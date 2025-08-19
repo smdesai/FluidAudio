@@ -44,7 +44,7 @@ struct TdtHypothesis: Sendable {
 @available(macOS 13.0, iOS 16.0, *)
 internal struct TdtDecoder {
 
-    private let logger = Logger(subsystem: "com.fluidinfluence.asr", category: "TDT")
+    private let logger = FluidLogger(subsystem: "com.fluidinfluence.asr", category: "TDT")
     private let config: ASRConfig
     private let predictionOptions = AsrModels.optimizedPredictionOptions()
 

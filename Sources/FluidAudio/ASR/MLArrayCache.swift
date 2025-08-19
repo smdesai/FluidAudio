@@ -7,7 +7,7 @@ import os
 actor MLArrayCache {
     private var cache: [CacheKey: [MLMultiArray]] = [:]
     private let maxCacheSize: Int
-    private let logger = Logger(subsystem: "com.fluidinfluence.asr", category: "MLArrayCache")
+    private let logger = FluidLogger(subsystem: "com.fluidinfluence.asr", category: "MLArrayCache")
 
     struct CacheKey: Hashable {
         let shape: [Int]
