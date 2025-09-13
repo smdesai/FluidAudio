@@ -8,24 +8,24 @@ public struct KokoroModelDownloader {
 
     private static let modelFiles = [
         (
-            "kokoro_completev20.mlmodelc/model.mil",
-            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev20.mlmodelc/model.mil"
+            "kokoro_completev21.mlmodelc/model.mil",
+            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev21.mlmodelc/model.mil"
         ),
         (
-            "kokoro_completev20.mlmodelc/coremldata.bin",
-            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev20.mlmodelc/coremldata.bin"
+            "kokoro_completev21.mlmodelc/coremldata.bin",
+            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev21.mlmodelc/coremldata.bin"
         ),
         (
-            "kokoro_completev20.mlmodelc/weights/weight.bin",
-            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev20.mlmodelc/weights/weight.bin"
+            "kokoro_completev21.mlmodelc/weights/weight.bin",
+            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev21.mlmodelc/weights/weight.bin"
         ),
         (
-            "kokoro_completev20.mlmodelc/metadata.json",
-            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev20.mlmodelc/metadata.json"
+            "kokoro_completev21.mlmodelc/metadata.json",
+            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev21.mlmodelc/metadata.json"
         ),
         (
-            "kokoro_completev20.mlmodelc/analytics/coremldata.bin",
-            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev20.mlmodelc/analytics/coremldata.bin"
+            "kokoro_completev21.mlmodelc/analytics/coremldata.bin",
+            "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/kokoro_completev21.mlmodelc/analytics/coremldata.bin"
         ),
     ]
 
@@ -46,7 +46,7 @@ public struct KokoroModelDownloader {
         let currentDir = fm.currentDirectoryPath
 
         // Check model directory
-        let modelPath = URL(fileURLWithPath: currentDir).appendingPathComponent("kokoro_completev20.mlmodelc").path
+        let modelPath = URL(fileURLWithPath: currentDir).appendingPathComponent("kokoro_completev21.mlmodelc").path
         if !fm.fileExists(atPath: modelPath) {
             return false
         }
@@ -86,7 +86,7 @@ public struct KokoroModelDownloader {
         let currentDir = fm.currentDirectoryPath
 
         // Create model directories
-        let modelDir = URL(fileURLWithPath: currentDir).appendingPathComponent("kokoro_completev20.mlmodelc")
+        let modelDir = URL(fileURLWithPath: currentDir).appendingPathComponent("kokoro_completev21.mlmodelc")
         let weightsDir = modelDir.appendingPathComponent("weights")
         let analyticsDir = modelDir.appendingPathComponent("analytics")
 

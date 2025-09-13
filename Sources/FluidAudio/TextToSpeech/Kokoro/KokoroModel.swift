@@ -7,7 +7,7 @@ import FoundationNetworking
 #endif
 
 /// Kokoro TTS implementation using unified CoreML model
-/// Uses kokoro_completev20.mlmodelc with word_frames_phonemes.json dictionary
+/// Uses kokoro_completev21.mlmodelc with word_phonemes.json dictionary
 @available(macOS 13.0, iOS 16.0, *)
 public struct KokoroModel {
     private static let logger = Logger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
@@ -69,7 +69,7 @@ public struct KokoroModel {
         logger.info("Model directory: \(modelDir.path)")
         print("Model directory: \(modelDir.path)")
 
-        let modelPath = modelDir.appendingPathComponent("kokoro_completev20.mlmodelc")
+        let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
 
         if FileManager.default.fileExists(atPath: modelPath.path) {
             logger.info("Model already downloaded")
@@ -77,8 +77,8 @@ public struct KokoroModel {
             return
         }
 
-        logger.info("Downloading kokoro_completev20 model...")
-        print("Downloading kokoro_completev20 model...")
+        logger.info("Downloading kokoro_completev21 model...")
+        print("Downloading kokoro_completev21 model...")
 
         // Create model directory
         try FileManager.default.createDirectory(at: modelPath, withIntermediateDirectories: true)
@@ -103,7 +103,7 @@ public struct KokoroModel {
         )
 
         for file in filesToDownload {
-            let fileURL = URL(string: "\(baseURL)/kokoro_completev20.mlmodelc/\(file)")!
+            let fileURL = URL(string: "\(baseURL)/kokoro_completev21.mlmodelc/\(file)")!
             let destPath: URL
 
             if file == "weights/weight.bin" {
@@ -131,7 +131,7 @@ public struct KokoroModel {
             }
         }
 
-        logger.info("✓ Downloaded kokoro_completev20.mlmodelc (required files)")
+        logger.info("✓ Downloaded kokoro_completev21.mlmodelc (required files)")
     }
 
     /// Ensure all required files are downloaded
@@ -152,7 +152,7 @@ public struct KokoroModel {
 
         let fm = FileManager.default
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
-        let localPackage = cwd.appendingPathComponent("kokoro_completev20.mlpackage")
+        let localPackage = cwd.appendingPathComponent("kokoro_completev21.mlpackage")
 
         if fm.fileExists(atPath: localPackage.path) {
             logger.info("Loading Kokoro model from local package: \(localPackage.path)")
@@ -165,7 +165,7 @@ public struct KokoroModel {
         } else {
             let cacheDir = try TtsModels.cacheDirectoryURL()
             let modelDir = cacheDir.appendingPathComponent("Models/kokoro")
-            let modelPath = modelDir.appendingPathComponent("kokoro_completev20.mlmodelc")
+            let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
 
             logger.info("Loading Kokoro model from \(modelDir.path)")
             print("Loading Kokoro model from \(modelDir.path)")
@@ -179,7 +179,7 @@ public struct KokoroModel {
             configuration.computeUnits = .cpuAndNeuralEngine
             kokoroModel = try MLModel(contentsOf: modelPath, configuration: configuration)
         }
-        logger.info("Loaded kokoro_completev20 model")
+        logger.info("Loaded kokoro_completev21 model")
 
         isModelLoaded = true
         logger.info("Kokoro model successfully loaded")

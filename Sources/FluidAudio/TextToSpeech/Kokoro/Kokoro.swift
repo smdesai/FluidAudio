@@ -185,9 +185,9 @@ public struct Kokoro {
         logger.debug("First 10 input_ids: \(inputIds.prefix(10))")
         logger.debug("First 5 ref_s values: \(voiceEmbedding.prefix(5))")
 
-        // Step 6: Load and run model - use unified compiled model only
+        // Step 6: Load and run model - use unified compiled model only (v21 preferred)
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let modelURL = cwd.appendingPathComponent("kokoro_completev20.mlmodelc")
+        let modelURL = cwd.appendingPathComponent("kokoro_completev21.mlmodelc")
 
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw TTSError.modelNotFound("Model not found at \(modelURL.path)")
@@ -204,25 +204,46 @@ public struct Kokoro {
         // Step 7: Run inference
         let output = try model.prediction(from: input)
 
-        // Step 8: Process output (var_7495)
-        guard let audioOutput = output.featureValue(for: "var_7495")?.multiArrayValue else {
-            throw TTSError.processingFailed("No audio output from model")
+        // Step 8: Robustly select audio output
+        // Prefer named 'audio', else first float MLMultiArray
+        let audioOutput: MLMultiArray = {
+            if let arr = output.featureValue(for: "audio")?.multiArrayValue { return arr }
+            // Fallback: search first float array
+            for name in output.featureNames {
+                if let arr = output.featureValue(for: name)?.multiArrayValue,
+                   arr.dataType == .float32 || arr.dataType == .float16 {
+                    return arr
+                }
+            }
+            return MLMultiArray()
+        }()
+        if audioOutput.count == 0 {
+            throw TTSError.processingFailed("No float audio output found in model outputs: \(Array(output.featureNames))")
         }
 
         logger.info("Audio output shape: \(audioOutput.shape), count: \(audioOutput.count)")
+
+        // Optional trim using audio_length_samples if provided
+        var effectiveCount = audioOutput.count
+        if let lenFV = output.featureValue(for: "audio_length_samples") {
+            if let la = lenFV.multiArrayValue, la.count > 0 { effectiveCount = max(0, la[0].intValue) }
+            else if lenFV.type == .int64 { effectiveCount = max(0, Int(lenFV.int64Value)) }
+            else if lenFV.type == .double { effectiveCount = max(0, Int(lenFV.doubleValue)) }
+            effectiveCount = min(effectiveCount, audioOutput.count)
+        }
 
         // Step 9: Convert to audio data (normalize like main.py)
         var audioSamples: [Float] = []
         var maxVal: Float = 0.0
 
         // First pass: find max for normalization
-        for i in 0..<audioOutput.count {
+        for i in 0..<effectiveCount {
             let val = audioOutput[i].floatValue
             maxVal = max(maxVal, abs(val))
         }
 
         // Second pass: normalize and collect samples
-        for i in 0..<audioOutput.count {
+        for i in 0..<effectiveCount {
             let normalizedSample = audioOutput[i].floatValue / (maxVal + 1e-8)
             audioSamples.append(normalizedSample)
         }

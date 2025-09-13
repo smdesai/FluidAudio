@@ -16,8 +16,8 @@ public struct TtsModels {
         from repo: String = "FluidInference/kokoro-82m-coreml",
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
-        // Unified Kokoro model that includes frontend + decoder
-        let modelName = "kokoro_completev20.mlmodelc"
+        // Unified Kokoro model that includes frontend + decoder (v21 for improved silence trimming)
+        let modelName = "kokoro_completev21.mlmodelc"
         let modelURL = try await downloadModel(
             from: repo,
             modelName: modelName,

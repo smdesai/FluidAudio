@@ -133,9 +133,9 @@ public enum TTSHarness {
         }
         // Prefer local mlpackage, then cache mlmodelc
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
-        let localPkg = cwd.appendingPathComponent("kokoro_completev20.mlpackage")
+        let localPkg = cwd.appendingPathComponent("kokoro_completev21.mlpackage")
         if fm.fileExists(atPath: localPkg.path) { return localPkg }
-        let cache = try cacheDir().appendingPathComponent("Models/kokoro/kokoro_completev20.mlmodelc")
+        let cache = try cacheDir().appendingPathComponent("Models/kokoro/kokoro_completev21.mlmodelc")
         return cache
     }
 
