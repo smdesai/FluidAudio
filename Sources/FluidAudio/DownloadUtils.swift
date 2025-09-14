@@ -104,7 +104,13 @@ public class DownloadUtils {
         case kokoro = "FluidInference/kokoro-82m-coreml"
 
         var folderName: String {
-            rawValue.split(separator: "/").last?.description ?? rawValue
+            switch self {
+            case .kokoro:
+                // Use "kokoro" instead of "kokoro-82m-coreml" for consistency with existing paths
+                return "kokoro"
+            default:
+                return rawValue.split(separator: "/").last?.description ?? rawValue
+            }
         }
 
     }

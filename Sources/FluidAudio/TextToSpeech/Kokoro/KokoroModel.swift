@@ -27,7 +27,7 @@ public struct KokoroModel {
     // Model and data URLs
     private static let baseURL = "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main"
 
-    /// Download file from URL if needed
+    /// Download file from URL if needed (uses DownloadUtils for consistency)
     private static func downloadFileIfNeeded(filename: String, urlPath: String) async throws {
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
@@ -45,7 +45,8 @@ public struct KokoroModel {
         logger.info("Downloading \(filename)...")
         let downloadURL = URL(string: "\(baseURL)/\(urlPath)")!
 
-        let (data, response) = try await URLSession.shared.data(from: downloadURL)
+        // Use DownloadUtils.sharedSession for consistent proxy and configuration handling
+        let (data, response) = try await DownloadUtils.sharedSession.data(from: downloadURL)
 
         guard let httpResponse = response as? HTTPURLResponse,
             httpResponse.statusCode == 200
@@ -57,81 +58,9 @@ public struct KokoroModel {
         logger.info("Downloaded \(filename) (\(data.count) bytes)")
     }
 
-    /// Download model files if needed
-    private static func downloadModelIfNeeded() async throws {
-        let cacheDir = try TtsModels.cacheDirectoryURL()
-        let modelDir = cacheDir.appendingPathComponent("Models/kokoro")
-
-        // Create Models/kokoro directory if needed
-        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
-
-        logger.info("Model directory: \(modelDir.path)")
-
-        let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
-
-        if FileManager.default.fileExists(atPath: modelPath.path) {
-            logger.info("Model already downloaded")
-            return
-        }
-
-        logger.info("Downloading kokoro_completev21 model...")
-
-        // Create model directory
-        try FileManager.default.createDirectory(at: modelPath, withIntermediateDirectories: true)
-
-        // Download the compiled mlmodelc files (some optional depending on packaging)
-        let filesToDownload = [
-            "coremldata.bin",
-            "metadata.json",  // optional
-            "model.mil",
-            "weights/weight.bin",  // optional
-            "analytics/coremldata.bin",  // optional
-        ]
-
-        // Create subdirectories
-        try FileManager.default.createDirectory(
-            at: modelPath.appendingPathComponent("weights"),
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.createDirectory(
-            at: modelPath.appendingPathComponent("analytics"),
-            withIntermediateDirectories: true
-        )
-
-        for file in filesToDownload {
-            let fileURL = URL(string: "\(baseURL)/kokoro_completev21.mlmodelc/\(file)")!
-            let destPath: URL
-
-            if file == "weights/weight.bin" {
-                destPath = modelPath.appendingPathComponent("weights").appendingPathComponent("weight.bin")
-            } else if file == "analytics/coremldata.bin" {
-                destPath = modelPath.appendingPathComponent("analytics").appendingPathComponent("coremldata.bin")
-            } else {
-                destPath = modelPath.appendingPathComponent(file)
-            }
-
-            do {
-                logger.info("  Downloading \(file)...")
-                let (data, response) = try await URLSession.shared.data(from: fileURL)
-
-                if let httpResponse = response as? HTTPURLResponse,
-                    httpResponse.statusCode == 200
-                {
-                    try data.write(to: destPath)
-                    logger.info("  ✓ Downloaded \(file) (\(data.count) bytes)")
-                } else {
-                    logger.warning("  File \(file) returned status \((response as? HTTPURLResponse)?.statusCode ?? -1)")
-                }
-            } catch {
-                logger.warning("  Could not download \(file): \(error.localizedDescription)")
-            }
-        }
-
-        logger.info("✓ Downloaded kokoro_completev21.mlmodelc (required files)")
-    }
-
-    /// Ensure required dictionary files exist (model download delegated to TtsModels)
+    /// Ensure required dictionary files exist
     public static func ensureRequiredFiles() async throws {
+        // Download dictionary files using our simplified helper (which uses DownloadUtils.sharedSession)
         try await downloadFileIfNeeded(filename: "word_phonemes.json", urlPath: "word_phonemes.json")
         try await downloadFileIfNeeded(filename: "word_frames_phonemes.json", urlPath: "word_frames_phonemes.json")
     }
@@ -152,7 +81,7 @@ public struct KokoroModel {
             configuration.computeUnits = .cpuAndNeuralEngine
             kokoroModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
         } else {
-            // Delegate download/loading to TtsModels/DownloadUtils for consistency
+            // Delegate to TtsModels which uses DownloadUtils for all model downloads
             let models = try await TtsModels.download()
             kokoroModel = models.kokoro
         }

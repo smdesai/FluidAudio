@@ -70,7 +70,9 @@ enum KokoroChunker {
                         if let ipa = EspeakG2P.shared.phonemize(word: key) {
                             let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
                             if !mapped.isEmpty {
-                                print("[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))")
+                                print(
+                                    "[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))"
+                                )
                                 out.append(contentsOf: mapped)
                                 KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key)")
                             } else {

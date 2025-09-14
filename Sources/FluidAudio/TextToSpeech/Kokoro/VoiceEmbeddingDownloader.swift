@@ -10,7 +10,8 @@ public enum VoiceEmbeddingDownloader {
 
         if let url = URL(string: jsonURL) {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                // Use DownloadUtils.sharedSession for consistent proxy and configuration handling
+                let (data, response) = try await DownloadUtils.sharedSession.data(from: url)
 
                 if let httpResponse = response as? HTTPURLResponse,
                     httpResponse.statusCode == 200
@@ -28,7 +29,8 @@ public enum VoiceEmbeddingDownloader {
         let ptURL = "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/voices/\(voice).pt"
         if let url = URL(string: ptURL) {
             do {
-                let (ptData, response) = try await URLSession.shared.data(from: url)
+                // Use DownloadUtils.sharedSession for consistent proxy and configuration handling
+                let (ptData, response) = try await DownloadUtils.sharedSession.data(from: url)
 
                 if let httpResponse = response as? HTTPURLResponse,
                     httpResponse.statusCode == 200
