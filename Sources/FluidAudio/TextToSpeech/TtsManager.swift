@@ -135,18 +135,20 @@ public final class TtSManager {
 
     private func processAudioOutput(_ audioArray: MLMultiArray) throws -> Data {
         let sampleRate: Double = 24000
-        let numSamples = audioArray.shape[1].intValue
+        let numSamples: Int = (audioArray.shape.count > 1 ? audioArray.shape.last?.intValue : audioArray.count) ?? audioArray.count
 
         guard numSamples > 0 else {
             throw TTSError.processingFailed("No audio samples generated")
         }
 
-        let audioFormat = AVAudioFormat(
+        guard let audioFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: sampleRate,
             channels: 1,
             interleaved: false
-        )!
+        ) else {
+            throw TTSError.processingFailed("Failed to create source audio format")
+        }
 
         guard
             let buffer = AVAudioPCMBuffer(
@@ -159,7 +161,10 @@ public final class TtSManager {
 
         buffer.frameLength = AVAudioFrameCount(numSamples)
 
-        let channelData = buffer.floatChannelData![0]
+        guard let channelBase = buffer.floatChannelData else {
+            throw TTSError.processingFailed("Missing floatChannelData in source buffer")
+        }
+        let channelData = channelBase[0]
         let dataPointer = audioArray.dataPointer.bindMemory(
             to: Float.self,
             capacity: numSamples
@@ -183,7 +188,9 @@ public final class TtSManager {
             throw TTSError.processingFailed("Failed to create audio format")
         }
 
-        let converter = AVAudioConverter(from: audioFormat, to: format)!
+        guard let converter = AVAudioConverter(from: audioFormat, to: format) else {
+            throw TTSError.processingFailed("Failed to create AVAudioConverter")
+        }
 
         guard
             let outputBuffer = AVAudioPCMBuffer(
@@ -194,12 +201,18 @@ public final class TtSManager {
             throw TTSError.processingFailed("Failed to create output buffer")
         }
 
-        try converter.convert(to: outputBuffer, from: buffer)
+        do {
+            try converter.convert(to: outputBuffer, from: buffer)
+        } catch {
+            throw TTSError.processingFailed("Audio conversion failed: \(error.localizedDescription)")
+        }
 
-        return Data(
-            bytes: outputBuffer.floatChannelData![0],
-            count: Int(outputBuffer.frameLength) * MemoryLayout<Float>.size
-        )
+        guard let outBase = outputBuffer.floatChannelData else {
+            throw TTSError.processingFailed("Missing floatChannelData in output buffer")
+        }
+        let outPtr = outBase[0]
+        let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Float>.size
+        return Data(bytes: outPtr, count: byteCount)
     }
 
     public func cleanup() {

@@ -16,16 +16,18 @@ public struct TtsModels {
         from repo: String = "FluidInference/kokoro-82m-coreml",
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
-        // Unified Kokoro model that includes frontend + decoder (v21 for improved silence trimming)
+        // Unified Kokoro model (v21). Delegate download/load to DownloadUtils for consistency
         let modelName = "kokoro_completev21.mlmodelc"
-        let modelURL = try await downloadModel(
-            from: repo,
-            modelName: modelName,
-            progressHandler: progressHandler
+        let cacheDirectory = try getCacheDirectory()
+        let dict = try await DownloadUtils.loadModels(
+            .kokoro,
+            modelNames: [modelName],
+            directory: cacheDirectory,
+            computeUnits: .cpuAndNeuralEngine
         )
-
-        let kokoro = try await loadCompiledModel(at: modelURL, modelName: modelName)
-
+        guard let kokoro = dict[modelName] else {
+            throw TTSError.modelNotFound(modelName)
+        }
         return TtsModels(kokoro: kokoro)
     }
 
@@ -62,7 +64,10 @@ public struct TtsModels {
         )
 
         for (index, file) in files.enumerated() {
-            let fileURL = URL(string: "\(baseURL)/\(modelName)/\(file)")!
+            guard let base = URL(string: baseURL) else {
+                throw TTSError.downloadFailed("Invalid base URL: \(baseURL)")
+            }
+            let fileURL = base.appendingPathComponent(modelName).appendingPathComponent(file)
             let destinationURL = modelPath.appendingPathComponent(file)
 
             let progress: Double = Double(index) / Double(files.count)
@@ -124,7 +129,10 @@ public struct TtsModels {
         baseDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cache")
         #else
-        baseDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        guard let first = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            throw TTSError.processingFailed("Failed to locate caches directory")
+        }
+        baseDirectory = first
         #endif
 
         let cacheDirectory = baseDirectory.appendingPathComponent("fluidaudio")

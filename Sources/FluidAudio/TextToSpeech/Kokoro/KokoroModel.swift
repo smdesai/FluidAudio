@@ -10,7 +10,7 @@ import FoundationNetworking
 /// Uses kokoro_completev21.mlmodelc with word_phonemes.json dictionary
 @available(macOS 13.0, iOS 16.0, *)
 public struct KokoroModel {
-    private static let logger = Logger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
+    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
 
     // Single model reference
     private static var kokoroModel: MLModel?
@@ -43,7 +43,6 @@ public struct KokoroModel {
         }
 
         logger.info("Downloading \(filename)...")
-        print("  Downloading \(filename)...")
         let downloadURL = URL(string: "\(baseURL)/\(urlPath)")!
 
         let (data, response) = try await URLSession.shared.data(from: downloadURL)
@@ -67,18 +66,15 @@ public struct KokoroModel {
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
         logger.info("Model directory: \(modelDir.path)")
-        print("Model directory: \(modelDir.path)")
 
         let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
 
         if FileManager.default.fileExists(atPath: modelPath.path) {
             logger.info("Model already downloaded")
-            print("Model already downloaded")
             return
         }
 
         logger.info("Downloading kokoro_completev21 model...")
-        print("Downloading kokoro_completev21 model...")
 
         // Create model directory
         try FileManager.default.createDirectory(at: modelPath, withIntermediateDirectories: true)
@@ -137,9 +133,9 @@ public struct KokoroModel {
     /// Ensure all required files are downloaded
     public static func ensureRequiredFiles() async throws {
         // Download dictionary files
-        print("Checking word_phonemes.json...")
+        
         try await downloadFileIfNeeded(filename: "word_phonemes.json", urlPath: "word_phonemes.json")
-        print("Checking word_frames_phonemes.json...")
+        
         try await downloadFileIfNeeded(filename: "word_frames_phonemes.json", urlPath: "word_frames_phonemes.json")
 
         // Download model
@@ -156,7 +152,6 @@ public struct KokoroModel {
 
         if fm.fileExists(atPath: localPackage.path) {
             logger.info("Loading Kokoro model from local package: \(localPackage.path)")
-            print("Loading Kokoro model from local package: \(localPackage.path)")
             // Compile the .mlpackage to a .mlmodelc bundle before loading
             let compiledURL = try await MLModel.compileModel(at: localPackage)
             let configuration = MLModelConfiguration()
@@ -168,11 +163,9 @@ public struct KokoroModel {
             let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
 
             logger.info("Loading Kokoro model from \(modelDir.path)")
-            print("Loading Kokoro model from \(modelDir.path)")
 
             if !fm.fileExists(atPath: modelPath.path) {
                 logger.warning("Model not found in cache, downloading...")
-                print("Model not found in cache, downloading...")
                 try await downloadModelIfNeeded()
             }
             let configuration = MLModelConfiguration()
@@ -459,31 +452,14 @@ public struct KokoroModel {
             attentionMask[i] = NSNumber(value: i < trueLen ? 1 : 0)
         }
 
-        print(
-            "targetTokens=\(targetTokens), trueLen=\(trueLen), maskOn=\((0..<targetTokens).reduce(0){ $0 + (attentionMask[$1].intValue) })"
-        )
+        
 
         // Use zeros for phases for determinism (works well for 3s model)
         let phasesArray = try MLMultiArray(shape: [1, 9] as [NSNumber], dataType: .float32)
         for i in 0..<9 { phasesArray[i] = 0 }
 
         // Debug: print model IO
-        if let model = kokoroModel {
-            let inputs = model.modelDescription.inputDescriptionsByName
-            let outputs = model.modelDescription.outputDescriptionsByName
-            // Print to console for quick debugging
-            print("Model inputs: \(Array(inputs.keys))")
-            print("Model outputs: \(Array(outputs.keys))")
-            if let idsDesc = inputs["input_ids"], let c = idsDesc.multiArrayConstraint {
-                print("input_ids shape: \(c.shape.map{ $0.intValue })")
-            }
-            if let attnDesc = inputs["attention_mask"], let c = attnDesc.multiArrayConstraint {
-                print("attention_mask shape: \(c.shape.map{ $0.intValue })")
-            }
-            if let refDesc = inputs["ref_s"], let c = refDesc.multiArrayConstraint {
-                print("ref_s shape: \(c.shape.map{ $0.intValue })")
-            }
-        }
+        
 
         // Run inference
         let modelInput = try MLDictionaryFeatureProvider(dictionary: [

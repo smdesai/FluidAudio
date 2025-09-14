@@ -96,6 +96,19 @@ public class DownloadUtils {
         public static let `default` = DownloadConfig()
     }
 
+    /// Model repositories on HuggingFace
+    public enum Repo: String, CaseIterable {
+        case vad = "FluidInference/silero-vad-coreml"
+        case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
+        case diarizer = "FluidInference/speaker-diarization-coreml"
+        case kokoro = "FluidInference/kokoro-82m-coreml"
+
+        var folderName: String {
+            rawValue.split(separator: "/").last?.description ?? rawValue
+        }
+
+    }
+
     public static func loadModels(
         _ repo: Repo,
         modelNames: [String],
