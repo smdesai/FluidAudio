@@ -65,14 +65,12 @@ enum KokoroChunker {
                     if let arr = wordToPhonemes[key] {
                         out.append(contentsOf: arr)
                     } else {
-                        // Use C eSpeak NG for OOV phonemization only
+                        // Use C eSpeak NG for OOV phonemization only (if available)
+                        #if canImport(CEspeakNG)
                         if let ipa = EspeakG2P.shared.phonemize(word: key) {
                             let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
                             if !mapped.isEmpty {
-                                // Print details for visibility as requested
-                                print(
-                                    "[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))"
-                                )
+                                print("[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))")
                                 out.append(contentsOf: mapped)
                                 KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key)")
                             } else {
@@ -83,6 +81,10 @@ enum KokoroChunker {
                             print("[G2P] word=\(key) | ipa=<failed> | map=<empty>")
                             KokoroChunker.logger.warning("EspeakG2P failed for OOV word: \(key)")
                         }
+                        #else
+                        // G2P not available in this build; skip OOV word
+                        KokoroChunker.logger.warning("CEspeakNG not available; skipping OOV word: \(key)")
+                        #endif
                     }
                     seg.removeAll()
                 }

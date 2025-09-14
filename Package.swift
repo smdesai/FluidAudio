@@ -19,17 +19,9 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
-        .systemLibrary(
-            name: "CEspeakNG",
-            pkgConfig: "espeak-ng",
-            providers: [
-                .brew(["espeak-ng"])
-            ],
-            path: "Sources/CEspeakNG"
-        ),
         .target(
             name: "FluidAudio",
-            dependencies: ["CEspeakNG"],
+            dependencies: [],
             path: "Sources/FluidAudio",
             exclude: []
         ),
