@@ -130,16 +130,10 @@ public struct KokoroModel {
         logger.info("✓ Downloaded kokoro_completev21.mlmodelc (required files)")
     }
 
-    /// Ensure all required files are downloaded
+    /// Ensure required dictionary files exist (model download delegated to TtsModels)
     public static func ensureRequiredFiles() async throws {
-        // Download dictionary files
-        
         try await downloadFileIfNeeded(filename: "word_phonemes.json", urlPath: "word_phonemes.json")
-        
         try await downloadFileIfNeeded(filename: "word_frames_phonemes.json", urlPath: "word_frames_phonemes.json")
-
-        // Download model
-        try await downloadModelIfNeeded()
     }
 
     /// Load the Kokoro model
@@ -158,19 +152,9 @@ public struct KokoroModel {
             configuration.computeUnits = .cpuAndNeuralEngine
             kokoroModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
         } else {
-            let cacheDir = try TtsModels.cacheDirectoryURL()
-            let modelDir = cacheDir.appendingPathComponent("Models/kokoro")
-            let modelPath = modelDir.appendingPathComponent("kokoro_completev21.mlmodelc")
-
-            logger.info("Loading Kokoro model from \(modelDir.path)")
-
-            if !fm.fileExists(atPath: modelPath.path) {
-                logger.warning("Model not found in cache, downloading...")
-                try await downloadModelIfNeeded()
-            }
-            let configuration = MLModelConfiguration()
-            configuration.computeUnits = .cpuAndNeuralEngine
-            kokoroModel = try MLModel(contentsOf: modelPath, configuration: configuration)
+            // Delegate download/loading to TtsModels/DownloadUtils for consistency
+            let models = try await TtsModels.download()
+            kokoroModel = models.kokoro
         }
         logger.info("Loaded kokoro_completev21 model")
 
@@ -318,6 +302,7 @@ public struct KokoroModel {
 
     /// Load voice embedding (simplified for 3-second model)
     public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) throws -> MLMultiArray {
+        let voice = "af_heart"
         // Try to load from cache: ~/.cache/fluidaudio/Models/kokoro/voices/<voice>.json
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let voicesDir = cacheDir.appendingPathComponent("Models/kokoro/voices")
@@ -399,7 +384,7 @@ public struct KokoroModel {
             embedding[i] = NSNumber(value: v)
             varsum += v * v
         }
-        print("ref_s dim=\(dim), loaded=true, l2norm=\(String(format: "%.3f", sqrt(Double(varsum))))")
+        logger.info("Loaded voice embedding: \(voice), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(varsum))))")
         return embedding
     }
 

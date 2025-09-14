@@ -4,7 +4,7 @@ import OSLog
 /// Minimal vocabulary loader for KokoroDirect
 @available(macOS 13.0, *)
 public struct KokoroVocabulary {
-    private static let logger = Logger(subsystem: "com.fluidaudio.tts", category: "KokoroVocabulary")
+    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroVocabulary")
     private static var vocabulary: [String: Int32] = [:]
     private static var isLoaded = false
 

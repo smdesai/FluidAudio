@@ -6,7 +6,7 @@ import OSLog
 @available(macOS 13.0, *)
 public final class TtSManager {
 
-    private let logger = Logger(subsystem: "com.fluidaudio.tts", category: "TtSManager")
+    private let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "TtSManager")
 
     private var kokoroModel: MLModel?
     private var ttsModels: TtsModels?

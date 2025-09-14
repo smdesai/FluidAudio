@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import OSLog
 
 /// A chunk of text prepared for synthesis.
 /// - words: The original words in this chunk
@@ -16,7 +17,7 @@ struct TextChunk {
 /// Punctuation-aware chunker that splits paragraphs → sentences → clauses
 /// and packs them under the model token budget.
 enum KokoroChunker {
-    private static let logger = Logger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
+    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
     /// Build chunks under the token budget.
     /// - Parameters:
     ///   - text: Raw input text

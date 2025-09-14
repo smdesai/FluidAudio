@@ -6,7 +6,7 @@ import OSLog
 public struct TtsModels {
     public let kokoro: MLModel
 
-    private static let logger = Logger(subsystem: "com.fluidaudio.tts", category: "TtsModels")
+    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "TtsModels")
 
     public init(kokoro: MLModel) {
         self.kokoro = kokoro
