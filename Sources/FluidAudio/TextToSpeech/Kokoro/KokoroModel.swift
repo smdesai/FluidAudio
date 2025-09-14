@@ -404,7 +404,7 @@ public struct KokoroModel {
     /// Synthesize a single chunk of text
     private static func synthesizeChunk(_ chunk: TextChunk, voice: String) async throws -> [Float] {
         // Convert phonemes to input IDs
-        var phonemeSeq = chunk.phonemes
+        let phonemeSeq = chunk.phonemes
         // No language token prefix; avoid audible leading vowel
         let inputIds = phonemesToInputIds(phonemeSeq)
 
@@ -536,7 +536,7 @@ public struct KokoroModel {
             // Normalize and convert to WAV
             let maxVal = samples.map { abs($0) }.max() ?? 1.0
             let normalizedSamples = maxVal > 0 ? samples.map { $0 / maxVal } : samples
-            let audioData = try convertSamplesToWAV(normalizedSamples)
+            let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
 
             let totalTime = Date().timeIntervalSince(synthesisStart)
             logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
@@ -595,8 +595,8 @@ public struct KokoroModel {
             let maxVal = allSamples.map { abs($0) }.max() ?? 1.0
             let normalizedSamples = maxVal > 0 ? allSamples.map { $0 / maxVal } : allSamples
 
-            // Convert to WAV
-            let audioData = try convertSamplesToWAV(normalizedSamples)
+            // Convert to WAV (24 kHz mono)
+            let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
 
             let totalTime = Date().timeIntervalSince(synthesisStart)
             logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
@@ -607,44 +607,7 @@ public struct KokoroModel {
         }
     }
 
-    /// Convert float samples to WAV data
-    private static func convertSamplesToWAV(_ samples: [Float]) throws -> Data {
-        let sampleRate: Double = 24000  // 24 kHz sample rate
-
-        // Convert to 16-bit PCM
-        var pcmData = Data()
-        for sample in samples {
-            let clippedSample = max(-1.0, min(1.0, sample))
-            let pcmSample = Int16(clippedSample * 32767)
-            pcmData.append(contentsOf: withUnsafeBytes(of: pcmSample) { Array($0) })
-        }
-
-        // Create WAV header
-        var wavData = Data()
-
-        // RIFF header
-        wavData.append(contentsOf: "RIFF".data(using: .ascii)!)
-        let fileSize = UInt32(36 + pcmData.count)
-        wavData.append(contentsOf: withUnsafeBytes(of: fileSize.littleEndian) { Array($0) })
-        wavData.append(contentsOf: "WAVE".data(using: .ascii)!)
-
-        // fmt chunk
-        wavData.append(contentsOf: "fmt ".data(using: .ascii)!)
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // PCM
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // Mono
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate * 2).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(2).littleEndian) { Array($0) })  // Block align
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(16).littleEndian) { Array($0) })  // Bits per sample
-
-        // data chunk
-        wavData.append(contentsOf: "data".data(using: .ascii)!)
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(pcmData.count).littleEndian) { Array($0) })
-        wavData.append(pcmData)
-
-        return wavData
-    }
+    // convertSamplesToWAV moved to AudioWAV
 
     // convertToWAV removed (unused); use convertSamplesToWAV instead
 }

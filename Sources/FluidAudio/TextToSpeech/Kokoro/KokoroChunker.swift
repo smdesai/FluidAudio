@@ -73,14 +73,14 @@ enum KokoroChunker {
                                 // Print details for visibility as requested
                                 print("[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))")
                                 out.append(contentsOf: mapped)
-                                KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key, privacy: .public)")
+                                KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key)")
                             } else {
                                 print("[G2P] word=\(key) | ipa=<none> | map=<empty>")
-                                KokoroChunker.logger.warning("OOV word yielded no mappable IPA tokens: \(key, privacy: .public)")
+                                KokoroChunker.logger.warning("OOV word yielded no mappable IPA tokens: \(key)")
                             }
                         } else {
                             print("[G2P] word=\(key) | ipa=<failed> | map=<empty>")
-                            KokoroChunker.logger.warning("EspeakG2P failed for OOV word: \(key, privacy: .public)")
+                            KokoroChunker.logger.warning("EspeakG2P failed for OOV word: \(key)")
                         }
                     }
                     seg.removeAll()

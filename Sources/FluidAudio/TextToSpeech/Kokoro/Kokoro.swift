@@ -254,53 +254,14 @@ public struct Kokoro {
             audioSamples.append(normalizedSample)
         }
 
-        // Convert to WAV data
-        let audioData = try createWAVData(samples: audioSamples, sampleRate: 24000)
+        // Convert to WAV data via shared utility
+        let audioData = try AudioWAV.data(from: audioSamples, sampleRate: 24000)
 
         logger.info("Generated \(audioData.count) bytes of audio")
         return audioData
     }
 
-    /// Create WAV file data from samples
-    private static func createWAVData(samples: [Float], sampleRate: Int) throws -> Data {
-        var data = Data()
-
-        // WAV header
-        let numChannels: Int16 = 1
-        let bitsPerSample: Int16 = 16
-        let byteRate = Int32(sampleRate) * Int32(numChannels) * Int32(bitsPerSample / 8)
-        let blockAlign = numChannels * (bitsPerSample / 8)
-        let dataSize = Int32(samples.count * 2)  // 16-bit samples
-        let fileSize = dataSize + 36
-
-        // RIFF header
-        data.append("RIFF".data(using: .ascii)!)
-        data.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
-        data.append("WAVE".data(using: .ascii)!)
-
-        // fmt chunk
-        data.append("fmt ".data(using: .ascii)!)
-        data.append(withUnsafeBytes(of: Int32(16).littleEndian) { Data($0) })  // Chunk size
-        data.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) })  // PCM format
-        data.append(withUnsafeBytes(of: numChannels.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: Int32(sampleRate).littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
-        data.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
-
-        // data chunk
-        data.append("data".data(using: .ascii)!)
-        data.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-
-        // Convert float samples to 16-bit PCM
-        for sample in samples {
-            let clipped = max(-1.0, min(1.0, sample))
-            let intSample = Int16(clipped * 32767)
-            data.append(withUnsafeBytes(of: intSample.littleEndian) { Data($0) })
-        }
-
-        return data
-    }
+    // Removed duplicate WAV utility; see AudioWAV in AudioConverter.swift
 }
 
 // TTSError is already defined in TtsModels.swift

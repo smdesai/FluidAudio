@@ -225,6 +225,21 @@ public class DownloadUtils {
         return models
     }
 
+    /// Get required model names from the appropriate manager
+    @available(macOS 13.0, iOS 16.0, *)
+    private static func getRequiredModelNames(for repo: Repo) -> Set<String> {
+        switch repo {
+        case .vad:
+            return VadManager.requiredModelNames
+        case .parakeet:
+            return AsrModels.requiredModelNames
+        case .diarizer:
+            return DiarizerModels.requiredModelNames
+        case .kokoro:
+            return Set(["kokoro_completev21.mlmodelc"]) // unified Kokoro TTS model bundle
+        }
+    }
+
     /// Download a HuggingFace repository
     private static func downloadRepo(_ repo: Repo, to directory: URL) async throws {
         logger.info("📥 Downloading \(repo.folderName) from HuggingFace...")
