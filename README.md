@@ -213,7 +213,53 @@ Task {
 swift run fluidaudio vad-benchmark --num-files 50 --threshold 0.3
 ```
 
-## Showcase
+## Text‑To‑Speech (TTS)
+
+- Model: Kokoro (CoreML unified model)
+- G2P: Dictionary first, then eSpeak NG (CEspeakNG) for OOV words
+- Output: 24 kHz mono WAV
+
+Requirements (macOS)
+- Homebrew packages:
+  - `brew install espeak-ng pkg-config`
+
+### Quick Start (CLI)
+
+```bash
+# First run will download the Kokoro model and vocab
+swift run fluidaudio tts "Hello from FluidAudio." --auto-download --output out.wav
+
+# Another example with punctuation and OOV handling
+swift run fluidaudio tts "Edge-cases: URLs like https://example.com and e-mail test@example.com." --output out2.wav
+```
+
+Notes
+- The TTS pipeline uses a word→phoneme dictionary first; unknown words are phonemized with eSpeak NG (C API) and mapped to the model’s token set.
+- OOV words are printed with their IPA and mapped tokens for visibility during synthesis.
+- We do not prepend any “language token” to avoid leading vowel artifacts.
+
+### Quick Start (Code)
+
+```swift
+import FluidAudio
+
+Task {
+  do {
+    let data = try await KokoroModel.synthesize(text: "Hello from FluidAudio.")
+    try data.write(to: URL(fileURLWithPath: "out.wav"))
+  } catch {
+    print("TTS error: \(error)")
+  }
+}
+```
+
+Troubleshooting
+- Build requires eSpeak NG headers/libs for the C API: `brew install espeak-ng pkg-config`
+- If SwiftPM cannot find headers, build with explicit paths:
+  - `swift build -Xcc -I/opt/homebrew/include -Xlinker -L/opt/homebrew/lib`
+- Dictionary and model assets are cached under `~/.cache/fluidaudio/Models/kokoro`.
+
+## Showcase 
 
 Make a PR if you want to add your app!
 
