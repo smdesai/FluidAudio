@@ -1,6 +1,5 @@
 import Foundation
 import OSLog
-import OSLog
 
 /// A chunk of text prepared for synthesis.
 /// - words: The original words in this chunk
@@ -71,7 +70,9 @@ enum KokoroChunker {
                             let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
                             if !mapped.isEmpty {
                                 // Print details for visibility as requested
-                                print("[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))")
+                                print(
+                                    "[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))"
+                                )
                                 out.append(contentsOf: mapped)
                                 KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key)")
                             } else {

@@ -255,15 +255,15 @@ public enum AudioWAV {
 
         // fmt chunk
         wav.append(contentsOf: "fmt ".data(using: .ascii)!)
-        var subchunk1Size = UInt32(16).littleEndian // PCM
+        var subchunk1Size = UInt32(16).littleEndian  // PCM
         withUnsafeBytes(of: &subchunk1Size) { wav.append(contentsOf: $0) }
-        var audioFormat = UInt16(1).littleEndian // PCM
+        var audioFormat = UInt16(1).littleEndian  // PCM
         withUnsafeBytes(of: &audioFormat) { wav.append(contentsOf: $0) }
         var numChannels = UInt16(1).littleEndian
         withUnsafeBytes(of: &numChannels) { wav.append(contentsOf: $0) }
         var sr = UInt32(sampleRate).littleEndian
         withUnsafeBytes(of: &sr) { wav.append(contentsOf: $0) }
-        var byteRate = UInt32(sampleRate * 2).littleEndian // 16-bit mono
+        var byteRate = UInt32(sampleRate * 2).littleEndian  // 16-bit mono
         withUnsafeBytes(of: &byteRate) { wav.append(contentsOf: $0) }
         var blockAlign = UInt16(2).littleEndian
         withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }

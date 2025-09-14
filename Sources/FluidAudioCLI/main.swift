@@ -102,7 +102,7 @@ Task {
             print("TTS requires macOS 13.0 or later")
             exit(1)
         }
-    
+
     case "diarization-benchmark":
         if #available(macOS 13.0, *) {
             await StreamDiarizationBenchmark.run(arguments: Array(arguments.dropFirst(2)))

@@ -24,7 +24,8 @@ let package = Package(
             pkgConfig: "espeak-ng",
             providers: [
                 .brew(["espeak-ng"])
-            ]
+            ],
+            path: "Sources/CEspeakNG"
         ),
         .target(
             name: "FluidAudio",

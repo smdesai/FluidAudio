@@ -135,18 +135,21 @@ public final class TtSManager {
 
     private func processAudioOutput(_ audioArray: MLMultiArray) throws -> Data {
         let sampleRate: Double = 24000
-        let numSamples: Int = (audioArray.shape.count > 1 ? audioArray.shape.last?.intValue : audioArray.count) ?? audioArray.count
+        let numSamples: Int =
+            (audioArray.shape.count > 1 ? audioArray.shape.last?.intValue : audioArray.count) ?? audioArray.count
 
         guard numSamples > 0 else {
             throw TTSError.processingFailed("No audio samples generated")
         }
 
-        guard let audioFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false
-        ) else {
+        guard
+            let audioFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: sampleRate,
+                channels: 1,
+                interleaved: false
+            )
+        else {
             throw TTSError.processingFailed("Failed to create source audio format")
         }
 

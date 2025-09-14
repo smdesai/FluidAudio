@@ -236,7 +236,7 @@ public class DownloadUtils {
         case .diarizer:
             return DiarizerModels.requiredModelNames
         case .kokoro:
-            return Set(["kokoro_completev21.mlmodelc"]) // unified Kokoro TTS model bundle
+            return Set(["kokoro_completev21.mlmodelc"])  // unified Kokoro TTS model bundle
         }
     }
 

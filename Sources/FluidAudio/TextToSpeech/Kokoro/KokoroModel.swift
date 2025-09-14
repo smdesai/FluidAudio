@@ -252,7 +252,6 @@ public struct KokoroModel {
         )
     }
 
-
     /// Convert phonemes to input IDs
     public static func phonemesToInputIds(_ phonemes: [String]) -> [Int32] {
         let vocabulary = KokoroVocabulary.getVocabulary()
@@ -384,7 +383,8 @@ public struct KokoroModel {
             embedding[i] = NSNumber(value: v)
             varsum += v * v
         }
-        logger.info("Loaded voice embedding: \(voice), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(varsum))))")
+        logger.info(
+            "Loaded voice embedding: \(voice), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(varsum))))")
         return embedding
     }
 
@@ -437,14 +437,11 @@ public struct KokoroModel {
             attentionMask[i] = NSNumber(value: i < trueLen ? 1 : 0)
         }
 
-        
-
         // Use zeros for phases for determinism (works well for 3s model)
         let phasesArray = try MLMultiArray(shape: [1, 9] as [NSNumber], dataType: .float32)
         for i in 0..<9 { phasesArray[i] = 0 }
 
         // Debug: print model IO
-        
 
         // Run inference
         let modelInput = try MLDictionaryFeatureProvider(dictionary: [

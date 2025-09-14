@@ -20,11 +20,20 @@ public enum TTSHarness {
             let a = arguments[i]
             switch a {
             case "--voice", "-v":
-                if i + 1 < arguments.count { voice = arguments[i + 1]; i += 1 }
+                if i + 1 < arguments.count {
+                    voice = arguments[i + 1]
+                    i += 1
+                }
             case "--output", "-o":
-                if i + 1 < arguments.count { output = arguments[i + 1]; i += 1 }
+                if i + 1 < arguments.count {
+                    output = arguments[i + 1]
+                    i += 1
+                }
             case "--model", "-m":
-                if i + 1 < arguments.count { modelPath = arguments[i + 1]; i += 1 }
+                if i + 1 < arguments.count {
+                    modelPath = arguments[i + 1]
+                    i += 1
+                }
             case "--debug":
                 debug = true
             default:
@@ -45,7 +54,7 @@ public enum TTSHarness {
 
             // Text -> phonemes
             var phonemes = textToPhonemes(text, using: w2p)
-            if vocab["a"] != nil { phonemes.insert("a", at: 0) } // language token
+            if vocab["a"] != nil { phonemes.insert("a", at: 0) }  // language token
             if debug {
                 print("Phonemes(\(phonemes.count)): \(phonemes.prefix(32).joined(separator: " "))")
             }
@@ -75,7 +84,8 @@ public enum TTSHarness {
 
             let ref = try loadVoiceEmbeddingJSON(voice: voice, phonemeCount: phonemes.count)
             if debug {
-                let norm = sqrt((0..<ref.count).reduce(0.0) { $0 + Double(truncating: ref[$1]) * Double(truncating: ref[$1]) })
+                let norm = sqrt(
+                    (0..<ref.count).reduce(0.0) { $0 + Double(truncating: ref[$1]) * Double(truncating: ref[$1]) })
                 print(String(format: "ref_s norm=%.3f", norm))
             }
 
@@ -95,13 +105,22 @@ public enum TTSHarness {
 
             // Extract audio and optional length
             guard let audioArr = out.featureValue(for: "audio")?.multiArrayValue else {
-                throw NSError(domain: "TTSHarness", code: 2, userInfo: [NSLocalizedDescriptionKey: "No 'audio' output in model outputs: \(Array(out.featureNames))"]) }
+                throw NSError(
+                    domain: "TTSHarness", code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "No 'audio' output in model outputs: \(Array(out.featureNames))"
+                    ])
+            }
 
             var effective = audioArr.count
             if let fv = out.featureValue(for: "audio_length_samples") {
-                if let a = fv.multiArrayValue, a.count > 0 { effective = max(0, a[0].intValue) }
-                else if fv.type == .int64 { effective = max(0, Int(fv.int64Value)) }
-                else if fv.type == .double { effective = max(0, Int(fv.doubleValue)) }
+                if let a = fv.multiArrayValue, a.count > 0 {
+                    effective = max(0, a[0].intValue)
+                } else if fv.type == .int64 {
+                    effective = max(0, Int(fv.int64Value))
+                } else if fv.type == .double {
+                    effective = max(0, Int(fv.doubleValue))
+                }
             }
             effective = min(effective, audioArr.count)
 
@@ -129,7 +148,8 @@ public enum TTSHarness {
         if let p = explicit {
             let u = URL(fileURLWithPath: p)
             if fm.fileExists(atPath: u.path) { return u }
-            throw NSError(domain: "TTSHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model not found at \(u.path)"])
+            throw NSError(
+                domain: "TTSHarness", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model not found at \(u.path)"])
         }
         // Prefer local mlpackage, then cache mlmodelc
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
@@ -174,10 +194,12 @@ public enum TTSHarness {
     private static func loadResources() throws -> ([String: Int32], [String: [String]]) {
         let cache = try cacheDir().appendingPathComponent("Models/kokoro")
         let fm = FileManager.default
-        let vocabURL = fm.fileExists(atPath: cache.appendingPathComponent("vocab_index.json").path)
+        let vocabURL =
+            fm.fileExists(atPath: cache.appendingPathComponent("vocab_index.json").path)
             ? cache.appendingPathComponent("vocab_index.json")
             : URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("vocab_index.json")
-        let wpURL = fm.fileExists(atPath: cache.appendingPathComponent("word_phonemes.json").path)
+        let wpURL =
+            fm.fileExists(atPath: cache.appendingPathComponent("word_phonemes.json").path)
             ? cache.appendingPathComponent("word_phonemes.json")
             : URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("word_phonemes.json")
 
@@ -185,12 +207,16 @@ public enum TTSHarness {
         let vocabJSON = try JSONSerialization.jsonObject(with: vocabData) as! [String: Any]
         let vocabDict = vocabJSON["vocab"] as? [String: Any] ?? [:]
         var vocab: [String: Int32] = [:]
-        for (k, v) in vocabDict { if let vi = v as? Int { vocab[k] = Int32(vi) } else if let vd = v as? Double { vocab[k] = Int32(vd) } }
+        for (k, v) in vocabDict {
+            if let vi = v as? Int { vocab[k] = Int32(vi) } else if let vd = v as? Double { vocab[k] = Int32(vd) }
+        }
 
         let wpData = try Data(contentsOf: wpURL)
         let wpJSON = try JSONSerialization.jsonObject(with: wpData) as! [String: Any]
         guard let w2p = wpJSON["word_to_phonemes"] as? [String: [String]] else {
-            throw NSError(domain: "TTSHarness", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid word_phonemes.json format"])
+            throw NSError(
+                domain: "TTSHarness", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid word_phonemes.json format"])
         }
         return (vocab, w2p)
     }
@@ -223,7 +249,10 @@ public enum TTSHarness {
             throw NSError(
                 domain: "TTSHarness",
                 code: 100,
-                userInfo: [NSLocalizedDescriptionKey: "Voice embedding JSON not found for \(voice). Checked: \(candidates.map { $0.path })"]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Voice embedding JSON not found for \(voice). Checked: \(candidates.map { $0.path })"
+                ]
             )
         }
 
@@ -239,27 +268,37 @@ public enum TTSHarness {
                 var out: [Float] = []
                 out.reserveCapacity(arr.count)
                 for v in arr {
-                    if let n = v as? NSNumber { out.append(n.floatValue) }
-                    else if let d = v as? Double { out.append(Float(d)) }
-                    else if let f = v as? Float { out.append(f) }
-                    else { return nil }
+                    if let n = v as? NSNumber {
+                        out.append(n.floatValue)
+                    } else if let d = v as? Double {
+                        out.append(Float(d))
+                    } else if let f = v as? Float {
+                        out.append(f)
+                    } else {
+                        return nil
+                    }
                 }
                 return out
             }
             return nil
         }
 
-        if let arr = parseArray(jsonAny) { vec = arr }
-        else if let dict = jsonAny as? [String: Any] {
-            if let embed = dict["embedding"], let arr = parseArray(embed) { vec = arr }
-            else if let byVoice = dict[voice], let arr = parseArray(byVoice) { vec = arr }
-            else {
+        if let arr = parseArray(jsonAny) {
+            vec = arr
+        } else if let dict = jsonAny as? [String: Any] {
+            if let embed = dict["embedding"], let arr = parseArray(embed) {
+                vec = arr
+            } else if let byVoice = dict[voice], let arr = parseArray(byVoice) {
+                vec = arr
+            } else {
                 let numericKeys = dict.keys.compactMap { Int($0) }.sorted()
                 var chosen: [Float]? = nil
-                if let exact = dict["\(phonemeCount)"] { chosen = parseArray(exact) }
-                else if let k = numericKeys.last(where: { $0 <= phonemeCount }), let cand = dict["\(k)"] { chosen = parseArray(cand) }
-                if let c = chosen { vec = c }
-                else if let any = dict.values.first { vec = parseArray(any) }
+                if let exact = dict["\(phonemeCount)"] {
+                    chosen = parseArray(exact)
+                } else if let k = numericKeys.last(where: { $0 <= phonemeCount }), let cand = dict["\(k)"] {
+                    chosen = parseArray(cand)
+                }
+                if let c = chosen { vec = c } else if let any = dict.values.first { vec = parseArray(any) }
             }
         }
 
@@ -269,7 +308,10 @@ public enum TTSHarness {
             throw NSError(
                 domain: "TTSHarness",
                 code: 101,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid or missing voice embedding for \(voice) at \(jsonURL.path) (expected 256 floats, got \(vec?.count ?? -1))"]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Invalid or missing voice embedding for \(voice) at \(jsonURL.path) (expected 256 floats, got \(vec?.count ?? -1))"
+                ]
             )
         }
         let values = vec
@@ -293,12 +335,12 @@ public enum TTSHarness {
         wav.append("WAVE".data(using: .ascii)!)
         wav.append("fmt ".data(using: .ascii)!)
         wav.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
-        wav.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) }) // PCM
-        wav.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) }) // mono
+        wav.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // PCM
+        wav.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // mono
         wav.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Array($0) })
         wav.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate * 2).littleEndian) { Array($0) })
-        wav.append(contentsOf: withUnsafeBytes(of: UInt16(2).littleEndian) { Array($0) }) // block align
-        wav.append(contentsOf: withUnsafeBytes(of: UInt16(16).littleEndian) { Array($0) }) // bits per sample
+        wav.append(contentsOf: withUnsafeBytes(of: UInt16(2).littleEndian) { Array($0) })  // block align
+        wav.append(contentsOf: withUnsafeBytes(of: UInt16(16).littleEndian) { Array($0) })  // bits per sample
         wav.append("data".data(using: .ascii)!)
         wav.append(contentsOf: withUnsafeBytes(of: UInt32(pcmData.count).littleEndian) { Array($0) })
         wav.append(pcmData)

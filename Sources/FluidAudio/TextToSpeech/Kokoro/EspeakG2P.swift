@@ -42,7 +42,7 @@ final class EspeakG2P {
                 let s = String(cString: outPtr)
                 if s.isEmpty { return nil }
                 if s.contains(where: { $0.isWhitespace }) {
-                    return s.split{ $0.isWhitespace }.map { String($0) }
+                    return s.split { $0.isWhitespace }.map { String($0) }
                 } else {
                     return s.unicodeScalars.map { String($0) }
                 }

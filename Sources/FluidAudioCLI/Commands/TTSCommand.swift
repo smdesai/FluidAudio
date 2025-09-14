@@ -6,7 +6,10 @@ public struct TTS {
 
     public static func run(arguments: [String]) async {
         // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--auto-download]
-        guard !arguments.isEmpty else { printUsage(); return }
+        guard !arguments.isEmpty else {
+            printUsage()
+            return
+        }
 
         let text = arguments[0]
         var output = "output.wav"
@@ -17,11 +20,18 @@ public struct TTS {
         while i < arguments.count {
             switch arguments[i] {
             case "--help", "-h":
-                printUsage(); return
+                printUsage()
+                return
             case "--output", "-o":
-                if i + 1 < arguments.count { output = arguments[i + 1]; i += 1 }
+                if i + 1 < arguments.count {
+                    output = arguments[i + 1]
+                    i += 1
+                }
             case "--voice", "-v":
-                if i + 1 < arguments.count { voice = arguments[i + 1]; i += 1 }
+                if i + 1 < arguments.count {
+                    voice = arguments[i + 1]
+                    i += 1
+                }
             case "--auto-download":
                 // No-op: downloads are always ensured by the CLI
                 ()

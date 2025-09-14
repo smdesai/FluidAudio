@@ -52,9 +52,9 @@ public struct TtsModels {
         let files = [
             "coremldata.bin",
             "model.mil",
-            "weights/weight.bin",          // optional
-            "metadata.json",               // optional
-            "analytics/coremldata.bin",    // optional
+            "weights/weight.bin",  // optional
+            "metadata.json",  // optional
+            "analytics/coremldata.bin",  // optional
         ]
 
         try FileManager.default.createDirectory(at: modelPath, withIntermediateDirectories: true)
