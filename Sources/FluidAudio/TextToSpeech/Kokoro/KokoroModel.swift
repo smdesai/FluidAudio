@@ -86,9 +86,9 @@ public struct KokoroModel {
         // Download the compiled mlmodelc files (some optional depending on packaging)
         let filesToDownload = [
             "coremldata.bin",
-            "metadata.json",              // optional
+            "metadata.json",  // optional
             "model.mil",
-            "weights/weight.bin",        // optional
+            "weights/weight.bin",  // optional
             "analytics/coremldata.bin",  // optional
         ]
 
@@ -186,6 +186,9 @@ public struct KokoroModel {
     }
 
     /// Load simple word->phonemes dictionary (preferred)
+    /// Supports two formats:
+    /// 1) { "word_to_phonemes": { word: [token, ...] } }
+    /// 2) { word: "ipa string" | [token, ...] } (flat map)
     public static func loadSimplePhonemeDictionary() throws {
         guard !isSimpleDictLoaded else { return }
 
@@ -198,135 +201,85 @@ public struct KokoroModel {
         }
 
         let data = try Data(contentsOf: dictURL)
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let mapping = json["word_to_phonemes"] as? [String: [String]] {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TTSError.processingFailed("Invalid word_phonemes.json (not a JSON object)")
+        }
+
+        // Case 1: expected wrapped format
+        if let mapping = json["word_to_phonemes"] as? [String: [String]] {
             wordToPhonemes = mapping
             isSimpleDictLoaded = true
-            logger.info("Loaded \(wordToPhonemes.count) words from word_phonemes.json")
-        } else {
-            throw TTSError.processingFailed("Invalid word_phonemes.json format")
+            logger.info("Loaded \(wordToPhonemes.count) words from word_phonemes.json (wrapped)")
+            return
         }
+
+        // Case 2: flat map format (word -> String or [String])
+        var tmp: [String: [String]] = [:]
+        let vocabulary = KokoroVocabulary.getVocabulary()
+        let allowed = Set(vocabulary.keys)
+
+        var converted = 0
+        for (k, v) in json {
+            if let s = v as? String {
+                let toks = tokenizeIPAString(s)
+                let filtered = toks.filter { allowed.contains($0) }
+                if !filtered.isEmpty {
+                    tmp[k.lowercased()] = filtered
+                    converted += 1
+                }
+            } else if let arr = v as? [String] {
+                let filtered = arr.filter { allowed.contains($0) }
+                if !filtered.isEmpty {
+                    tmp[k.lowercased()] = filtered
+                    converted += 1
+                }
+            }
+        }
+
+        guard !tmp.isEmpty else {
+            throw TTSError.processingFailed("Unsupported word_phonemes.json format (no usable entries)")
+        }
+
+        wordToPhonemes = tmp
+        isSimpleDictLoaded = true
+        logger.info("Loaded \(wordToPhonemes.count) words from word_phonemes.json (flat)")
     }
 
-    /// Structure to hold word with its phonemes and frame count
-    private struct WordInfo {
-        let word: String
-        let phonemes: [String]
-        let frameCount: Float
+    /// Tokenize an IPA string into model tokens.
+    /// If the string contains whitespace, split on whitespace; otherwise split into Unicode scalars.
+    private static func tokenizeIPAString(_ s: String) -> [String] {
+        if s.contains(where: { $0.isWhitespace }) {
+            return
+                s
+                .components(separatedBy: .whitespacesAndNewlines)
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ",.;:()[]{}\"'")) }
+                .filter { !$0.isEmpty }
+        }
+        // Split into Unicode scalars to preserve single-codepoint IPA tokens (e.g., ʧ, ʤ, ˈ)
+        return s.unicodeScalars.map { String($0) }
     }
 
     /// Structure to hold a chunk of text that fits within 3.17 seconds
-    private struct TextChunk {
-        let words: [String]
-        let phonemes: [String]
-        let totalFrames: Float
-    }
+    // TextChunk is defined in KokoroChunker.swift
 
-    /// Convert text to phonemes with frame timing
-    public static func textToPhonemes(_ text: String) throws -> (phonemes: [String], totalFrames: Float) {
-        try loadSimplePhonemeDictionary()
-
-        let words = text.lowercased().split(separator: " ")
-        var allPhonemes: [String] = []
-
-        for word in words {
-            let cleanWord = String(word).filter { $0.isLetter || $0.isNumber }
-
-            if let phonemes = wordToPhonemes[cleanWord] {
-                allPhonemes.append(contentsOf: phonemes)
-                allPhonemes.append(" ")  // Space between words
-            } else {
-                logger.warning("Word '\(cleanWord)' not in dictionary")
-            }
-        }
-
-        if allPhonemes.last == " " { allPhonemes.removeLast() }
-
-        return (allPhonemes, 0)
-    }
-
-    /// Chunk text into segments that fit within 3.17 seconds
+    /// Chunk text into segments under the model token budget, using punctuation-driven pauses.
     private static func chunkText(_ text: String) throws -> [TextChunk] {
-        // Prefer simple dictionary and produce a single chunk (matches main4.py)
-        do {
-            try loadSimplePhonemeDictionary()
-            let words = text.lowercased().split(separator: " ").map { String($0) }
-            let (phonemes, _) = try textToPhonemes(text)
-            return [TextChunk(words: words, phonemes: phonemes, totalFrames: 0)]
-        } catch {
-            // Fallback to legacy frame-based chunking if needed
-            try loadFramePhonemeDictionary()
-
-            let maxFrames: Float = 76080.0  // 3.17 seconds at 24kHz
-            let words = text.lowercased().split(separator: " ").map { String($0) }
-            var chunks: [TextChunk] = []
-
-            var currentChunkWords: [String] = []
-            var currentChunkPhonemes: [String] = []
-            var currentChunkFrames: Float = 0.0
-
-            for word in words {
-                let cleanWord = word.filter { $0.isLetter || $0.isNumber }
-
-                if let (frameCount, phonemes) = phonemeDictionary[cleanWord] {
-                    if currentChunkFrames + frameCount > maxFrames && !currentChunkWords.isEmpty {
-                        if currentChunkPhonemes.last == " " { currentChunkPhonemes.removeLast() }
-                        chunks.append(TextChunk(words: currentChunkWords, phonemes: currentChunkPhonemes, totalFrames: currentChunkFrames))
-                        currentChunkWords = [word]
-                        currentChunkPhonemes = phonemes + [" "]
-                        currentChunkFrames = frameCount
-                    } else {
-                        currentChunkWords.append(word)
-                        currentChunkPhonemes.append(contentsOf: phonemes)
-                        currentChunkPhonemes.append(" ")
-                        currentChunkFrames += frameCount
-                    }
-                }
-            }
-
-            if !currentChunkWords.isEmpty {
-                if currentChunkPhonemes.last == " " { currentChunkPhonemes.removeLast() }
-                chunks.append(TextChunk(words: currentChunkWords, phonemes: currentChunkPhonemes, totalFrames: currentChunkFrames))
-            }
-
-            return chunks
-        }
+        try loadSimplePhonemeDictionary()
+        let target = targetTokenLength()
+        let hasLang = false
+        return KokoroChunker.chunk(
+            text: text,
+            wordToPhonemes: wordToPhonemes,
+            targetTokens: target,
+            hasLanguageToken: hasLang
+        )
     }
 
-    /// Legacy frame-aware dictionary loader (word -> (frames, phonemes))
-    private static func loadFramePhonemeDictionary() throws {
-        guard !isDictionaryLoaded else { return }
-
-        let cacheDir = try TtsModels.cacheDirectoryURL()
-        let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
-        let dictURL = kokoroDir.appendingPathComponent("word_frames_phonemes.json")
-
-        guard FileManager.default.fileExists(atPath: dictURL.path) else {
-            throw TTSError.modelNotFound("Phoneme dictionary not found at \(dictURL.path)")
-        }
-
-        let data = try Data(contentsOf: dictURL)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: [Any]]
-
-        // Parse the dictionary format: {"word": [frame_count, [phonemes]]}
-        for (word, value) in json {
-            let array = value
-            if array.count == 2,
-                let frameCount = array[0] as? Double,
-                let phonemes = array[1] as? [String]
-            {
-                phonemeDictionary[word] = (Float(frameCount), phonemes)
-            }
-        }
-
-        isDictionaryLoaded = true
-        logger.info("Loaded \(phonemeDictionary.count) words from frame-aware dictionary")
-    }
 
     /// Convert phonemes to input IDs
     public static func phonemesToInputIds(_ phonemes: [String]) -> [Int32] {
         let vocabulary = KokoroVocabulary.getVocabulary()
-        var ids: [Int32] = [0] // BOS/EOS token per Python harness
+        var ids: [Int32] = [0]  // BOS/EOS token per Python harness
         for phoneme in phonemes {
             if let id = vocabulary[phoneme] {
                 ids.append(id)
@@ -341,9 +294,11 @@ public struct KokoroModel {
         if !vocabulary.isEmpty {
             let maxId = vocabulary.values.max() ?? 0
             let minId = vocabulary.values.min() ?? 0
-            let outOfRange = ids.filter { $0 < minId || $0 > maxId }
+            let outOfRange = ids.filter { $0 != 0 && ($0 < minId || $0 > maxId) }
             if !outOfRange.isEmpty {
-                print("Warning: Found \(outOfRange.count) token IDs out of range [\(minId), \(maxId)]")
+                print(
+                    "Warning: Found \(outOfRange.count) token IDs out of range [\(minId), \(maxId)] (excluding BOS/EOS=0)"
+                )
             }
             print("Tokenized \(ids.count) ids; first 32: \(ids.prefix(32))")
         }
@@ -365,7 +320,7 @@ public struct KokoroModel {
             }
         }
         // Fallback to a common unified length if not discoverable
-        return 139
+        return 124
     }
 
     /// Load voice embedding (simplified for 3-second model)
@@ -397,10 +352,15 @@ public struct KokoroModel {
                         var out: [Float] = []
                         out.reserveCapacity(arr.count)
                         for v in arr {
-                            if let n = v as? NSNumber { out.append(n.floatValue) }
-                            else if let d = v as? Double { out.append(Float(d)) }
-                            else if let f = v as? Float { out.append(f) }
-                            else { return nil }
+                            if let n = v as? NSNumber {
+                                out.append(n.floatValue)
+                            } else if let d = v as? Double {
+                                out.append(Float(d))
+                            } else if let f = v as? Float {
+                                out.append(f)
+                            } else {
+                                return nil
+                            }
                         }
                         return out
                     }
@@ -410,15 +370,23 @@ public struct KokoroModel {
                 if let arr = parseArray(json) {
                     vector = arr
                 } else if let dict = json as? [String: Any] {
-                    if let embed = dict["embedding"], let arr = parseArray(embed) { vector = arr }
-                    else if let byVoice = dict[voice], let arr = parseArray(byVoice) { vector = arr }
-                    else {
+                    if let embed = dict["embedding"], let arr = parseArray(embed) {
+                        vector = arr
+                    } else if let byVoice = dict[voice], let arr = parseArray(byVoice) {
+                        vector = arr
+                    } else {
                         let keys = dict.keys.compactMap { Int($0) }.sorted()
                         var chosen: [Float]? = nil
-                        if let exact = dict["\(phonemeCount)"] { chosen = parseArray(exact) }
-                        else if let k = keys.last(where: { $0 <= phonemeCount }), let cand = dict["\(k)"] { chosen = parseArray(cand) }
-                        if let c = chosen { vector = c }
-                        else if let any = dict.values.first { vector = parseArray(any) }
+                        if let exact = dict["\(phonemeCount)"] {
+                            chosen = parseArray(exact)
+                        } else if let k = keys.last(where: { $0 <= phonemeCount }), let cand = dict["\(k)"] {
+                            chosen = parseArray(cand)
+                        }
+                        if let c = chosen {
+                            vector = c
+                        } else if let any = dict.values.first {
+                            vector = parseArray(any)
+                        }
                     }
                 }
             } catch {
@@ -446,23 +414,20 @@ public struct KokoroModel {
     private static func refDimFromModel() -> Int {
         guard let model = kokoroModel else { return 256 }
         if let desc = model.modelDescription.inputDescriptionsByName["ref_s"],
-           let shape = desc.multiArrayConstraint?.shape,
-           shape.count >= 2 {
+            let shape = desc.multiArrayConstraint?.shape,
+            shape.count >= 2
+        {
             let n = shape.last!.intValue
             if n > 0 { return n }
         }
         return 256
     }
 
-    
-
     /// Synthesize a single chunk of text
     private static func synthesizeChunk(_ chunk: TextChunk, voice: String) async throws -> [Float] {
         // Convert phonemes to input IDs
         var phonemeSeq = chunk.phonemes
-        // Prepend language token if present in vocab
-        let vocab = KokoroVocabulary.getVocabulary()
-        if vocab["a"] != nil { phonemeSeq.insert("a", at: 0) }
+        // No language token prefix; avoid audible leading vowel
         let inputIds = phonemesToInputIds(phonemeSeq)
 
         guard !inputIds.isEmpty else {
@@ -494,7 +459,9 @@ public struct KokoroModel {
             attentionMask[i] = NSNumber(value: i < trueLen ? 1 : 0)
         }
 
-        print("targetTokens=\(targetTokens), trueLen=\(trueLen), maskOn=\((0..<targetTokens).reduce(0){ $0 + (attentionMask[$1].intValue) })")
+        print(
+            "targetTokens=\(targetTokens), trueLen=\(trueLen), maskOn=\((0..<targetTokens).reduce(0){ $0 + (attentionMask[$1].intValue) })"
+        )
 
         // Use zeros for phases for determinism (works well for 3s model)
         let phasesArray = try MLMultiArray(shape: [1, 9] as [NSNumber], dataType: .float32)
@@ -532,7 +499,8 @@ public struct KokoroModel {
 
         // Extract audio output explicitly by key used by model
         guard let audioArrayUnwrapped = output.featureValue(for: "audio")?.multiArrayValue,
-              audioArrayUnwrapped.count > 0 else {
+            audioArrayUnwrapped.count > 0
+        else {
             let names = Array(output.featureNames)
             throw TTSError.processingFailed("Failed to extract 'audio' output. Features: \(names)")
         }
@@ -615,20 +583,50 @@ public struct KokoroModel {
 
             return audioData
         } else {
-            // Multiple chunks - process and concatenate
+            // Multiple chunks - process and concatenate with boundary handling
             logger.info("Text split into \(chunks.count) chunks")
             var allSamples: [Float] = []
 
-            for (i, chunk) in chunks.enumerated() {
+            // let sampleRate = 24000  // implicit by model; reserved for future resampling logic
+            let crossfadeMs = 8
+            let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
+
+            for i in 0..<chunks.count {
+                let chunk = chunks[i]
                 logger.info(
                     "Processing chunk \(i+1)/\(chunks.count): \(chunk.words.count) words, \(chunk.totalFrames) frames")
                 let chunkSamples = try await synthesizeChunk(chunk, voice: voice)
-                allSamples.append(contentsOf: chunkSamples)
-
-                // Add small silence between chunks (0.1 seconds = 2400 samples at 24kHz)
-                if i < chunks.count - 1 {
-                    let silenceSamples = Array(repeating: Float(0.0), count: 2400)
-                    allSamples.append(contentsOf: silenceSamples)
+                if i == 0 {
+                    allSamples.append(contentsOf: chunkSamples)
+                } else {
+                    let prevPause = chunks[i - 1].pauseAfterMs
+                    if prevPause > 0 {
+                        let silenceCount = Int(Double(prevPause) * 24.0)
+                        if silenceCount > 0 {
+                            allSamples.append(contentsOf: Array(repeating: 0.0, count: silenceCount))
+                        }
+                        allSamples.append(contentsOf: chunkSamples)
+                    } else {
+                        // Micro crossfade join (only when no punctuation-driven pause)
+                        let n = min(crossfadeN, allSamples.count, chunkSamples.count)
+                        if n > 0 {
+                            // Fade out last n of allSamples, fade in first n of chunkSamples
+                            for k in 0..<n {
+                                let aIdx = allSamples.count - n + k
+                                let bIdx = k
+                                let t = Float(k) / Float(n)
+                                let fadeOut = 1.0 - t
+                                let fadeIn = t
+                                allSamples[aIdx] = allSamples[aIdx] * fadeOut + chunkSamples[bIdx] * fadeIn
+                            }
+                            // Append remainder of chunk after crossfade overlap
+                            if chunkSamples.count > n {
+                                allSamples.append(contentsOf: chunkSamples[n...])
+                            }
+                        } else {
+                            allSamples.append(contentsOf: chunkSamples)
+                        }
+                    }
                 }
             }
 
@@ -687,54 +685,5 @@ public struct KokoroModel {
         return wavData
     }
 
-    /// Convert MLMultiArray to WAV data
-    private static func convertToWAV(_ audioArray: MLMultiArray) throws -> Data {
-        let sampleRate: Double = 24000  // 24 kHz sample rate
-        let count = audioArray.count
-
-        // Extract float samples
-        var samples: [Float] = []
-        for i in 0..<count {
-            samples.append(audioArray[i].floatValue)
-        }
-
-        // Normalize
-        let maxVal = samples.map { abs($0) }.max() ?? 1.0
-        if maxVal > 0 {
-            samples = samples.map { $0 / maxVal }
-        }
-
-        // Convert to 16-bit PCM
-        var pcmData = Data()
-        for sample in samples {
-            let pcmSample = Int16(max(-32768, min(32767, sample * 32767)))
-            pcmData.append(contentsOf: withUnsafeBytes(of: pcmSample) { Array($0) })
-        }
-
-        // Create WAV header
-        var wavData = Data()
-
-        // RIFF header
-        wavData.append(contentsOf: "RIFF".data(using: .ascii)!)
-        let fileSize = UInt32(36 + pcmData.count)
-        wavData.append(contentsOf: withUnsafeBytes(of: fileSize.littleEndian) { Array($0) })
-        wavData.append(contentsOf: "WAVE".data(using: .ascii)!)
-
-        // fmt chunk
-        wavData.append(contentsOf: "fmt ".data(using: .ascii)!)
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // PCM
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) })  // Mono
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(sampleRate * 2).littleEndian) { Array($0) })
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(2).littleEndian) { Array($0) })  // Block align
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt16(16).littleEndian) { Array($0) })  // Bits per sample
-
-        // data chunk
-        wavData.append(contentsOf: "data".data(using: .ascii)!)
-        wavData.append(contentsOf: withUnsafeBytes(of: UInt32(pcmData.count).littleEndian) { Array($0) })
-        wavData.append(pcmData)
-
-        return wavData
-    }
+    // convertToWAV removed (unused); use convertSamplesToWAV instead
 }

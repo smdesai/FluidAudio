@@ -211,14 +211,16 @@ public struct Kokoro {
             // Fallback: search first float array
             for name in output.featureNames {
                 if let arr = output.featureValue(for: name)?.multiArrayValue,
-                   arr.dataType == .float32 || arr.dataType == .float16 {
+                    arr.dataType == .float32 || arr.dataType == .float16
+                {
                     return arr
                 }
             }
             return MLMultiArray()
         }()
         if audioOutput.count == 0 {
-            throw TTSError.processingFailed("No float audio output found in model outputs: \(Array(output.featureNames))")
+            throw TTSError.processingFailed(
+                "No float audio output found in model outputs: \(Array(output.featureNames))")
         }
 
         logger.info("Audio output shape: \(audioOutput.shape), count: \(audioOutput.count)")
@@ -226,9 +228,13 @@ public struct Kokoro {
         // Optional trim using audio_length_samples if provided
         var effectiveCount = audioOutput.count
         if let lenFV = output.featureValue(for: "audio_length_samples") {
-            if let la = lenFV.multiArrayValue, la.count > 0 { effectiveCount = max(0, la[0].intValue) }
-            else if lenFV.type == .int64 { effectiveCount = max(0, Int(lenFV.int64Value)) }
-            else if lenFV.type == .double { effectiveCount = max(0, Int(lenFV.doubleValue)) }
+            if let la = lenFV.multiArrayValue, la.count > 0 {
+                effectiveCount = max(0, la[0].intValue)
+            } else if lenFV.type == .int64 {
+                effectiveCount = max(0, Int(lenFV.int64Value))
+            } else if lenFV.type == .double {
+                effectiveCount = max(0, Int(lenFV.doubleValue))
+            }
             effectiveCount = min(effectiveCount, audioOutput.count)
         }
 

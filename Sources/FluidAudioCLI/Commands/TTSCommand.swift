@@ -17,8 +17,8 @@ public struct TTS {
         var autoDownload = false
 
         for i in 0..<arguments.count {
-            if (arguments[i] == "--output" || arguments[i] == "-o"), i + 1 < arguments.count { output = arguments[i + 1] }
-            if (arguments[i] == "--voice" || arguments[i] == "-v"), i + 1 < arguments.count { voice = arguments[i + 1] }
+            if arguments[i] == "--output" || arguments[i] == "-o", i + 1 < arguments.count { output = arguments[i + 1] }
+            if arguments[i] == "--voice" || arguments[i] == "-v", i + 1 < arguments.count { voice = arguments[i + 1] }
             if arguments[i] == "--auto-download" { autoDownload = true }
         }
 
@@ -26,11 +26,11 @@ public struct TTS {
             if autoDownload {
                 try await KokoroModel.ensureRequiredFiles()
             }
-            // Delegate to the unified harness so tts and tts-harness are identical
-            var harnessArgs: [String] = []
-            harnessArgs.append(text)
-            harnessArgs.append(contentsOf: ["--voice", voice, "--output", output])
-            await TTSHarness.run(arguments: harnessArgs)
+            // Use full KokoroModel pipeline (with chunking + punctuation-driven pauses)
+            let wav = try await KokoroModel.synthesize(text: text, voice: voice)
+            let outURL = URL(fileURLWithPath: output)
+            try wav.write(to: outURL)
+            print("Saved: \(outURL.path)")
         } catch {
             print("Error: \(error.localizedDescription)")
         }
