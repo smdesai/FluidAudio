@@ -231,18 +231,20 @@ public class DownloadUtils {
         return models
     }
 
-    /// Get required model names from the appropriate manager
+    /// Get required model names for a given repository
+    /// Uses centralized ModelNames where available to avoid cross‑type coupling
     @available(macOS 13.0, iOS 16.0, *)
     private static func getRequiredModelNames(for repo: Repo) -> Set<String> {
         switch repo {
         case .vad:
-            return VadManager.requiredModelNames
+            return ModelNames.VAD.requiredModels
         case .parakeet:
-            return AsrModels.requiredModelNames
+            return ModelNames.ASR.requiredModels
         case .diarizer:
-            return DiarizerModels.requiredModelNames
+            return ModelNames.Diarizer.requiredModels
         case .kokoro:
-            return Set(["kokoro_completev21.mlmodelc"])  // unified Kokoro TTS model bundle
+            // Unified Kokoro TTS model bundle name
+            return Set(["kokoro_completev21.mlmodelc"])
         }
     }
 
@@ -254,8 +256,8 @@ public class DownloadUtils {
         let repoPath = directory.appendingPathComponent(repo.folderName)
         try FileManager.default.createDirectory(at: repoPath, withIntermediateDirectories: true)
 
-        // Get the required model names for this repo from the appropriate manager
-        let requiredModels = ModelNames.getRequiredModelNames(for: repo)
+        // Get the required model names for this repo
+        let requiredModels = getRequiredModelNames(for: repo)
 
         // Download all repository contents
         let files = try await listRepoFiles(repo)
