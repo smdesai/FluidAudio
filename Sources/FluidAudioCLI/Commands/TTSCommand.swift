@@ -5,7 +5,7 @@ import Foundation
 public struct TTS {
 
     public static func run(arguments: [String]) async {
-        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--auto-download]
+        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json] [--auto-download]
         guard !arguments.isEmpty else {
             printUsage()
             return
@@ -14,6 +14,7 @@ public struct TTS {
         let text = arguments[0]
         var output = "output.wav"
         var voice = "af_heart"
+        var metricsPath: String? = nil
         // Always ensure required files in CLI
 
         var i = 1
@@ -32,6 +33,11 @@ public struct TTS {
                     voice = arguments[i + 1]
                     i += 1
                 }
+            case "--metrics":
+                if i + 1 < arguments.count {
+                    metricsPath = arguments[i + 1]
+                    i += 1
+                }
             case "--auto-download":
                 // No-op: downloads are always ensured by the CLI
                 ()
@@ -43,13 +49,104 @@ public struct TTS {
         }
 
         do {
-            // Always ensure required files (model + dictionary)
+            // Timing buckets
+            let tStart = Date()
+
+            // 1) Ensure required resources (dictionary)
             try await KokoroModel.ensureRequiredFiles()
-            // Use full KokoroModel pipeline (with chunking + punctuation-driven pauses)
+
+            // 2) Ensure voice embedding in cache
+            try? await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: voice)
+
+            // 3) Load/compile model if needed
+            let tLoad0 = Date()
+            try await KokoroModel.loadModel()
+            let tLoad1 = Date()
+
+            // 4) Synthesize (includes chunking + inference + stitching + WAV pack)
+            let tSynth0 = Date()
             let wav = try await KokoroModel.synthesize(text: text, voice: voice)
+            let tSynth1 = Date()
+
+            // Write WAV
             let outURL = URL(fileURLWithPath: output)
             try wav.write(to: outURL)
             print("Saved: \(outURL.path)")
+
+            // Metrics
+            if let metricsPath = metricsPath {
+                let loadS = tLoad1.timeIntervalSince(tLoad0)
+                let synthS = tSynth1.timeIntervalSince(tSynth0)
+                let totalS = tSynth1.timeIntervalSince(tStart)
+
+                // Approx audio seconds from WAV header (24 kHz mono)
+                let audioSecs: Double = {
+                    // 44-byte header typical, but use Data length minus header if possible.
+                    // We store raw bytes; Safe estimate: payload / (24000 * 2)
+                    let bytes = wav.count
+                    let payload = max(0, bytes - 44)
+                    return Double(payload) / Double(24000 * 2)
+                }()
+                let rtf = audioSecs > 0 ? (synthS / audioSecs) : 0
+                let realtimeSpeed = rtf > 0 ? (1.0 / rtf) : 0
+
+                // Run ASR on the generated audio for comparison
+                var asrHypothesis: String? = nil
+                var werValue: Double? = nil
+
+                print("\n--- Running ASR for TTS evaluation ---")
+                do {
+                    // Load ASR models and initialize
+                    let models = try await AsrModels.downloadAndLoad()
+                    let asr = AsrManager()
+                    try await asr.initialize(models: models)
+
+                    // Transcribe the generated audio file
+                    let transcription = try await asr.transcribe(outURL)
+                    asrHypothesis = transcription.text
+
+                    // Calculate WER
+                    werValue = calculateWER(reference: text, hypothesis: transcription.text)
+
+                    print("Reference: \(text)")
+                    print("ASR Output: \(transcription.text)")
+                    print(String(format: "WER: %.1f%%", werValue! * 100))
+
+                    // Clean up ASR resources
+                    asr.cleanup()
+                } catch {
+                    print("ASR evaluation failed: \(error.localizedDescription)")
+                }
+
+                var metricsDict: [String: Any] = [
+                    "inference_time_s": synthS,
+                    "realtime_speed": realtimeSpeed,
+                    "audio_duration_s": audioSecs,
+                    "model_load_time_s": loadS,
+                    "total_time_s": totalS,
+                ]
+
+                // Add ASR comparison if available
+                if let asrHypothesis = asrHypothesis {
+                    metricsDict["asr_hypothesis"] = asrHypothesis
+                    if let werValue = werValue {
+                        metricsDict["wer"] = werValue
+                    }
+                }
+
+                let dict: [String: Any] = [
+                    "text": text,
+                    "voice": voice,
+                    "output": outURL.path,
+                    "metrics": metricsDict,
+                ]
+
+                // Write JSON
+                let json = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted])
+                let mURL = URL(fileURLWithPath: metricsPath)
+                try json.write(to: mURL)
+                print("\nMetrics saved: \(mURL.path)")
+            }
         } catch {
             print("Error: \(error.localizedDescription)")
         }
@@ -58,14 +155,87 @@ public struct TTS {
     private static func printUsage() {
         print(
             """
-            Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart]
+            Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json]
 
             Options:
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart)
+              --metrics            Write timing metrics to a JSON file (also runs ASR for evaluation)
               (models/dictionary auto-download is always on in CLI)
               --help, -h           Show this help
             """
         )
+    }
+
+    private static func calculateWER(reference: String, hypothesis: String) -> Double {
+        // Normalize text for comparison
+        func normalize(_ text: String) -> String {
+            return
+                text
+                .lowercased()
+                .replacingOccurrences(of: "\u{2019}", with: "'")  // smart quotes
+                .replacingOccurrences(of: "\u{2018}", with: "'")
+                .replacingOccurrences(of: "\u{201c}", with: "\"")
+                .replacingOccurrences(of: "\u{201d}", with: "\"")
+                .replacingOccurrences(of: "\u{2014}", with: "-")  // em dash
+                .replacingOccurrences(of: "\u{2026}", with: "...")  // ellipsis
+        }
+
+        // Tokenize into words (alphanumeric + apostrophe only)
+        func tokenize(_ text: String) -> [String] {
+            var tokens: [String] = []
+            var currentToken = ""
+
+            for char in normalize(text) {
+                if char.isLetter || char.isNumber || char == "'" {
+                    currentToken.append(char)
+                } else {
+                    if !currentToken.isEmpty {
+                        tokens.append(currentToken)
+                        currentToken = ""
+                    }
+                }
+            }
+            if !currentToken.isEmpty {
+                tokens.append(currentToken)
+            }
+            return tokens
+        }
+
+        let refTokens = tokenize(reference)
+        let hypTokens = tokenize(hypothesis)
+
+        // Handle empty cases
+        if refTokens.isEmpty {
+            return hypTokens.isEmpty ? 0.0 : 1.0
+        }
+
+        // Calculate Levenshtein distance using dynamic programming
+        let n = refTokens.count
+        let m = hypTokens.count
+        var dp = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
+
+        // Initialize base cases
+        for i in 0...n {
+            dp[i][0] = i
+        }
+        for j in 0...m {
+            dp[0][j] = j
+        }
+
+        // Fill the DP table
+        for i in 1...n {
+            for j in 1...m {
+                let cost = refTokens[i - 1] == hypTokens[j - 1] ? 0 : 1
+                dp[i][j] = min(
+                    dp[i - 1][j] + 1,  // deletion
+                    dp[i][j - 1] + 1,  // insertion
+                    dp[i - 1][j - 1] + cost  // substitution
+                )
+            }
+        }
+
+        // WER = edits / reference_length
+        return Double(dp[n][m]) / Double(n)
     }
 }

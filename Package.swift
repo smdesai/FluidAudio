@@ -19,9 +19,13 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        .binaryTarget(
+            name: "ESpeakNG",
+            path: "Frameworks/ESpeakNG.xcframework"
+        ),
         .target(
             name: "FluidAudio",
-            dependencies: [],
+            dependencies: ["ESpeakNG"],
             path: "Sources/FluidAudio",
             exclude: []
         ),

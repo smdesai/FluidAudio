@@ -66,7 +66,7 @@ enum KokoroChunker {
                         out.append(contentsOf: arr)
                     } else {
                         // Use C eSpeak NG for OOV phonemization only (if available)
-                        #if canImport(CEspeakNG)
+                        #if canImport(ESpeakNG) || canImport(CEspeakNG)
                         if let ipa = EspeakG2P.shared.phonemize(word: key) {
                             let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
                             if !mapped.isEmpty {
@@ -127,14 +127,20 @@ enum KokoroChunker {
             for ch in sentence {
                 if ch == "," || ch == ";" || ch == ":" {
                     let trimmed = buf.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty { parts.append((trimmed, pauseClause)) }
+                    if !trimmed.isEmpty {
+                        parts.append((trimmed, pauseClause))
+                        KokoroChunker.logger.info("    Split at '\(ch)': added '\(trimmed)'")
+                    }
                     buf = ""
                 } else {
                     buf.append(ch)
                 }
             }
             let last = buf.trimmingCharacters(in: .whitespaces)
-            if !last.isEmpty { parts.append((last, endPunct != nil ? pauseSentence : 0)) }
+            if !last.isEmpty {
+                parts.append((last, endPunct != nil ? pauseSentence : 0))
+                KokoroChunker.logger.info("    Final part: '\(last)'")
+            }
             return parts
         }
 
@@ -148,9 +154,13 @@ enum KokoroChunker {
             var units: [(words: [String], pause: Int)] = []
             for (sent, endP) in sentences {
                 let clauses = splitClauses(sent, endPunct: endP)
-                for (cl, pause) in clauses {
+                KokoroChunker.logger.info("Sentence: '\(sent)' -> \(clauses.count) clauses")
+                for (idx, (cl, pause)) in clauses.enumerated() {
                     let words = cl.lowercased().split(separator: " ").map { String($0) }
-                    if !words.isEmpty { units.append((words, pause)) }
+                    if !words.isEmpty {
+                        units.append((words, pause))
+                        KokoroChunker.logger.info("  Clause \(idx): '\(cl)' -> \(words.count) words, pause=\(pause)")
+                    }
                 }
             }
 
@@ -171,6 +181,16 @@ enum KokoroChunker {
                 }
 
                 if fitsEmpty == false {
+                    // First, flush any existing buffer before micro-splitting
+                    if !curPhon.isEmpty {
+                        if curPhon.last == " " { curPhon.removeLast() }
+                        chunks.append(
+                            TextChunk(words: curWords, phonemes: curPhon, totalFrames: 0, pauseAfterMs: lastPause))
+                        curWords.removeAll()
+                        curPhon.removeAll()
+                        curTokenCount = baseOverhead
+                    }
+
                     // Micro-split: accumulate word-by-word within this unit.
                     var subWords: [String] = []
                     var subPhon: [String] = []

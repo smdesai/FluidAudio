@@ -63,6 +63,11 @@ public struct KokoroModel {
         // Download dictionary files using our simplified helper (which uses DownloadUtils.sharedSession)
         try await downloadFileIfNeeded(filename: "word_phonemes.json", urlPath: "word_phonemes.json")
         try await downloadFileIfNeeded(filename: "word_frames_phonemes.json", urlPath: "word_frames_phonemes.json")
+
+        // Ensure eSpeak NG data bundle exists (download from HuggingFace Resources if missing)
+        let cacheDir = try TtsModels.cacheDirectoryURL()
+        let modelsDirectory = cacheDir.appendingPathComponent("Models")
+        _ = try? await DownloadUtils.ensureEspeakDataBundle(in: modelsDirectory)
     }
 
     /// Load the Kokoro model
@@ -380,9 +385,13 @@ public struct KokoroModel {
             "random_phases": phasesArray,
         ])
 
+        // Time ONLY the model prediction
+        let predictionStart = Date()
         guard let output = try kokoroModel?.prediction(from: modelInput) else {
             throw TTSError.processingFailed("Model prediction failed")
         }
+        let predictionTime = Date().timeIntervalSince(predictionStart)
+        print("[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s")
 
         // Extract audio output explicitly by key used by model
         guard let audioArrayUnwrapped = output.featureValue(for: "audio")?.multiArrayValue,
@@ -444,6 +453,50 @@ public struct KokoroModel {
             try await loadModel()
         }
 
+        // Preload dictionary for OOV detection
+        try loadSimplePhonemeDictionary()
+
+        // If there are OOV words and G2P data is missing, fail fast per policy.
+        do {
+            // Normalize words similarly to chunker
+            let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
+            func normalize(_ s: String) -> String {
+                let lowered = s.lowercased()
+                    .replacingOccurrences(of: "\u{2019}", with: "'")
+                    .replacingOccurrences(of: "\u{2018}", with: "'")
+                return String(lowered.unicodeScalars.filter { allowedSet.contains($0) })
+            }
+
+            let tokens =
+                text
+                .lowercased()
+                .split(whereSeparator: { $0.isWhitespace })
+                .map { String($0) }
+            var oov: [String] = []
+            oov.reserveCapacity(8)
+            for raw in tokens {
+                let key = normalize(raw)
+                if key.isEmpty { continue }
+                if wordToPhonemes[key] == nil {
+                    oov.append(key)
+                    if oov.count >= 8 { break }
+                }
+            }
+            #if canImport(ESpeakNG) || canImport(CEspeakNG)
+            if !oov.isEmpty && EspeakG2P.isDataAvailable() == false {
+                throw TTSError.processingFailed(
+                    "G2P (eSpeak NG) data missing but required for OOV words: \(Set(oov).sorted().prefix(5).joined(separator: ", ")). Ensure the eSpeak NG data bundle is available in the models cache (use DownloadUtils.ensureEspeakDataBundle)."
+                )
+            }
+            #else
+            if !oov.isEmpty {
+                throw TTSError.processingFailed(
+                    "G2P (eSpeak NG) not included in this build but required for OOV words: \(Set(oov).sorted().prefix(5).joined(separator: ", "))."
+                )
+            }
+            #endif
+        }
+
         // Chunk the text based on frame counts
         let chunks = try chunkText(text)
 
@@ -482,6 +535,7 @@ public struct KokoroModel {
                 let chunk = chunks[i]
                 logger.info(
                     "Processing chunk \(i+1)/\(chunks.count): \(chunk.words.count) words, \(chunk.totalFrames) frames")
+                logger.info("Chunk \(i+1) text: '\(chunk.words.joined(separator: " "))'")
                 let chunkSamples = try await synthesizeChunk(chunk, voice: voice)
                 if i == 0 {
                     allSamples.append(contentsOf: chunkSamples)

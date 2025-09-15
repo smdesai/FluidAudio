@@ -220,8 +220,8 @@ swift run fluidaudio vad-benchmark --num-files 50 --threshold 0.3
 - Output: 24 kHz mono WAV
 
 Requirements (macOS)
-- Homebrew packages:
-  - `brew install espeak-ng pkg-config`
+Ensure eSpeak NG headers/libs are available via pkg-config (`espeak-ng`).
+https://github.com/espeak-ng/espeak-ng/tree/master 
 
 ### Quick Start (CLI)
 
@@ -254,7 +254,7 @@ Task {
 ```
 
 Troubleshooting
-- Build requires eSpeak NG headers/libs for the C API: `brew install espeak-ng pkg-config`
+Build requires eSpeak NG headers/libs for the C API discoverable via pkg-config (`espeak-ng`).
 - If SwiftPM cannot find headers, build with explicit paths:
   - `swift build -Xcc -I/opt/homebrew/include -Xlinker -L/opt/homebrew/lib`
 - Dictionary and model assets are cached under `~/.cache/fluidaudio/Models/kokoro`.
