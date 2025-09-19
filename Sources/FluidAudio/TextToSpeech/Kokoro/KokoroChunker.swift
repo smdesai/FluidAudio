@@ -83,24 +83,43 @@ enum KokoroChunker {
         let safety = 12
         let cap = max(1, targetTokens - safety)
 
+        let vocabulary = KokoroVocabulary.getVocabulary()
+        let punctuationTokensToStrip: Set<String> = [":", ";", ","]
+        let punctuationEndingTokens: Set<String> = [".", "!", "?", "…"]
+        // Conjunctions & prepositions we try not to end a chunk on (keep in lowercase)
+        let boundaryStopWords: Set<String> = [
+            // Coordinating conjunctions
+            "and", "but", "or", "nor", "so", "yet", "for",
+            // Common prepositions
+            "with", "without", "about", "above", "below", "across",
+            "after", "before", "into", "onto", "upon", "between",
+            "among", "around", "near", "to", "of", "in", "on",
+            "at", "by", "from", "over", "under", "through",
+            // Subordinating conjunctions / prepositional variants
+            "during", "regarding", "concerning", "because", "since",
+            "though", "although", "while"
+        ]
+        let periodTokenAvailable = vocabulary["."] != nil
+
         // Pause mapping (ms)
         let pauseSentence = 300
         let pauseClause = 150
         let pauseParagraph = 500
 
+        let normalizationSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
+
+        func normalizeWord(_ s: String) -> String {
+            let lowered = s.lowercased()
+                .replacingOccurrences(of: "\u{2019}", with: "'")
+                .replacingOccurrences(of: "\u{2018}", with: "'")
+            return String(lowered.unicodeScalars.filter { normalizationSet.contains($0) })
+        }
+
         func phonemizeWords(_ words: [String]) -> [String] {
-            let vocab = KokoroVocabulary.getVocabulary()
-            let allowed = Set(vocab.keys)
+            let allowed = Set(vocabulary.keys)
 
             func isPunct(_ ch: Character) -> Bool {
                 return !(ch.isLetter || ch.isNumber || ch.isWhitespace || ch == "'")
-            }
-            func normalize(_ s: String) -> String {
-                let lowered = s.lowercased()
-                    .replacingOccurrences(of: "\u{2019}", with: "'")
-                    .replacingOccurrences(of: "\u{2018}", with: "'")
-                let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
-                return String(lowered.unicodeScalars.filter { allowedSet.contains($0) })
             }
 
             var out: [String] = []
@@ -109,7 +128,7 @@ enum KokoroChunker {
                 var seg = ""
                 func flushSeg() {
                     guard !seg.isEmpty else { return }
-                    let key = normalize(seg)
+                    let key = normalizeWord(seg)
                     if let arr = wordToPhonemes[key] {
                         out.append(contentsOf: arr)
                     } else {
@@ -191,20 +210,60 @@ enum KokoroChunker {
             return out
         }
 
-        /// Remove trailing whitespace tokens and suppress terminal colon/semicolon tokens so
-        /// punctuation pauses do not produce artifacts in the synthesised audio.
-        func sanitizeChunkTokens(_ tokens: [String]) -> [String] {
+        func appendPeriod(to atoms: inout [String]) {
+            guard !atoms.isEmpty else {
+                atoms.append(".")
+                return
+            }
+            var updated = atoms[atoms.count - 1]
+            while let last = updated.last, last.isWhitespace {
+                updated.removeLast()
+            }
+            while let last = updated.last, punctuationTokensToStrip.contains(String(last)) {
+                updated.removeLast()
+            }
+            if updated.isEmpty {
+                atoms[atoms.count - 1] = "."
+            } else {
+                atoms[atoms.count - 1] = updated + "."
+            }
+        }
+
+        /// Remove trailing whitespace tokens and suppress terminal colon/semicolon/comma tokens so
+        /// punctuation pauses do not produce artifacts in the synthesised audio. Optionally appends
+        /// a terminating period when a chunk ends on a conjunction or preposition (if budget allows).
+        func sanitizeChunkTokens(
+            _ tokens: [String],
+            lastWord: String?,
+            currentTokenCount: Int
+        ) -> ([String], Bool) {
             var cleaned = tokens
             while let last = cleaned.last, last == " " {
                 cleaned.removeLast()
             }
-            if let last = cleaned.last, last == ":" || last == ";" {
+            if let last = cleaned.last, punctuationTokensToStrip.contains(last) {
                 cleaned.removeLast()
                 while let tail = cleaned.last, tail == " " {
                     cleaned.removeLast()
                 }
             }
-            return cleaned
+
+            var appendedPeriod = false
+            if periodTokenAvailable {
+                let normalized = lastWord.map { normalizeWord($0) }
+                if let normalized,
+                    !normalized.isEmpty,
+                    boundaryStopWords.contains(normalized)
+                {
+                    let alreadyTerminated = cleaned.last.map { punctuationEndingTokens.contains($0) || punctuationTokensToStrip.contains($0) } ?? false
+                    if alreadyTerminated == false && currentTokenCount + 1 <= targetTokens {
+                        cleaned.append(".")
+                        appendedPeriod = true
+                    }
+                }
+            }
+
+            return (cleaned, appendedPeriod)
         }
 
         func splitSentences(_ paragraph: String) -> [(String, Character?)] {
@@ -290,7 +349,11 @@ enum KokoroChunker {
                 if fitsEmpty == false {
                     // First, flush any existing buffer before micro-splitting
                     if !curPhon.isEmpty {
-                        let cleaned = sanitizeChunkTokens(curPhon)
+                        let (cleaned, appendedPeriod) = sanitizeChunkTokens(
+                            curPhon,
+                            lastWord: curWords.last,
+                            currentTokenCount: curTokenCount)
+                        if appendedPeriod { appendPeriod(to: &curAtoms) }
                         if !cleaned.isEmpty {
                             chunks.append(
                                 TextChunk(
@@ -314,7 +377,11 @@ enum KokoroChunker {
 
                     func flushSub(finalPause: Int) {
                         if !subPhon.isEmpty {
-                            let cleaned = sanitizeChunkTokens(subPhon)
+                            let (cleaned, appendedPeriod) = sanitizeChunkTokens(
+                                subPhon,
+                                lastWord: subWords.last,
+                                currentTokenCount: subCount)
+                            if appendedPeriod { appendPeriod(to: &subAtoms) }
                             if !cleaned.isEmpty {
                                 chunks.append(
                                     TextChunk(
@@ -374,7 +441,11 @@ enum KokoroChunker {
                     lastPause = unit.pause
                 } else {
                     if !curPhon.isEmpty {
-                        let cleaned = sanitizeChunkTokens(curPhon)
+                        let (cleaned, appendedPeriod) = sanitizeChunkTokens(
+                            curPhon,
+                            lastWord: curWords.last,
+                            currentTokenCount: curTokenCount)
+                        if appendedPeriod { appendPeriod(to: &curAtoms) }
                         if !cleaned.isEmpty {
                             chunks.append(
                                 TextChunk(
@@ -393,8 +464,12 @@ enum KokoroChunker {
                 }
             }
             if !curPhon.isEmpty {
-                let cleaned = sanitizeChunkTokens(curPhon)
+                let (cleaned, appendedPeriod) = sanitizeChunkTokens(
+                    curPhon,
+                    lastWord: curWords.last,
+                    currentTokenCount: curTokenCount)
                 guard !cleaned.isEmpty else { continue }
+                if appendedPeriod { appendPeriod(to: &curAtoms) }
                 let paraPause = (pIndex < paragraphs.count - 1) ? pauseParagraph : lastPause
                 chunks.append(
                     TextChunk(
