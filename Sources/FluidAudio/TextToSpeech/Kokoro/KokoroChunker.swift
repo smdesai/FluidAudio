@@ -8,9 +8,14 @@ import OSLog
 /// - pauseAfterMs: Silence to insert after this chunk (punctuation/paragraph driven)
 struct TextChunk {
     let words: [String]
+    let originalWords: [String]
     let phonemes: [String]
     let totalFrames: Float
     let pauseAfterMs: Int
+
+    var text: String {
+        originalWords.joined(separator: " ")
+    }
 }
 
 /// Punctuation-aware chunker that splits paragraphs → sentences → clauses
@@ -151,25 +156,30 @@ enum KokoroChunker {
         var chunks: [TextChunk] = []
         for (pIndex, para) in paragraphs.enumerated() {
             let sentences = splitSentences(para)
-            var units: [(words: [String], pause: Int)] = []
+            var units: [(words: [String], originalWords: [String], pause: Int)] = []
             for (sent, endP) in sentences {
                 let clauses = splitClauses(sent, endPunct: endP)
                 KokoroChunker.logger.info("Sentence: '\(sent)' -> \(clauses.count) clauses")
                 for (idx, (cl, pause)) in clauses.enumerated() {
-                    let words = cl.lowercased().split(separator: " ").map { String($0) }
+                    let trimmed = cl.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty else { continue }
+                    let originalWords = trimmed.split(whereSeparator: { $0.isWhitespace }).map { String($0) }
+                    let words = originalWords.map { $0.lowercased() }
                     if !words.isEmpty {
-                        units.append((words, pause))
-                        KokoroChunker.logger.info("  Clause \(idx): '\(cl)' -> \(words.count) words, pause=\(pause)")
+                        units.append((words, originalWords, pause))
+                        KokoroChunker.logger.info(
+                            "  Clause \(idx): '\(trimmed)' -> \(words.count) words, pause=\(pause)")
                     }
                 }
             }
 
             var curWords: [String] = []
+            var curOriginalWords: [String] = []
             var curPhon: [String] = []
             var curTokenCount = baseOverhead
             var lastPause = pIndex < paragraphs.count - 1 ? pauseParagraph : 0
 
-            for (words, pause) in units {
+            for (words, originalWords, pause) in units {
                 let ph = phonemizeWords(words)
                 // If the entire unit doesn't fit into an empty chunk, split by words to respect budget.
                 let fitsEmpty = (baseOverhead + ph.count) <= cap
@@ -185,14 +195,21 @@ enum KokoroChunker {
                     if !curPhon.isEmpty {
                         if curPhon.last == " " { curPhon.removeLast() }
                         chunks.append(
-                            TextChunk(words: curWords, phonemes: curPhon, totalFrames: 0, pauseAfterMs: lastPause))
+                            TextChunk(
+                                words: curWords,
+                                originalWords: curOriginalWords,
+                                phonemes: curPhon,
+                                totalFrames: 0,
+                                pauseAfterMs: lastPause))
                         curWords.removeAll()
+                        curOriginalWords.removeAll()
                         curPhon.removeAll()
                         curTokenCount = baseOverhead
                     }
 
                     // Micro-split: accumulate word-by-word within this unit.
                     var subWords: [String] = []
+                    var subOriginalWords: [String] = []
                     var subPhon: [String] = []
                     var subCount = baseOverhead
 
@@ -200,14 +217,21 @@ enum KokoroChunker {
                         if !subPhon.isEmpty {
                             if subPhon.last == " " { subPhon.removeLast() }
                             chunks.append(
-                                TextChunk(words: subWords, phonemes: subPhon, totalFrames: 0, pauseAfterMs: finalPause))
+                                TextChunk(
+                                    words: subWords,
+                                    originalWords: subOriginalWords,
+                                    phonemes: subPhon,
+                                    totalFrames: 0,
+                                    pauseAfterMs: finalPause))
                             subWords.removeAll(keepingCapacity: true)
+                            subOriginalWords.removeAll(keepingCapacity: true)
                             subPhon.removeAll(keepingCapacity: true)
                             subCount = baseOverhead
                         }
                     }
 
                     for (i, w) in words.enumerated() {
+                        let displayWord = originalWords[i]
                         let wPh = phonemizeWords([w])
                         // Fallback cost for unknown words: treat as small cost so we still split; no phonemes appended.
                         let wCost = (wPh.isEmpty ? 1 : wPh.count) + (subPhon.isEmpty ? 0 : 1)
@@ -217,6 +241,7 @@ enum KokoroChunker {
                                 subPhon.append(contentsOf: wPh)
                             }
                             subWords.append(w)
+                            subOriginalWords.append(displayWord)
                             subCount += wCost
                         } else {
                             // flush with no internal pause between sub-chunks
@@ -225,6 +250,7 @@ enum KokoroChunker {
                                 subPhon.append(contentsOf: wPh)
                             }
                             subWords.append(w)
+                            subOriginalWords.append(displayWord)
                             subCount = baseOverhead + (wPh.isEmpty ? 1 : wPh.count)
                         }
                         // At end of unit, flush with the unit's pause
@@ -242,15 +268,22 @@ enum KokoroChunker {
                     if !curPhon.isEmpty { curPhon.append(" ") }
                     curPhon.append(contentsOf: ph)
                     curWords.append(contentsOf: words)
+                    curOriginalWords.append(contentsOf: originalWords)
                     curTokenCount += additional
                     lastPause = pause
                 } else {
                     if !curPhon.isEmpty {
                         if curPhon.last == " " { curPhon.removeLast() }
                         chunks.append(
-                            TextChunk(words: curWords, phonemes: curPhon, totalFrames: 0, pauseAfterMs: lastPause))
+                            TextChunk(
+                                words: curWords,
+                                originalWords: curOriginalWords,
+                                phonemes: curPhon,
+                                totalFrames: 0,
+                                pauseAfterMs: lastPause))
                     }
                     curWords = words
+                    curOriginalWords = originalWords
                     curPhon = ph
                     curTokenCount = baseOverhead + ph.count
                     lastPause = pause
@@ -259,7 +292,13 @@ enum KokoroChunker {
             if !curPhon.isEmpty {
                 if curPhon.last == " " { curPhon.removeLast() }
                 let paraPause = (pIndex < paragraphs.count - 1) ? pauseParagraph : lastPause
-                chunks.append(TextChunk(words: curWords, phonemes: curPhon, totalFrames: 0, pauseAfterMs: paraPause))
+                chunks.append(
+                    TextChunk(
+                        words: curWords,
+                        originalWords: curOriginalWords,
+                        phonemes: curPhon,
+                        totalFrames: 0,
+                        pauseAfterMs: paraPause))
             }
         }
         return chunks

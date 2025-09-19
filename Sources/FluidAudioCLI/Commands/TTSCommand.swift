@@ -5,7 +5,7 @@ import Foundation
 public struct TTS {
 
     public static func run(arguments: [String]) async {
-        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json] [--auto-download]
+        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json] [--chunk-dir dir]
         guard !arguments.isEmpty else {
             printUsage()
             return
@@ -15,6 +15,7 @@ public struct TTS {
         var output = "output.wav"
         var voice = "af_heart"
         var metricsPath: String? = nil
+        var chunkDirectory: String? = nil
         // Always ensure required files in CLI
 
         var i = 1
@@ -36,6 +37,11 @@ public struct TTS {
             case "--metrics":
                 if i + 1 < arguments.count {
                     metricsPath = arguments[i + 1]
+                    i += 1
+                }
+            case "--chunk-dir":
+                if i + 1 < arguments.count {
+                    chunkDirectory = arguments[i + 1]
                     i += 1
                 }
             case "--auto-download":
@@ -65,13 +71,28 @@ public struct TTS {
 
             // 4) Synthesize (includes chunking + inference + stitching + WAV pack)
             let tSynth0 = Date()
-            let wav = try await KokoroModel.synthesize(text: text, voice: voice)
+            let detailed = try await KokoroModel.synthesizeDetailed(text: text, voice: voice)
+            let wav = detailed.audio
             let tSynth1 = Date()
 
             // Write WAV
             let outURL = URL(fileURLWithPath: output)
             try wav.write(to: outURL)
             print("Saved: \(outURL.path)")
+
+            var chunkFileMap: [Int: String] = [:]
+            if let chunkDirectory = chunkDirectory {
+                let dirURL = URL(fileURLWithPath: chunkDirectory, isDirectory: true)
+                try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+                for chunk in detailed.chunks {
+                    let fileName = String(format: "chunk_%03d.wav", chunk.index)
+                    let fileURL = dirURL.appendingPathComponent(fileName)
+                    let chunkData = try AudioWAV.data(from: chunk.samples, sampleRate: 24_000)
+                    try chunkData.write(to: fileURL)
+                    chunkFileMap[chunk.index] = fileURL.path
+                }
+                print("Saved \(chunkFileMap.count) chunk WAV files to \(dirURL.path)")
+            }
 
             // Metrics
             if let metricsPath = metricsPath {
@@ -134,6 +155,23 @@ public struct TTS {
                     }
                 }
 
+                if !detailed.chunks.isEmpty {
+                    let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
+                        var entry: [String: Any] = [
+                            "index": chunk.index,
+                            "text": chunk.text,
+                            "pause_after_ms": chunk.pauseAfterMs,
+                            "tokens": chunk.tokenCount,
+                        ]
+                        entry["word_count"] = chunk.wordCount
+                        if let path = chunkFileMap[chunk.index] {
+                            entry["audio_file"] = path
+                        }
+                        return entry
+                    }
+                    metricsDict["chunks"] = chunkMetrics
+                }
+
                 let dict: [String: Any] = [
                     "text": text,
                     "voice": voice,
@@ -161,6 +199,7 @@ public struct TTS {
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart)
               --metrics            Write timing metrics to a JSON file (also runs ASR for evaluation)
+              --chunk-dir          Directory where individual chunk WAVs will be written
               (models/dictionary auto-download is always on in CLI)
               --help, -h           Show this help
             """

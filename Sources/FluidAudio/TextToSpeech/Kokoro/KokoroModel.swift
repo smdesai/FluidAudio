@@ -12,6 +12,43 @@ import FoundationNetworking
 public struct KokoroModel {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
 
+    /// Detailed synthesis output including audio data and per-chunk metadata.
+    public struct SynthesisResult: Sendable {
+        public let audio: Data
+        public let chunks: [ChunkInfo]
+
+        public init(audio: Data, chunks: [ChunkInfo]) {
+            self.audio = audio
+            self.chunks = chunks
+        }
+    }
+
+    /// Metadata describing each chunk synthesized by the Kokoro pipeline.
+    public struct ChunkInfo: Sendable {
+        public let index: Int
+        public let text: String
+        public let wordCount: Int
+        public let pauseAfterMs: Int
+        public let tokenCount: Int
+        public let samples: [Float]
+
+        public init(
+            index: Int,
+            text: String,
+            wordCount: Int,
+            pauseAfterMs: Int,
+            tokenCount: Int,
+            samples: [Float]
+        ) {
+            self.index = index
+            self.text = text
+            self.wordCount = wordCount
+            self.pauseAfterMs = pauseAfterMs
+            self.tokenCount = tokenCount
+            self.samples = samples
+        }
+    }
+
     // Single model reference
     private static var kokoroModel: MLModel?
     private static var isModelLoaded = false
@@ -335,13 +372,13 @@ public struct KokoroModel {
         return 256
     }
 
-    /// Synthesize a single chunk of text
-    private static func synthesizeChunk(_ chunk: TextChunk, voice: String) async throws -> [Float] {
-        // Convert phonemes to input IDs
-        let phonemeSeq = chunk.phonemes
-        // No language token prefix; avoid audible leading vowel
-        let inputIds = phonemesToInputIds(phonemeSeq)
-
+    /// Synthesize a single chunk of text using precomputed token IDs.
+    private static func synthesizeChunk(
+        _ chunk: TextChunk,
+        voice: String,
+        inputIds: [Int32],
+        targetTokens: Int
+    ) async throws -> [Float] {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
         }
@@ -349,8 +386,7 @@ public struct KokoroModel {
         // Get voice embedding
         let refStyle = try loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
 
-        // Determine target token length from model and pad/truncate accordingly
-        let targetTokens = targetTokenLength()
+        // Pad or truncate to match model expectation
         var trimmedIds = inputIds
         if trimmedIds.count > targetTokens {
             trimmedIds = Array(trimmedIds.prefix(targetTokens))
@@ -436,29 +472,33 @@ public struct KokoroModel {
         return samples
     }
 
-    /// Main synthesis function with chunking support
+    /// Main synthesis function returning audio bytes only.
     public static func synthesize(text: String, voice: String = "af_heart") async throws -> Data {
+        let result = try await synthesizeDetailed(text: text, voice: voice)
+        return result.audio
+    }
+
+    /// Synthesize audio while returning per-chunk metadata used during inference.
+    public static func synthesizeDetailed(
+        text: String,
+        voice: String = "af_heart"
+    ) async throws -> SynthesisResult {
         let synthesisStart = Date()
 
         logger.info("Starting synthesis: '\(text)'")
         logger.info("Input length: \(text.count) characters")
 
-        // Ensure required files are downloaded
         try await ensureRequiredFiles()
-        // Ensure voice embedding if available
         try? await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: voice)
 
-        // Load model if needed
         if !isModelLoaded {
             try await loadModel()
         }
 
-        // Preload dictionary for OOV detection
         try loadSimplePhonemeDictionary()
 
         // If there are OOV words and G2P data is missing, fail fast per policy.
         do {
-            // Normalize words similarly to chunker
             let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
             func normalize(_ s: String) -> String {
                 let lowered = s.lowercased()
@@ -497,94 +537,134 @@ public struct KokoroModel {
             #endif
         }
 
-        // Chunk the text based on frame counts
         let chunks = try chunkText(text)
-
-        if chunks.isEmpty {
+        guard !chunks.isEmpty else {
             throw TTSError.processingFailed("No valid words found in text")
         }
 
-        if chunks.count == 1 {
-            // Single chunk - process normally
+        let targetTokens = targetTokenLength()
+
+        struct ChunkInfoTemplate {
+            let index: Int
+            let text: String
+            let wordCount: Int
+            let pauseAfterMs: Int
+            let tokenCount: Int
+        }
+
+        struct ChunkEntry {
+            let chunk: TextChunk
+            let inputIds: [Int32]
+            let template: ChunkInfoTemplate
+        }
+
+        var entries: [ChunkEntry] = []
+        entries.reserveCapacity(chunks.count)
+
+        for (index, chunk) in chunks.enumerated() {
+            let inputIds = phonemesToInputIds(chunk.phonemes)
+            guard !inputIds.isEmpty else {
+                throw TTSError.processingFailed(
+                    "No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
+            }
+            let template = ChunkInfoTemplate(
+                index: index,
+                text: chunk.text,
+                wordCount: chunk.originalWords.count,
+                pauseAfterMs: chunk.pauseAfterMs,
+                tokenCount: min(inputIds.count, targetTokens)
+            )
+            entries.append(ChunkEntry(chunk: chunk, inputIds: inputIds, template: template))
+        }
+
+        if entries.count == 1 {
             logger.info("Text fits in single chunk")
-            let chunk = chunks[0]
-            logger.info("Processing chunk: \(chunk.words.count) words, \(chunk.totalFrames) frames")
-
-            let samples = try await synthesizeChunk(chunk, voice: voice)
-
-            // Normalize and convert to WAV
-            let maxVal = samples.map { abs($0) }.max() ?? 1.0
-            let normalizedSamples = maxVal > 0 ? samples.map { $0 / maxVal } : samples
-            let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
-
-            let totalTime = Date().timeIntervalSince(synthesisStart)
-            logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
-            logger.info("Audio size: \(audioData.count) bytes")
-
-            return audioData
         } else {
-            // Multiple chunks - process and concatenate with boundary handling
-            logger.info("Text split into \(chunks.count) chunks")
-            var allSamples: [Float] = []
+            logger.info("Text split into \(entries.count) chunks")
+        }
 
-            // let sampleRate = 24000  // implicit by model; reserved for future resampling logic
-            let crossfadeMs = 8
-            let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
+        var allSamples: [Float] = []
+        var chunkTemplates: [ChunkInfoTemplate] = []
+        var chunkSampleBuffers: [[Float]] = []
+        let crossfadeMs = 8
+        let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
 
-            for i in 0..<chunks.count {
-                let chunk = chunks[i]
-                logger.info(
-                    "Processing chunk \(i+1)/\(chunks.count): \(chunk.words.count) words, \(chunk.totalFrames) frames")
-                logger.info("Chunk \(i+1) text: '\(chunk.words.joined(separator: " "))'")
-                let chunkSamples = try await synthesizeChunk(chunk, voice: voice)
-                if i == 0 {
-                    allSamples.append(contentsOf: chunkSamples)
-                } else {
-                    let prevPause = chunks[i - 1].pauseAfterMs
-                    if prevPause > 0 {
-                        let silenceCount = Int(Double(prevPause) * 24.0)
-                        if silenceCount > 0 {
-                            allSamples.append(contentsOf: Array(repeating: 0.0, count: silenceCount))
-                        }
-                        allSamples.append(contentsOf: chunkSamples)
-                    } else {
-                        // Micro crossfade join (only when no punctuation-driven pause)
-                        let n = min(crossfadeN, allSamples.count, chunkSamples.count)
-                        if n > 0 {
-                            // Fade out last n of allSamples, fade in first n of chunkSamples
-                            for k in 0..<n {
-                                let aIdx = allSamples.count - n + k
-                                let bIdx = k
-                                let t = Float(k) / Float(n)
-                                let fadeOut = 1.0 - t
-                                let fadeIn = t
-                                allSamples[aIdx] = allSamples[aIdx] * fadeOut + chunkSamples[bIdx] * fadeIn
-                            }
-                            // Append remainder of chunk after crossfade overlap
-                            if chunkSamples.count > n {
-                                allSamples.append(contentsOf: chunkSamples[n...])
-                            }
-                        } else {
-                            allSamples.append(contentsOf: chunkSamples)
-                        }
-                    }
-                }
+        for (index, entry) in entries.enumerated() {
+            let chunk = entry.chunk
+            logger.info(
+                "Processing chunk \(index + 1)/\(entries.count): \(chunk.originalWords.count) words")
+            logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
+            let chunkSamples = try await synthesizeChunk(
+                entry.chunk,
+                voice: voice,
+                inputIds: entry.inputIds,
+                targetTokens: targetTokens)
+            chunkSampleBuffers.append(chunkSamples)
+            chunkTemplates.append(entry.template)
+
+            if index == 0 {
+                allSamples.append(contentsOf: chunkSamples)
+                continue
             }
 
-            // Normalize all samples together
-            let maxVal = allSamples.map { abs($0) }.max() ?? 1.0
-            let normalizedSamples = maxVal > 0 ? allSamples.map { $0 / maxVal } : allSamples
-
-            // Convert to WAV (24 kHz mono)
-            let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
-
-            let totalTime = Date().timeIntervalSince(synthesisStart)
-            logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
-            logger.info("Total audio size: \(audioData.count) bytes")
-            logger.info("Total samples: \(allSamples.count)")
-
-            return audioData
+            let prevPause = entries[index - 1].chunk.pauseAfterMs
+            if prevPause > 0 {
+                let silenceCount = Int(Double(prevPause) * 24.0)
+                if silenceCount > 0 {
+                    allSamples.append(contentsOf: Array(repeating: 0.0, count: silenceCount))
+                }
+                allSamples.append(contentsOf: chunkSamples)
+            } else {
+                let n = min(crossfadeN, allSamples.count, chunkSamples.count)
+                if n > 0 {
+                    for k in 0..<n {
+                        let aIdx = allSamples.count - n + k
+                        let t = Float(k) / Float(n)
+                        allSamples[aIdx] = allSamples[aIdx] * (1.0 - t) + chunkSamples[k] * t
+                    }
+                    if chunkSamples.count > n {
+                        allSamples.append(contentsOf: chunkSamples[n...])
+                    }
+                } else {
+                    allSamples.append(contentsOf: chunkSamples)
+                }
+            }
         }
+
+        guard !allSamples.isEmpty else {
+            throw TTSError.processingFailed("Synthesis produced no samples")
+        }
+
+        let maxVal = allSamples.map { abs($0) }.max() ?? 1.0
+        let normalize: (Float) -> Float = { sample in
+            guard maxVal > 0 else { return sample }
+            return sample / maxVal
+        }
+
+        let normalizedSamples = allSamples.map(normalize)
+        let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
+
+        let normalizedChunkSamples = chunkSampleBuffers.map { buffer -> [Float] in
+            buffer.map(normalize)
+        }
+
+        let chunkInfos = zip(chunkTemplates, normalizedChunkSamples).map { template, samples in
+            ChunkInfo(
+                index: template.index,
+                text: template.text,
+                wordCount: template.wordCount,
+                pauseAfterMs: template.pauseAfterMs,
+                tokenCount: template.tokenCount,
+                samples: samples
+            )
+        }
+
+        let totalTime = Date().timeIntervalSince(synthesisStart)
+        logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
+        logger.info("Audio size: \(audioData.count) bytes")
+        logger.info("Total samples: \(allSamples.count)")
+
+        return SynthesisResult(audio: audioData, chunks: chunkInfos)
     }
 
     // convertSamplesToWAV moved to AudioWAV
