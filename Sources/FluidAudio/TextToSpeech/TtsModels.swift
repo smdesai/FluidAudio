@@ -16,7 +16,6 @@ public struct TtsModels {
         from repo: String = "FluidInference/kokoro-82m-coreml",
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
-        // Unified Kokoro model (v21). Delegate download/load to DownloadUtils for consistency
         let modelName = "kokoro_completev21.mlmodelc"
         let cacheDirectory = try getCacheDirectory()
         // Pass Models subdirectory so models end up in ~/.cache/fluidaudio/Models/kokoro/

@@ -28,6 +28,7 @@ public struct KokoroModel {
         public let index: Int
         public let text: String
         public let wordCount: Int
+        public let words: [String]
         public let pauseAfterMs: Int
         public let tokenCount: Int
         public let samples: [Float]
@@ -36,6 +37,7 @@ public struct KokoroModel {
             index: Int,
             text: String,
             wordCount: Int,
+            words: [String],
             pauseAfterMs: Int,
             tokenCount: Int,
             samples: [Float]
@@ -43,6 +45,7 @@ public struct KokoroModel {
             self.index = index
             self.text = text
             self.wordCount = wordCount
+            self.words = words
             self.pauseAfterMs = pauseAfterMs
             self.tokenCount = tokenCount
             self.samples = samples
@@ -472,6 +475,21 @@ public struct KokoroModel {
         return samples
     }
 
+    /// Apply a short linear ramp-to-zero at the end of a sample buffer to avoid discontinuities.
+    private static func applyTailRamp(
+        _ samples: inout [Float],
+        sampleRate: Int = 24_000,
+        rampDurationMs: Int = 6
+    ) {
+        guard !samples.isEmpty else { return }
+        let rampCount = max(1, min(samples.count, sampleRate * rampDurationMs / 1_000))
+        let start = samples.count - rampCount
+        for i in 0..<rampCount {
+            let weight = Float(rampCount - i) / Float(rampCount)
+            samples[start + i] *= weight
+        }
+    }
+
     /// Main synthesis function returning audio bytes only.
     public static func synthesize(text: String, voice: String = "af_heart") async throws -> Data {
         let result = try await synthesizeDetailed(text: text, voice: voice)
@@ -548,6 +566,7 @@ public struct KokoroModel {
             let index: Int
             let text: String
             let wordCount: Int
+            let words: [String]
             let pauseAfterMs: Int
             let tokenCount: Int
         }
@@ -570,7 +589,8 @@ public struct KokoroModel {
             let template = ChunkInfoTemplate(
                 index: index,
                 text: chunk.text,
-                wordCount: chunk.originalWords.count,
+                wordCount: chunk.words.count,
+                words: chunk.words,
                 pauseAfterMs: chunk.pauseAfterMs,
                 tokenCount: min(inputIds.count, targetTokens)
             )
@@ -592,13 +612,18 @@ public struct KokoroModel {
         for (index, entry) in entries.enumerated() {
             let chunk = entry.chunk
             logger.info(
-                "Processing chunk \(index + 1)/\(entries.count): \(chunk.originalWords.count) words")
+                "Processing chunk \(index + 1)/\(entries.count): \(chunk.words.count) words")
             logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
-            let chunkSamples = try await synthesizeChunk(
+            var chunkSamples = try await synthesizeChunk(
                 entry.chunk,
                 voice: voice,
                 inputIds: entry.inputIds,
                 targetTokens: targetTokens)
+
+            let needsTailRamp = entry.chunk.pauseAfterMs > 0 || index == entries.count - 1
+            if needsTailRamp {
+                applyTailRamp(&chunkSamples)
+            }
             chunkSampleBuffers.append(chunkSamples)
             chunkTemplates.append(entry.template)
 
@@ -653,6 +678,7 @@ public struct KokoroModel {
                 index: template.index,
                 text: template.text,
                 wordCount: template.wordCount,
+                words: template.words,
                 pauseAfterMs: template.pauseAfterMs,
                 tokenCount: template.tokenCount,
                 samples: samples

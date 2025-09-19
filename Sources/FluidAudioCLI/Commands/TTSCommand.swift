@@ -164,6 +164,9 @@ public struct TTS {
                             "tokens": chunk.tokenCount,
                         ]
                         entry["word_count"] = chunk.wordCount
+                        if !chunk.words.isEmpty {
+                            entry["normalized_words"] = chunk.words
+                        }
                         if let path = chunkFileMap[chunk.index] {
                             entry["audio_file"] = path
                         }
