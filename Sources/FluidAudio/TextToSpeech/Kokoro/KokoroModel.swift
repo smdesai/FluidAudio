@@ -7,7 +7,7 @@ import FoundationNetworking
 #endif
 
 /// Kokoro TTS implementation using unified CoreML model
-/// Uses kokoro_completev21.mlmodelc with word_phonemes.json dictionary
+/// Uses `ModelNames.TTS.kokoroBundle` with US English phoneme lexicons
 @available(macOS 13.0, iOS 16.0, *)
 public struct KokoroModel {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
@@ -60,7 +60,7 @@ public struct KokoroModel {
     private static var phonemeDictionary: [String: (frameCount: Float, phonemes: [String])] = [:]
     private static var isDictionaryLoaded = false
 
-    // Preferred: Simple word -> phonemes mapping from word_phonemes.json
+    // Preferred: Simple word -> phonemes mapping from US lexicon JSON files
     private static var wordToPhonemes: [String: [String]] = [:]
     private static var isSimpleDictLoaded = false
 
@@ -100,9 +100,8 @@ public struct KokoroModel {
 
     /// Ensure required dictionary files exist
     public static func ensureRequiredFiles() async throws {
-        // Download dictionary files using our simplified helper (which uses DownloadUtils.sharedSession)
-        try await downloadFileIfNeeded(filename: "word_phonemes.json", urlPath: "word_phonemes.json")
-        try await downloadFileIfNeeded(filename: "word_frames_phonemes.json", urlPath: "word_frames_phonemes.json")
+        try await downloadFileIfNeeded(filename: "us_gold.json", urlPath: "us_gold.json")
+        try await downloadFileIfNeeded(filename: "us_silver.json", urlPath: "us_silver.json")
 
         // Ensure eSpeak NG data bundle exists (download from HuggingFace Resources if missing)
         let cacheDir = try TtsModels.cacheDirectoryURL()
@@ -116,84 +115,89 @@ public struct KokoroModel {
 
         let fm = FileManager.default
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
-        let localPackage = cwd.appendingPathComponent("kokoro_completev21.mlpackage")
+        let localModel = cwd.appendingPathComponent(ModelNames.TTS.kokoroBundle)
 
-        if fm.fileExists(atPath: localPackage.path) {
-            logger.info("Loading Kokoro model from local package: \(localPackage.path)")
-            // Compile the .mlpackage to a .mlmodelc bundle before loading
-            let compiledURL = try await MLModel.compileModel(at: localPackage)
+        if fm.fileExists(atPath: localModel.path) {
+            logger.info("Loading Kokoro model from local bundle: \(localModel.path)")
             let configuration = MLModelConfiguration()
             configuration.computeUnits = .cpuAndNeuralEngine
-            kokoroModel = try MLModel(contentsOf: compiledURL, configuration: configuration)
+            kokoroModel = try MLModel(contentsOf: localModel, configuration: configuration)
         } else {
             // Delegate to TtsModels which uses DownloadUtils for all model downloads
             let models = try await TtsModels.download()
             kokoroModel = models.kokoro
         }
-        logger.info("Loaded kokoro_completev21 model")
+        logger.info("Loaded kokoro_completev22 model")
 
         isModelLoaded = true
         logger.info("Kokoro model successfully loaded")
     }
 
     /// Load simple word->phonemes dictionary (preferred)
-    /// Supports two formats:
-    /// 1) { "word_to_phonemes": { word: [token, ...] } }
-    /// 2) { word: "ipa string" | [token, ...] } (flat map)
+    /// Uses the richer US English lexicons (gold/silver) as the primary source.
     public static func loadSimplePhonemeDictionary() throws {
         guard !isSimpleDictLoaded else { return }
 
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
-        let dictURL = kokoroDir.appendingPathComponent("word_phonemes.json")
-
-        guard FileManager.default.fileExists(atPath: dictURL.path) else {
-            throw TTSError.modelNotFound("Phoneme dictionary not found at \(dictURL.path)")
-        }
-
-        let data = try Data(contentsOf: dictURL)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw TTSError.processingFailed("Invalid word_phonemes.json (not a JSON object)")
-        }
-
-        // Case 1: expected wrapped format
-        if let mapping = json["word_to_phonemes"] as? [String: [String]] {
-            wordToPhonemes = mapping
-            isSimpleDictLoaded = true
-            logger.info("Loaded \(wordToPhonemes.count) words from word_phonemes.json (wrapped)")
-            return
-        }
-
-        // Case 2: flat map format (word -> String or [String])
-        var tmp: [String: [String]] = [:]
         let vocabulary = KokoroVocabulary.getVocabulary()
         let allowed = Set(vocabulary.keys)
 
-        var converted = 0
-        for (k, v) in json {
-            if let s = v as? String {
-                let toks = tokenizeIPAString(s)
-                let filtered = toks.filter { allowed.contains($0) }
-                if !filtered.isEmpty {
-                    tmp[k.lowercased()] = filtered
-                    converted += 1
+        func filteredTokens(_ tokens: [String]) -> [String] {
+            tokens.filter { allowed.contains($0) }
+        }
+
+        let lexiconFiles = ["us_gold.json", "us_silver.json"]
+        var mapping: [String: [String]] = [:]
+        var totalAdded = 0
+
+        for filename in lexiconFiles {
+            let lexiconURL = kokoroDir.appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: lexiconURL.path) else { continue }
+
+            do {
+                let rawLexicon = try Data(contentsOf: lexiconURL)
+                guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
+                    logger.warning("Skipping \(filename) (unexpected format)")
+                    continue
                 }
-            } else if let arr = v as? [String] {
-                let filtered = arr.filter { allowed.contains($0) }
-                if !filtered.isEmpty {
-                    tmp[k.lowercased()] = filtered
-                    converted += 1
+
+                var addedHere = 0
+                for (key, value) in entries {
+                    let normalizedKey = key.lowercased()
+                    let tokens: [String]
+                    if let stringValue = value as? String {
+                        tokens = filteredTokens(tokenizeIPAString(stringValue))
+                    } else if let arrayValue = value as? [String] {
+                        tokens = filteredTokens(arrayValue)
+                    } else {
+                        continue
+                    }
+
+                    guard !tokens.isEmpty else { continue }
+
+                    if mapping[normalizedKey] == nil {
+                        mapping[normalizedKey] = tokens
+                        addedHere += 1
+                    }
                 }
+
+                if addedHere > 0 {
+                    totalAdded += addedHere
+                    logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
+                }
+            } catch {
+                logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
             }
         }
 
-        guard !tmp.isEmpty else {
-            throw TTSError.processingFailed("Unsupported word_phonemes.json format (no usable entries)")
+        guard !mapping.isEmpty else {
+            throw TTSError.processingFailed("No US English lexicon entries found (missing us_gold.json/us_silver.json)")
         }
 
-        wordToPhonemes = tmp
+        wordToPhonemes = mapping
         isSimpleDictLoaded = true
-        logger.info("Loaded \(wordToPhonemes.count) words from word_phonemes.json (flat)")
+        logger.info("Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))")
     }
 
     /// Tokenize an IPA string into model tokens.

@@ -238,6 +238,8 @@ enum KokoroChunker {
             currentTokenCount: Int
         ) -> ([String], Bool) {
             var cleaned = tokens
+            var appendedPeriod = false
+            var removedTrailingPunctuation = false
             while let last = cleaned.last, last == " " {
                 cleaned.removeLast()
             }
@@ -246,9 +248,18 @@ enum KokoroChunker {
                 while let tail = cleaned.last, tail == " " {
                     cleaned.removeLast()
                 }
+                removedTrailingPunctuation = true
             }
 
-            var appendedPeriod = false
+            if removedTrailingPunctuation,
+                periodTokenAvailable,
+                (cleaned.last.map { punctuationEndingTokens.contains($0) } ?? false) == false,
+                currentTokenCount + 1 <= targetTokens
+            {
+                cleaned.append(".")
+                appendedPeriod = true
+            }
+
             if periodTokenAvailable {
                 let normalized = lastWord.map { normalizeWord($0) }
                 if let normalized,
@@ -256,7 +267,8 @@ enum KokoroChunker {
                     boundaryStopWords.contains(normalized)
                 {
                     let alreadyTerminated = cleaned.last.map { punctuationEndingTokens.contains($0) || punctuationTokensToStrip.contains($0) } ?? false
-                    if alreadyTerminated == false && currentTokenCount + 1 <= targetTokens {
+                    let additionalCost = appendedPeriod ? 0 : 1
+                    if alreadyTerminated == false && currentTokenCount + additionalCost <= targetTokens {
                         cleaned.append(".")
                         appendedPeriod = true
                     }

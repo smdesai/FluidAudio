@@ -143,7 +143,7 @@ public class DownloadUtils {
     /// Internal helper to download repo (if needed) and load CoreML models
     /// - Parameters:
     ///   - repo: The HuggingFace repository to download
-    ///   - modelNames: Array of model file names to load (e.g., ["model.mlmodelc"])
+    ///   - modelNames: Array of model file names to load (e.g., ["model.mlpackage", "model.mlmodelc"])
     ///   - directory: Base directory to store repos (e.g., ~/Library/Application Support/FluidAudio)
     ///   - computeUnits: CoreML compute units to use (default: CPU and Neural Engine)
     /// - Returns: Dictionary mapping model names to loaded MLModel instances
@@ -184,7 +184,14 @@ public class DownloadUtils {
             }
 
             do {
-                // Validate model directory structure before loading
+                if modelPath.pathExtension == "mlpackage" {
+                    let compiledURL = try await MLModel.compileModel(at: modelPath)
+                    models[name] = try MLModel(contentsOf: compiledURL, configuration: config)
+                    logger.info("Compiled and loaded model package: \(name)")
+                    continue
+                }
+
+                // Validate model directory structure before loading (.mlmodelc bundle)
                 var isDirectory: ObjCBool = false
                 guard
                     FileManager.default.fileExists(
@@ -199,7 +206,6 @@ public class DownloadUtils {
                         ])
                 }
 
-                // Check for essential model files
                 let coremlDataPath = modelPath.appendingPathComponent("coremldata.bin")
                 guard FileManager.default.fileExists(atPath: coremlDataPath.path) else {
                     logger.error("Missing coremldata.bin in \(name)")
@@ -212,16 +218,14 @@ public class DownloadUtils {
                 }
 
                 models[name] = try MLModel(contentsOf: modelPath, configuration: config)
-                logger.info("Loaded model: \(name)")
+                logger.info("Loaded model bundle: \(name)")
             } catch {
                 logger.error("Failed to load model \(name): \(error)")
 
-                // List directory contents for debugging
                 if let contents = try? FileManager.default.contentsOfDirectory(
-                    at: modelPath, includingPropertiesForKeys: nil)
+                    atPath: modelPath.deletingLastPathComponent().path)
                 {
-                    logger.error(
-                        "   Model directory contents: \(contents.map { $0.lastPathComponent })")
+                    logger.error("   Nearby contents: \(contents)")
                 }
 
                 throw error
@@ -243,8 +247,7 @@ public class DownloadUtils {
         case .diarizer:
             return ModelNames.Diarizer.requiredModels
         case .kokoro:
-            // Unified Kokoro TTS model bundle name
-            return Set(["kokoro_completev21.mlmodelc"])
+            return ModelNames.TTS.requiredModels
         }
     }
 
@@ -264,7 +267,7 @@ public class DownloadUtils {
 
         for file in files {
             switch file.type {
-            case "directory" where file.path.hasSuffix(".mlmodelc"):
+            case "directory" where file.path.hasSuffix(".mlmodelc") || file.path.hasSuffix(".mlpackage"):
                 // Only download if this model is in our required list
                 if requiredModels.contains(file.path) {
                     logger.info("Downloading required model: \(file.path)")

@@ -16,7 +16,7 @@ public struct TtsModels {
         from repo: String = "FluidInference/kokoro-82m-coreml",
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
-        let modelName = "kokoro_completev21.mlmodelc"
+        let modelName = ModelNames.TTS.kokoroBundle
         let cacheDirectory = try getCacheDirectory()
         // Pass Models subdirectory so models end up in ~/.cache/fluidaudio/Models/kokoro/
         let modelsDirectory = cacheDirectory.appendingPathComponent("Models")

@@ -8,7 +8,7 @@ import OSLog
 public struct Kokoro {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroDirect")
 
-    // Phoneme dictionary loaded from kokoro_word_phonemes_full.json
+    // Phoneme dictionary loaded from US English lexicon JSON files
     private static var phonemeDictionary: [String: [String]] = [:]
     private static var isDictionaryLoaded = false
 
@@ -20,22 +20,71 @@ public struct Kokoro {
         guard !isDictionaryLoaded else { return }
 
         let currentDir = FileManager.default.currentDirectoryPath
-        let dictURL = URL(fileURLWithPath: currentDir).appendingPathComponent("word_phonemes.json")
+        let cacheDir = try? TtsModels.cacheDirectoryURL().appendingPathComponent("Models/kokoro")
+        let vocabulary = KokoroVocabulary.getVocabulary()
+        let allowed = Set(vocabulary.keys)
 
-        guard FileManager.default.fileExists(atPath: dictURL.path) else {
-            throw TTSError.modelNotFound("Phoneme dictionary not found at \(dictURL.path)")
+        func filteredTokens(_ tokens: [String]) -> [String] {
+            tokens.filter { allowed.contains($0) }
         }
 
-        let data = try Data(contentsOf: dictURL)
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-
-        if let wordToPhonemes = json["word_to_phonemes"] as? [String: [String]] {
-            phonemeDictionary = wordToPhonemes
-            isDictionaryLoaded = true
-            logger.info("Loaded \(phonemeDictionary.count) words from phoneme dictionary")
-        } else {
-            throw TTSError.processingFailed("Invalid phoneme dictionary format")
+        func tokenizeIPA(_ s: String) -> [String] {
+            if s.contains(where: { $0.isWhitespace }) {
+                return s
+                    .components(separatedBy: .whitespacesAndNewlines)
+                    .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ",.;:()[]{}\"'")) }
+                    .filter { !$0.isEmpty }
+            }
+            return s.unicodeScalars.map { String($0) }
         }
+
+        let lexiconNames = ["us_gold.json", "us_silver.json"]
+        var merged: [String: [String]] = [:]
+        for name in lexiconNames {
+            let localURL = URL(fileURLWithPath: currentDir).appendingPathComponent(name)
+            let cacheURL = cacheDir?.appendingPathComponent(name)
+            let candidates = [localURL, cacheURL].compactMap { $0 }
+            guard let fileURL = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+                continue
+            }
+
+            do {
+                let data = try Data(contentsOf: fileURL)
+                guard let entries = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    logger.warning("Skipping \(name) (unexpected format)")
+                    continue
+                }
+
+                for (key, value) in entries {
+                    let normalizedKey = key.lowercased()
+                    if merged[normalizedKey] != nil { continue }
+
+                    let tokens: [String]
+                    if let stringValue = value as? String {
+                        tokens = filteredTokens(tokenizeIPA(stringValue))
+                    } else if let arrayValue = value as? [String] {
+                        tokens = filteredTokens(arrayValue)
+                    } else {
+                        continue
+                    }
+
+                    guard !tokens.isEmpty else { continue }
+                    merged[normalizedKey] = tokens
+                }
+
+                logger.info("Merged lexicon \(name) (\(merged.count) total entries so far)")
+            } catch {
+                logger.warning("Failed to read lexicon \(name): \(error.localizedDescription)")
+            }
+        }
+
+        guard !merged.isEmpty else {
+            throw TTSError.modelNotFound("US lexicon files (us_gold.json/us_silver.json) not found in CWD or cache")
+        }
+
+        phonemeDictionary = merged
+        isDictionaryLoaded = true
+        logger.info("Loaded \(phonemeDictionary.count) words from US lexicon dictionary")
     }
 
     /// Convert text to phonemes using dictionary lookup (like main.py)
@@ -185,10 +234,9 @@ public struct Kokoro {
         logger.debug("First 10 input_ids: \(inputIds.prefix(10))")
         logger.debug("First 5 ref_s values: \(voiceEmbedding.prefix(5))")
 
-        // Step 6: Load and run model - use unified compiled model only (v21 preferred)
+        // Step 6: Load and run model - prefer unified .mlpackage (v22)
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let modelURL = cwd.appendingPathComponent("kokoro_completev21.mlmodelc")
-
+        let modelURL = cwd.appendingPathComponent(ModelNames.TTS.kokoroBundle)
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw TTSError.modelNotFound("Model not found at \(modelURL.path)")
         }
