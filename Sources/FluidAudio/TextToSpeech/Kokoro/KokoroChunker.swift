@@ -239,26 +239,24 @@ enum KokoroChunker {
         ) -> ([String], Bool) {
             var cleaned = tokens
             var appendedPeriod = false
-            var removedTrailingPunctuation = false
+            var replacedPunctuation = false
             while let last = cleaned.last, last == " " {
                 cleaned.removeLast()
             }
             if let last = cleaned.last, punctuationTokensToStrip.contains(last) {
-                cleaned.removeLast()
-                while let tail = cleaned.last, tail == " " {
+                if periodTokenAvailable {
+                    cleaned[cleaned.count - 1] = "."
+                    appendedPeriod = true
+                    replacedPunctuation = true
+                } else {
                     cleaned.removeLast()
+                    while let tail = cleaned.last, tail == " " {
+                        cleaned.removeLast()
+                    }
                 }
-                removedTrailingPunctuation = true
             }
 
-            if removedTrailingPunctuation,
-                periodTokenAvailable,
-                (cleaned.last.map { punctuationEndingTokens.contains($0) } ?? false) == false,
-                currentTokenCount + 1 <= targetTokens
-            {
-                cleaned.append(".")
-                appendedPeriod = true
-            }
+            let currentlyTerminated = cleaned.last.map { punctuationEndingTokens.contains($0) || punctuationTokensToStrip.contains($0) } ?? false
 
             if periodTokenAvailable {
                 let normalized = lastWord.map { normalizeWord($0) }
@@ -266,13 +264,15 @@ enum KokoroChunker {
                     !normalized.isEmpty,
                     boundaryStopWords.contains(normalized)
                 {
-                    let alreadyTerminated = cleaned.last.map { punctuationEndingTokens.contains($0) || punctuationTokensToStrip.contains($0) } ?? false
+                    let alreadyTerminated = currentlyTerminated
                     let additionalCost = appendedPeriod ? 0 : 1
                     if alreadyTerminated == false && currentTokenCount + additionalCost <= targetTokens {
                         cleaned.append(".")
                         appendedPeriod = true
                     }
                 }
+            } else if !currentlyTerminated, !replacedPunctuation {
+                // If we removed punctuation and cannot emit '.', the chunk will end without added token.
             }
 
             return (cleaned, appendedPeriod)
