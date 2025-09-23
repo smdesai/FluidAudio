@@ -198,19 +198,42 @@ public struct Kokoro {
         // Step 2: Phonemes to input IDs
         var inputIds = phonemesToInputIds(phonemes)
 
-        // Step 3: Pad to 249 (model requirement)
-        while inputIds.count < 249 {
-            inputIds.append(0)
-        }
-        if inputIds.count > 249 {
-            inputIds = Array(inputIds.prefix(249))
+        // Step 3: Load bundled .mlmodelc and inspect token budget
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let bundleName = ModelNames.TTS.defaultBundle
+        let modelURL = cwd.appendingPathComponent(bundleName)
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw TTSError.modelNotFound("Model not found at \(modelURL.path)")
         }
 
-        // Step 4: Get voice embedding
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .cpuAndNeuralEngine
+        let model = try MLModel(contentsOf: modelURL, configuration: configuration)
+
+        let tokenLength: Int = {
+            if let constraint = model.modelDescription
+                .inputDescriptionsByName["input_ids"]?
+                .multiArrayConstraint,
+                constraint.shape.count >= 2
+            {
+                let n = constraint.shape.last!.intValue
+                if n > 0 { return n }
+            }
+            return 249
+        }()
+
+        // Step 4: Pad or truncate to match the model token budget
+        if inputIds.count > tokenLength {
+            inputIds = Array(inputIds.prefix(tokenLength))
+        } else if inputIds.count < tokenLength {
+            inputIds.append(contentsOf: Array(repeating: 0, count: tokenLength - inputIds.count))
+        }
+
+        // Step 5: Get voice embedding
         let voiceEmbedding = try loadVoiceEmbedding(voice: voice, phonemeCount: phonemes.count)
 
-        // Step 5: Create model inputs
-        let inputShape = [1, 249] as [NSNumber]
+        // Step 6: Create model inputs
+        let inputShape = [1, NSNumber(value: tokenLength)]
         let inputArray = try MLMultiArray(shape: inputShape, dataType: .int32)
         for (i, id) in inputIds.enumerated() {
             inputArray[i] = NSNumber(value: id)
@@ -234,22 +257,13 @@ public struct Kokoro {
         logger.debug("First 10 input_ids: \(inputIds.prefix(10))")
         logger.debug("First 5 ref_s values: \(voiceEmbedding.prefix(5))")
 
-        // Step 6: Load and run model - prefer unified .mlpackage (v22)
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let modelURL = cwd.appendingPathComponent(ModelNames.TTS.kokoroBundle)
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
-            throw TTSError.modelNotFound("Model not found at \(modelURL.path)")
-        }
-
-        let model = try MLModel(contentsOf: modelURL)
-
+        // Step 7: Run inference
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "input_ids": MLFeatureValue(multiArray: inputArray),
             "ref_s": MLFeatureValue(multiArray: refArray),
             "random_phases": MLFeatureValue(multiArray: phasesArray),
         ])
 
-        // Step 7: Run inference
         let output = try model.prediction(from: input)
 
         // Step 8: Robustly select audio output
@@ -278,9 +292,9 @@ public struct Kokoro {
         if let lenFV = output.featureValue(for: "audio_length_samples") {
             if let la = lenFV.multiArrayValue, la.count > 0 {
                 effectiveCount = max(0, la[0].intValue)
-            } else if lenFV.type == .int64 {
+            } else if lenFV.type == MLFeatureType.int64 {
                 effectiveCount = max(0, Int(lenFV.int64Value))
-            } else if lenFV.type == .double {
+            } else if lenFV.type == MLFeatureType.double {
                 effectiveCount = max(0, Int(lenFV.doubleValue))
             }
             effectiveCount = min(effectiveCount, audioOutput.count)

@@ -25,7 +25,10 @@ public final class TtSManager {
         logger.info("Initializing TtSManager with provided models")
 
         self.ttsModels = models
-        self.kokoroModel = models.kokoro
+        guard let defaultModel = models.model(for: ModelNames.TTS.defaultVariant) else {
+            throw TTSError.modelNotFound(ModelNames.TTS.defaultBundle)
+        }
+        self.kokoroModel = defaultModel
 
         logger.info("TtSManager initialized successfully")
     }

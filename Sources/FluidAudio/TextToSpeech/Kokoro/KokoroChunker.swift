@@ -1,5 +1,8 @@
 import Foundation
 import OSLog
+#if canImport(NaturalLanguage)
+import NaturalLanguage
+#endif
 
 /// A chunk of text prepared for synthesis.
 /// - words: Tokenised words used for phoneme lookup
@@ -84,7 +87,7 @@ enum KokoroChunker {
         let cap = max(1, targetTokens - safety)
 
         let vocabulary = KokoroVocabulary.getVocabulary()
-        let punctuationTokensToStrip: Set<String> = [":", ";", ","]
+        let punctuationTokensToStrip: Set<String> = [","]
         let punctuationEndingTokens: Set<String> = [".", "!", "?", "…"]
         // Conjunctions & prepositions we try not to end a chunk on (keep in lowercase)
         let boundaryStopWords: Set<String> = [
@@ -102,9 +105,8 @@ enum KokoroChunker {
         let periodTokenAvailable = vocabulary["."] != nil
 
         // Pause mapping (ms)
-        let pauseSentence = 300
-        let pauseClause = 150
-        let pauseParagraph = 500
+        let pauseSentence = 0
+        let pauseParagraph = 0
 
         let normalizationSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
 
@@ -210,6 +212,51 @@ enum KokoroChunker {
             return out
         }
 
+        func tokenCount(for sentence: String) -> Int {
+            let displayWords = sentence
+                .split(whereSeparator: { $0.isWhitespace })
+                .map { String($0) }
+            guard !displayWords.isEmpty else { return 0 }
+            let words = displayWords.map { $0.lowercased() }
+            let tokens = phonemizeWords(words)
+            return tokens.count
+        }
+
+        func mergeSentences(_ sentences: [(String, Character?)]) -> [(String, Character?)] {
+            var merged: [(String, Character?)] = []
+            var currentText = ""
+            var currentEnd: Character? = nil
+
+            for (sentence, punctuation) in sentences {
+                let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+
+                if currentText.isEmpty {
+                    currentText = trimmed
+                    currentEnd = punctuation
+                    continue
+                }
+
+                let candidateText = currentText + " " + trimmed
+                let candidateTokens = tokenCount(for: candidateText)
+
+                if candidateTokens <= cap {
+                    currentText = candidateText
+                    currentEnd = punctuation
+                } else {
+                    merged.append((currentText, currentEnd))
+                    currentText = trimmed
+                    currentEnd = punctuation
+                }
+            }
+
+            if !currentText.isEmpty {
+                merged.append((currentText, currentEnd))
+            }
+
+            return merged
+        }
+
         func appendPeriod(to atoms: inout [String]) {
             guard !atoms.isEmpty else {
                 atoms.append(".")
@@ -279,42 +326,25 @@ enum KokoroChunker {
         }
 
         func splitSentences(_ paragraph: String) -> [(String, Character?)] {
+            let tokenizer = NLTokenizer(unit: .sentence)
+            tokenizer.string = paragraph
             var units: [(String, Character?)] = []
-            var buf = ""
-            for ch in paragraph {
-                buf.append(ch)
-                if ch == "." || ch == "!" || ch == "?" {
-                    units.append((buf.trimmingCharacters(in: .whitespaces), ch))
-                    buf = ""
-                }
+            tokenizer.enumerateTokens(in: paragraph.startIndex..<paragraph.endIndex) { range, _ in
+                let sentence = String(paragraph[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !sentence.isEmpty else { return true }
+                let endPunct = sentence.trimmingCharacters(in: .whitespaces).last
+                units.append((sentence, endPunct))
+                return true
             }
-            let tail = buf.trimmingCharacters(in: .whitespaces)
-            if !tail.isEmpty { units.append((tail, nil)) }
             return units
         }
 
         func splitClauses(_ sentence: String, endPunct: Character?) -> [(String, Int)] {
-            var parts: [(String, Int)] = []
-            var buf = ""
-            for ch in sentence {
-                if ch == "," || ch == ";" || ch == ":" {
-                    let trimmed = buf.trimmingCharacters(in: .whitespaces)
-                    if !trimmed.isEmpty {
-                        let segment = trimmed + String(ch)
-                        parts.append((segment, pauseClause))
-                        KokoroChunker.logger.info("    Split at '\(ch)': added '\(segment)'")
-                    }
-                    buf = ""
-                } else {
-                    buf.append(ch)
-                }
-            }
-            let last = buf.trimmingCharacters(in: .whitespaces)
-            if !last.isEmpty {
-                parts.append((last, endPunct != nil ? pauseSentence : 0))
-                KokoroChunker.logger.info("    Final part: '\(last)'")
-            }
-            return parts
+            let trimmed = sentence.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return [] }
+            let pause = endPunct != nil ? pauseSentence : 0
+            KokoroChunker.logger.info("    Clause: '\(trimmed)' (pause=\(pause))")
+            return [(trimmed, pause)]
         }
 
         let paragraphs = text.components(separatedBy: "\n\n").filter {
@@ -323,7 +353,7 @@ enum KokoroChunker {
 
         var chunks: [TextChunk] = []
         for (pIndex, para) in paragraphs.enumerated() {
-            let sentences = splitSentences(para)
+            let sentences = mergeSentences(splitSentences(para))
             var units: [(text: String, words: [String], displayWords: [String], pause: Int)] = []
             for (sent, endP) in sentences {
                 let clauses = splitClauses(sent, endPunct: endP)
@@ -367,13 +397,13 @@ enum KokoroChunker {
                             currentTokenCount: curTokenCount)
                         if appendedPeriod { appendPeriod(to: &curAtoms) }
                         if !cleaned.isEmpty {
-                            chunks.append(
-                                TextChunk(
-                                    words: curWords,
-                                    atoms: curAtoms,
-                                    phonemes: cleaned,
-                                    totalFrames: 0,
-                                    pauseAfterMs: lastPause))
+                    chunks.append(
+                        TextChunk(
+                            words: curWords,
+                            atoms: curAtoms,
+                            phonemes: cleaned,
+                            totalFrames: 0,
+                            pauseAfterMs: 0))
                         }
                         curWords.removeAll()
                         curAtoms.removeAll()
@@ -401,7 +431,7 @@ enum KokoroChunker {
                                         atoms: subAtoms,
                                         phonemes: cleaned,
                                         totalFrames: 0,
-                                        pauseAfterMs: finalPause))
+                                        pauseAfterMs: 0))
                             }
                             subWords.removeAll(keepingCapacity: true)
                             subAtoms.removeAll(keepingCapacity: true)
@@ -459,13 +489,13 @@ enum KokoroChunker {
                             currentTokenCount: curTokenCount)
                         if appendedPeriod { appendPeriod(to: &curAtoms) }
                         if !cleaned.isEmpty {
-                            chunks.append(
-                                TextChunk(
-                                    words: curWords,
-                                    atoms: curAtoms,
-                                    phonemes: cleaned,
-                                    totalFrames: 0,
-                                    pauseAfterMs: lastPause))
+                        chunks.append(
+                            TextChunk(
+                                words: curWords,
+                                atoms: curAtoms,
+                                phonemes: cleaned,
+                                totalFrames: 0,
+                                pauseAfterMs: 0))
                         }
                     }
                     curWords = unit.words
@@ -482,7 +512,7 @@ enum KokoroChunker {
                     currentTokenCount: curTokenCount)
                 guard !cleaned.isEmpty else { continue }
                 if appendedPeriod { appendPeriod(to: &curAtoms) }
-                let paraPause = (pIndex < paragraphs.count - 1) ? pauseParagraph : lastPause
+                let paraPause = 0
                 chunks.append(
                     TextChunk(
                         words: curWords,

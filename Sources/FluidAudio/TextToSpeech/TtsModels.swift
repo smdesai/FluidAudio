@@ -4,32 +4,41 @@ import OSLog
 
 @available(macOS 13.0, *)
 public struct TtsModels {
-    public let kokoro: MLModel
+    private let kokoroModels: [ModelNames.TTS.Variant: MLModel]
 
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "TtsModels")
 
-    public init(kokoro: MLModel) {
-        self.kokoro = kokoro
+    public init(models: [ModelNames.TTS.Variant: MLModel]) {
+        self.kokoroModels = models
+    }
+
+    public func model(for variant: ModelNames.TTS.Variant = ModelNames.TTS.defaultVariant) -> MLModel? {
+        kokoroModels[variant]
     }
 
     public static func download(
         from repo: String = "FluidInference/kokoro-82m-coreml",
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> TtsModels {
-        let modelName = ModelNames.TTS.kokoroBundle
         let cacheDirectory = try getCacheDirectory()
         // Pass Models subdirectory so models end up in ~/.cache/fluidaudio/Models/kokoro/
         let modelsDirectory = cacheDirectory.appendingPathComponent("Models")
+        let modelNames = ModelNames.TTS.Variant.allCases.map { $0.fileName }
         let dict = try await DownloadUtils.loadModels(
             .kokoro,
-            modelNames: [modelName],
+            modelNames: modelNames,
             directory: modelsDirectory,
             computeUnits: .cpuAndNeuralEngine
         )
-        guard let kokoro = dict[modelName] else {
-            throw TTSError.modelNotFound(modelName)
+        var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
+        for variant in ModelNames.TTS.Variant.allCases {
+            let name = variant.fileName
+            guard let model = dict[name] else {
+                throw TTSError.modelNotFound(name)
+            }
+            loaded[variant] = model
         }
-        return TtsModels(kokoro: kokoro)
+        return TtsModels(models: loaded)
     }
 
     private static func getCacheDirectory() throws -> URL {

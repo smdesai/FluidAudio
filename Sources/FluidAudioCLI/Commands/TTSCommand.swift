@@ -167,6 +167,17 @@ public struct TTS {
                         if !chunk.words.isEmpty {
                             entry["normalized_words"] = chunk.words
                         }
+                        let chunkSeconds = Double(chunk.samples.count) / 24_000.0
+                        entry["audio_duration_s"] = chunkSeconds
+                        let variantLabel: String = {
+                            switch chunk.variant {
+                            case .fiveSecond:
+                                return "kokoro_24_5s"
+                            case .fifteenSecond:
+                                return "kokoro_24_15s"
+                            }
+                        }()
+                        entry["model_variant"] = variantLabel
                         if let path = chunkFileMap[chunk.index] {
                             entry["audio_file"] = path
                         }
