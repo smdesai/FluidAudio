@@ -23,7 +23,7 @@ Below are some featured local AI apps using Fluid Audio models on macOS and iOS:
   <!-- Add your app: submit logo via PR -->
 </p>
 
-Wawnt to convert your own model? Check [möbius](https://github.com/FluidInference/mobius)
+Want to convert your own model? Check [möbius](https://github.com/FluidInference/mobius)
 
 ## Highlights
 
@@ -41,11 +41,11 @@ Add FluidAudio to your project using Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.5.1"),
+    .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.5.2"),
 ],
 ```
 
-**CocoaPods:** We recommend using [cocoapods-spm](https://github.com/trinhngocthuyen/cocoapods-spm) for better SPM integration, but if needed, you can also use our podspec: `pod 'FluidAudio', '~> 0.5.1'`
+**CocoaPods:** We recommend using [cocoapods-spm](https://github.com/trinhngocthuyen/cocoapods-spm) for better SPM integration, but if needed, you can also use our podspec: `pod 'FluidAudio', '~> 0.5.2'`
 
 Important: When adding FluidAudio as a package dependency, only add the library to your target (not the executable). Select `FluidAudio` library in the package products dialog and add it to your app target.
 
@@ -95,7 +95,7 @@ claude mcp add -s user -t http deepwiki https://mcp.deepwiki.com/mcp
 - **Model**: `FluidInference/parakeet-tdt-0.6b-v3-coreml`
 - **Languages**: All European languages (25) - see Huggingface models for exact list
 - **Processing Mode**: Batch transcription for complete audio files
-- **Real-time Factor**: ~120x on M4 Pro (processes 1 minute of audio in ~0.5 seconds)
+- **Real-time Factor**: ~190x on M4 Pro (processes 1 hour of audio in ~19 seconds)
 - **Streaming Support**: Coming soon — batch processing is recommended for production use
 - **Backend**: Same Parakeet TDT v3 model powers our backend ASR
 
@@ -331,8 +331,11 @@ Make a PR if you want to add your app!
 | --- | --- |
 | **[Voice Ink](https://tryvoiceink.com/)** | Local AI for instant, private transcription with near-perfect accuracy. Uses Parakeet ASR. |
 | **[Spokenly](https://spokenly.app/)** | Mac dictation app for fast, accurate voice-to-text; supports real-time dictation and file transcription. Uses Parakeet ASR and speaker diarization. |
+| **[Senko](https://github.com/narcotic-sh/senko)** | A very fast and accurate speaker diarization pipeline. A [good example](https://github.com/narcotic-sh/senko/commit/51dbd8bde764c3c6648dbbae57d6aff66c5ca15c) for how to integrate FluidAudio into a Python app |
 | **[Slipbox](https://slipbox.ai/)** | Privacy-first meeting assistant for real-time conversation intelligence. Uses Parakeet ASR (iOS) and speaker diarization across platforms. |
 | **[Whisper Mate](https://whisper.marksdo.com)** | Transcribes movies and audio locally; records and transcribes in real time from speakers or system apps. Uses speaker diarization. |
+| **[Altic/Fluid](https://github.com/altic-dev/Fluid-oss)** | Voice-to-text dictation app for macOS with AI enhancement. |
+| **[mac-whisper-speedtest](https://github.com/anvanvan/mac-whisper-speedtest)** | Comparison of different local ASR, including one of the first verions of FluidAudio's ASR models |
 
 ## Everything Else
 
