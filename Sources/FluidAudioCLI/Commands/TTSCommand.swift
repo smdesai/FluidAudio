@@ -158,7 +158,7 @@ public struct TTS {
                     let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
                         var entry: [String: Any] = [
                             "index": chunk.index,
-                    "text": chunk.text,
+                            "text": chunk.text,
                             "pause_after_ms": chunk.pauseAfterMs,
                             "tokens": chunk.tokenCount,
                         ]
