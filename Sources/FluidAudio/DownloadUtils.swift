@@ -96,25 +96,6 @@ public class DownloadUtils {
         public static let `default` = DownloadConfig()
     }
 
-    /// Model repositories on HuggingFace
-    public enum Repo: String, CaseIterable {
-        case vad = "FluidInference/silero-vad-coreml"
-        case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
-        case diarizer = "FluidInference/speaker-diarization-coreml"
-        case kokoro = "FluidInference/kokoro-82m-coreml"
-
-        var folderName: String {
-            switch self {
-            case .kokoro:
-                // Use "kokoro" instead of "kokoro-82m-coreml" for consistency with existing paths
-                return "kokoro"
-            default:
-                return rawValue.split(separator: "/").last?.description ?? rawValue
-            }
-        }
-
-    }
-
     public static func loadModels(
         _ repo: Repo,
         modelNames: [String],
@@ -143,7 +124,7 @@ public class DownloadUtils {
     /// Internal helper to download repo (if needed) and load CoreML models
     /// - Parameters:
     ///   - repo: The HuggingFace repository to download
-    ///   - modelNames: Array of model file names to load (e.g., ["model.mlpackage", "model.mlmodelc"])
+    ///   - modelNames: Array of model file names to load (e.g., ["model.mlmodelc"])
     ///   - directory: Base directory to store repos (e.g., ~/Library/Application Support/FluidAudio)
     ///   - computeUnits: CoreML compute units to use (default: CPU and Neural Engine)
     /// - Returns: Dictionary mapping model names to loaded MLModel instances
@@ -279,7 +260,7 @@ public class DownloadUtils {
 
         for file in files {
             switch file.type {
-            case "directory" where file.path.hasSuffix(".mlmodelc") || file.path.hasSuffix(".mlpackage"):
+            case "directory" where file.path.hasSuffix(".mlmodelc"):
                 // Only download if this model is in our required list
                 if requiredModels.contains(file.path) {
                     logger.info("Downloading required model: \(file.path)")
@@ -314,7 +295,7 @@ public class DownloadUtils {
     /// List files in a HuggingFace repository
     private static func listRepoFiles(_ repo: Repo, path: String = "") async throws -> [RepoFile] {
         let apiPath = path.isEmpty ? "tree/main" : "tree/main/\(path)"
-        let apiURL = URL(string: "https://huggingface.co/api/models/\(repo.rawValue)/\(apiPath)")!
+        let apiURL = URL(string: "https://huggingface.co/api/models/\(repo.remotePath)/\(apiPath)")!
 
         var request = URLRequest(url: apiURL)
         request.timeoutInterval = 30
@@ -424,7 +405,7 @@ public class DownloadUtils {
 
         // Download URL
         let downloadURL = URL(
-            string: "https://huggingface.co/\(repo.rawValue)/resolve/main/\(path)")!
+            string: "https://huggingface.co/\(repo.remotePath)/resolve/main/\(path)")!
 
         // Download the file (no retries)
         do {
@@ -566,7 +547,7 @@ extension DownloadUtils {
 
         // Download the zip file
         let zipPath = repoPath.appendingPathComponent("espeak-ng.zip")
-        let zipURL = URL(string: "https://huggingface.co/\(repo.rawValue)/resolve/main/espeak-ng.zip")!
+        let zipURL = URL(string: "https://huggingface.co/\(repo.remotePath)/resolve/main/espeak-ng.zip")!
 
         // Download if not present
         if !FileManager.default.fileExists(atPath: zipPath.path) {

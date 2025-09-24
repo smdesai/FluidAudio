@@ -1,16 +1,40 @@
 import Foundation
 
 /// Model repositories on HuggingFace
-public enum Repo: String, CaseIterable {
-    case vad = "FluidInference/silero-vad-coreml"
-    case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
-    case diarizer = "FluidInference/speaker-diarization-coreml"
-    case kokoro = "FluidInference/kokoro-82m-coreml"
+public enum Repo: CaseIterable {
+    case vad
+    case parakeet
+    case diarizer
+    case kokoro
 
-    var folderName: String {
-        rawValue.split(separator: "/").last?.description ?? rawValue
+    /// Repository slug (without owner)
+    public var name: String {
+        switch self {
+        case .vad:
+            return "silero-vad-coreml"
+        case .parakeet:
+            return "parakeet-tdt-0.6b-v3-coreml"
+        case .diarizer:
+            return "speaker-diarization-coreml"
+        case .kokoro:
+            return "kokoro-82m-coreml"
+        }
     }
 
+    /// Fully qualified HuggingFace repo path (owner/name)
+    public var remotePath: String {
+        "FluidInference/\(name)"
+    }
+
+    /// Local folder name used for caching
+    public var folderName: String {
+        switch self {
+        case .kokoro:
+            return "kokoro"
+        default:
+            return name
+        }
+    }
 }
 
 /// Centralized model names for all FluidAudio components

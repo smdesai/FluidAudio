@@ -80,7 +80,7 @@ public struct KokoroVocabulary {
         // Create directory if needed
         try FileManager.default.createDirectory(at: kokoroDir, withIntermediateDirectories: true)
 
-        let baseURL = "https://huggingface.co/\(DownloadUtils.Repo.kokoro.rawValue)/resolve/main"
+        let baseURL = "https://huggingface.co/\(Repo.kokoro.remotePath)/resolve/main"
         let fileName = "vocab_index.json"
         let localPath = kokoroDir.appendingPathComponent(fileName)
 
