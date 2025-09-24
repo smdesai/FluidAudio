@@ -1,37 +1,22 @@
 import Foundation
-import OSLog
+
 #if canImport(NaturalLanguage)
 import NaturalLanguage
 #endif
 
-/// A chunk of text prepared for synthesis.
-/// - words: Tokenised words used for phoneme lookup
-/// - atoms: Original text segments (words and punctuation) used to rebuild chunk text
-/// - phonemes: Flat phoneme sequence with single-space separators between words
-/// - totalFrames: Reserved for legacy/frame-aware modes (unused here)
-/// - pauseAfterMs: Silence to insert after this chunk (punctuation/paragraph driven)
+/// Lightweight chunk representation passed into Kokoro synthesis.
 struct TextChunk {
     let words: [String]
     let atoms: [String]
     let phonemes: [String]
     let totalFrames: Float
     let pauseAfterMs: Int
-
-    var text: String {
-        atoms.reduce(into: "") { partialResult, atom in
-            partialResult = KokoroChunker.appendSegment(partialResult, with: atom)
-        }
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+    let text: String
 }
 
-/// Punctuation-aware chunker that splits paragraphs → sentences → clauses
-/// and packs them under the model token budget.
+/// Chunker that mirrors the reference MLX Swift sentence-merging strategy for English text.
 enum KokoroChunker {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
-    private static let noPrespaceCharacters: Set<Character> = [
-        ",", ";", ":", "!", "?", ".", "…", "—", "–", "'", "\"", ")", "]", "}", "”", "’"
-    ]
     private static let decimalDigits = CharacterSet.decimalDigits
     private static let spelledOutFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
@@ -42,12 +27,630 @@ enum KokoroChunker {
         return formatter
     }()
 
-    static func appendSegment(_ base: String, with next: String) -> String {
+    /// Public entry point used by `KokoroModel`
+    static func chunk(
+        text: String,
+        wordToPhonemes: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        targetTokens: Int,
+        hasLanguageToken: Bool
+    ) -> [TextChunk] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let normalized = collapseNewlines(trimmed)
+
+        let (sentences, _) = splitIntoSentences(normalized)
+        guard !sentences.isEmpty else { return [] }
+
+        let segmentsByPeriods = applyRefinements(sentences)
+        guard !segmentsByPeriods.isEmpty else {
+            logger.info("Kokoro chunker produced no segments after refinement")
+            return []
+        }
+
+        let capacity = computeCapacity(targetTokens: targetTokens, hasLanguageToken: hasLanguageToken)
+        let allowedPhonemes = Set(KokoroVocabulary.getVocabulary().keys)
+
+        for (index, segment) in segmentsByPeriods.enumerated() {
+            logger.info("segmentsByPeriods[\(index)]: \(segment)")
+            let tokenCount = tokenCountForSegment(
+                for: segment,
+                lexicon: wordToPhonemes,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowedPhonemes,
+                capacity: capacity
+            )
+            logger.debug("segmentsByPeriods[\(index)] tokenCount=\(tokenCount) capacity=\(capacity)")
+        }
+
+        var segmentsByPunctuations: [String] = []
+        segmentsByPunctuations.reserveCapacity(segmentsByPeriods.count)
+
+        for (periodIndex, segment) in segmentsByPeriods.enumerated() {
+            let count = tokenCountForSegment(
+                for: segment,
+                lexicon: wordToPhonemes,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowedPhonemes,
+                capacity: capacity
+            )
+
+            if count > capacity {
+                let fragments = splitByPunctuation(segment)
+                let reassembled = reassembleFragments(
+                    fragments,
+                    lexicon: wordToPhonemes,
+                    caseSensitiveLexicon: caseSensitiveLexicon,
+                    allowed: allowedPhonemes,
+                    capacity: capacity
+                )
+                if !reassembled.isEmpty {
+                    logger.debug(
+                        "Segment exceeded capacity; punctuation split yielded \(reassembled.count) subsegments"
+                    )
+                    logger.info(
+                        "segmentsByPeriodsSplit[\(periodIndex)]: original='\(segment)'"
+                    )
+                    for (fragmentIndex, part) in reassembled.enumerated() {
+                        logger.info(
+                            "segmentsByPeriodsSplit[\(periodIndex)].part[\(fragmentIndex)]: \(part)"
+                        )
+                    }
+                    segmentsByPunctuations.append(contentsOf: reassembled)
+                    continue
+                }
+                logger.warning(
+                    "segmentsByPeriodsSplit[\(periodIndex)]: no punctuation-based split within capacity; deferring to chunk builder"
+                )
+            }
+
+            segmentsByPunctuations.append(segment)
+        }
+
+        for (index, segment) in segmentsByPunctuations.enumerated() {
+            logger.info("segmentsByPunctuations[\(index)]: \(segment)")
+        }
+
+        let chunks = segmentsByPunctuations.flatMap { chunkText in
+            buildChunks(
+                from: chunkText,
+                lexicon: wordToPhonemes,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowedPhonemes,
+                capacity: capacity
+            )
+        }
+
+        return chunks
+    }
+
+    private static func computeCapacity(targetTokens: Int, hasLanguageToken: Bool) -> Int {
+        let baseOverhead = 2 + (hasLanguageToken ? 1 : 0)
+        let safety = 12
+        return max(1, targetTokens - baseOverhead - safety)
+    }
+
+    // MARK: - Sentence Processing
+
+    private static func splitIntoSentences(_ text: String) -> ([String], NLLanguage?) {
+        #if canImport(NaturalLanguage)
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        let dominant = recognizer.dominantLanguage ?? .english
+
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        tokenizer.setLanguage(dominant)
+
+        var sentences: [String] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let candidate = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty {
+                sentences.append(candidate)
+            }
+            return true
+        }
+        if sentences.isEmpty {
+            return ([text], dominant)
+        }
+        return (sentences, dominant)
+        #else
+        // Fallback: split on period/question/exclamation marks.
+        let delimiters = CharacterSet(charactersIn: ".?!")
+        var current = ""
+        var sentences: [String] = []
+        for char in text {
+            current.append(char)
+            if let scalar = char.unicodeScalars.first, delimiters.contains(scalar) {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    sentences.append(trimmed)
+                }
+                current.removeAll(keepingCapacity: true)
+            }
+        }
+        if !current.isEmpty {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                sentences.append(trimmed)
+            }
+        }
+        return (sentences.isEmpty ? [text] : sentences, nil)
+        #endif
+    }
+
+    private static func applyRefinements(_ sentences: [String]) -> [String] {
+        sentences.compactMap { sentence in
+            let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    // MARK: - Chunk Construction
+
+    private static func buildChunks(
+        from text: String,
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        capacity: Int
+    ) -> [TextChunk] {
+        let atoms = tokenizeAtoms(text)
+        guard !atoms.isEmpty else { return [] }
+
+        var chunks: [TextChunk] = []
+        var chunkWords: [String] = []
+        var chunkAtoms: [String] = []
+        var chunkPhonemes: [String] = []
+        var chunkTokenCount = 0
+        var needsWordSeparator = false
+        var missing: Set<String> = []
+
+        func flushChunk() {
+            guard !chunkPhonemes.isEmpty else { return }
+            if chunkPhonemes.last == " " {
+                chunkPhonemes.removeLast()
+                chunkTokenCount -= 1
+            }
+            let textValue = chunkAtoms.reduce(into: "") { partial, atom in
+                partial = appendSegment(partial, with: atom)
+            }.trimmingCharacters(in: .whitespacesAndNewlines)
+            chunks.append(
+                TextChunk(
+                    words: chunkWords,
+                    atoms: chunkAtoms,
+                    phonemes: chunkPhonemes,
+                    totalFrames: 0,
+                    pauseAfterMs: 0,
+                    text: textValue
+                )
+            )
+            chunkWords.removeAll(keepingCapacity: true)
+            chunkAtoms.removeAll(keepingCapacity: true)
+            chunkPhonemes.removeAll(keepingCapacity: true)
+            chunkTokenCount = 0
+            needsWordSeparator = false
+        }
+
+        for atom in atoms {
+            switch atom.kind {
+            case .word(let original):
+                let normalized = normalize(original)
+                guard !normalized.isEmpty else { continue }
+
+                guard
+                    let resolved = resolvePhonemes(
+                        for: original,
+                        normalized: normalized,
+                        lexicon: lexicon,
+                        caseSensitiveLexicon: caseSensitiveLexicon,
+                        allowed: allowed,
+                        missing: &missing
+                    )
+                else {
+                    continue
+                }
+
+                var tokenCost = resolved.count
+                if needsWordSeparator {
+                    tokenCost += 1
+                }
+
+                if chunkTokenCount + tokenCost > capacity && !chunkPhonemes.isEmpty {
+                    flushChunk()
+                }
+
+                if needsWordSeparator {
+                    chunkPhonemes.append(" ")
+                    chunkTokenCount += 1
+                }
+
+                chunkPhonemes.append(contentsOf: resolved)
+                chunkTokenCount += resolved.count
+                chunkWords.append(original)
+                chunkAtoms.append(original)
+                needsWordSeparator = true
+
+            case .punctuation(let symbol):
+                guard allowed.contains(symbol) else { continue }
+                if chunkTokenCount + 1 > capacity && !chunkPhonemes.isEmpty {
+                    flushChunk()
+                }
+                chunkPhonemes.append(symbol)
+                chunkTokenCount += 1
+                chunkAtoms.append(symbol)
+                needsWordSeparator = false
+            }
+        }
+
+        flushChunk()
+
+        if !missing.isEmpty {
+            logger.warning("Missing phoneme entries for: \(missing.sorted().joined(separator: ", "))")
+        }
+
+        return chunks
+    }
+
+    private enum AtomKind {
+        case word(String)
+        case punctuation(String)
+    }
+
+    private struct AtomToken {
+        let text: String
+        let kind: AtomKind
+    }
+
+    private static func tokenizeAtoms(_ text: String) -> [AtomToken] {
+        var atoms: [AtomToken] = []
+        var currentWord = ""
+
+        func flushWord() {
+            guard !currentWord.isEmpty else { return }
+            let word = currentWord
+            atoms.append(AtomToken(text: word, kind: .word(word)))
+            currentWord.removeAll(keepingCapacity: true)
+        }
+
+        for ch in text {
+            if ch.isWhitespace {
+                flushWord()
+                continue
+            }
+
+            if ch.isLetter || ch.isNumber || ch == "'" {
+                currentWord.append(ch)
+            } else {
+                flushWord()
+                atoms.append(AtomToken(text: String(ch), kind: .punctuation(String(ch))))
+            }
+        }
+
+        flushWord()
+        return atoms
+    }
+
+    private static func resolvePhonemes(
+        for original: String,
+        normalized: String,
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        missing: inout Set<String>
+    ) -> [String]? {
+        var phonemes = caseSensitiveLexicon[original]
+
+        if phonemes == nil, let exactNormalized = caseSensitiveLexicon[normalized] {
+            phonemes = exactNormalized
+        }
+
+        if phonemes == nil {
+            phonemes = lexicon[normalized]
+        }
+
+        #if canImport(ESpeakNG) || canImport(CEspeakNG)
+        if phonemes == nil {
+            if #available(macOS 13.0, iOS 16.0, *) {
+                if let ipa = EspeakG2P.shared.phonemize(word: normalized) {
+                    let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
+                    if !mapped.isEmpty {
+                        phonemes = mapped
+                    }
+                }
+            }
+        }
+        #endif
+
+        if phonemes == nil,
+            let spelledTokens = spelledOutTokens(for: normalized),
+            !spelledTokens.isEmpty
+        {
+            var spelledPhonemes: [String] = []
+            var success = true
+            var firstSegment = true
+            for spelled in spelledTokens {
+                var segment = lexicon[spelled]
+
+                #if canImport(ESpeakNG) || canImport(CEspeakNG)
+                if segment == nil {
+                    if #available(macOS 13.0, iOS 16.0, *) {
+                        if let ipa = EspeakG2P.shared.phonemize(word: spelled) {
+                            let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
+                            if !mapped.isEmpty {
+                                segment = mapped
+                            }
+                        }
+                    }
+                }
+                #endif
+
+                if segment == nil, let fallback = letterPronunciations[spelled] {
+                    let filtered = fallback.filter { allowed.contains($0) }
+                    if !filtered.isEmpty {
+                        segment = filtered
+                    }
+                }
+
+                guard var resolvedSegment = segment, !resolvedSegment.isEmpty else {
+                    success = false
+                    break
+                }
+
+                resolvedSegment = resolvedSegment.filter { allowed.contains($0) }
+                if resolvedSegment.isEmpty {
+                    success = false
+                    break
+                }
+
+                if !firstSegment {
+                    spelledPhonemes.append(" ")
+                }
+                spelledPhonemes.append(contentsOf: resolvedSegment)
+                firstSegment = false
+            }
+
+            if success, !spelledPhonemes.isEmpty {
+                phonemes = spelledPhonemes
+            }
+        }
+
+        if phonemes == nil, let fallback = letterPronunciations[normalized] {
+            let filtered = fallback.filter { allowed.contains($0) }
+            if !filtered.isEmpty {
+                phonemes = filtered
+            }
+        }
+
+        guard var resolved = phonemes, !resolved.isEmpty else {
+            missing.insert(normalized)
+            return nil
+        }
+
+        resolved = resolved.filter { allowed.contains($0) }
+        guard !resolved.isEmpty else {
+            missing.insert(normalized)
+            return nil
+        }
+
+        return resolved
+    }
+
+    private static func tokenCountForSegment(
+        for text: String,
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        capacity: Int
+    ) -> Int {
+        let atoms = tokenizeAtoms(text)
+        guard !atoms.isEmpty else { return 0 }
+
+        var dummyMissing: Set<String> = []
+
+        var tokenCount = 0
+        var needsWordSeparator = false
+
+        for atom in atoms {
+            switch atom.kind {
+            case .word(let original):
+                let normalized = normalize(original)
+                guard !normalized.isEmpty else { continue }
+                guard
+                    let phonemes = resolvePhonemes(
+                        for: original,
+                        normalized: normalized,
+                        lexicon: lexicon,
+                        caseSensitiveLexicon: caseSensitiveLexicon,
+                        allowed: allowed,
+                        missing: &dummyMissing
+                    )
+                else {
+                    continue
+                }
+                tokenCount += phonemes.count
+                if needsWordSeparator {
+                    tokenCount += 1
+                }
+                needsWordSeparator = true
+            case .punctuation(let symbol):
+                guard allowed.contains(symbol) else { continue }
+                tokenCount += 1
+                needsWordSeparator = false
+            }
+
+            if tokenCount > capacity {
+                return tokenCount
+            }
+        }
+
+        return tokenCount
+    }
+
+    private static func reassembleFragments(
+        _ fragments: [String],
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        capacity: Int
+    ) -> [String] {
+        guard !fragments.isEmpty else { return [] }
+
+        var assembled: [String] = []
+        var current = ""
+
+        func flushCurrent() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                assembled.append(trimmed)
+            }
+            current.removeAll(keepingCapacity: false)
+        }
+
+        for fragment in fragments {
+            let trimmedFragment = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedFragment.isEmpty else { continue }
+
+            let candidate =
+                current.isEmpty
+                ? trimmedFragment
+                : appendSegment(current, with: trimmedFragment)
+            let candidateTokens = tokenCountForSegment(
+                for: candidate,
+                lexicon: lexicon,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowed,
+                capacity: capacity
+            )
+
+            if candidateTokens <= capacity || current.isEmpty {
+                current = candidate
+            } else {
+                flushCurrent()
+                current = trimmedFragment
+                let fragmentTokens = tokenCountForSegment(
+                    for: current,
+                    lexicon: lexicon,
+                    caseSensitiveLexicon: caseSensitiveLexicon,
+                    allowed: allowed,
+                    capacity: capacity
+                )
+                if fragmentTokens > capacity {
+                    // Fall back to returning empty so caller can handle via chunk builder.
+                    return []
+                }
+            }
+        }
+
+        flushCurrent()
+        return assembled
+    }
+
+    private static func splitByPunctuation(_ text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+
+        var segments: [String] = []
+        var currentStart = text.startIndex
+        let breakCharacters = CharacterSet(charactersIn: ",;:")
+        let separatorTokens = [": ", "; ", ", "]
+
+        #if canImport(NaturalLanguage)
+        if #available(macOS 10.14, iOS 12.0, *) {
+            let tagger = NLTagger(tagSchemes: [.lexicalClass])
+            tagger.string = text
+            tagger.enumerateTags(
+                in: text.startIndex..<text.endIndex,
+                unit: .word,
+                scheme: .lexicalClass,
+                options: []
+            ) { tag, range in
+                guard tag == .punctuation else { return true }
+                let token = text[range]
+                if token.unicodeScalars.contains(where: { breakCharacters.contains($0) }) {
+                    var endIndex = range.upperBound
+                    for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
+                        endIndex = text.index(endIndex, offsetBy: separator.count)
+                        break
+                    }
+                    let segment = text[currentStart..<endIndex]
+                    let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        segments.append(trimmed)
+                    }
+                    currentStart = endIndex
+                }
+                return true
+            }
+        } else {
+            let tagger = NSLinguisticTagger(tagSchemes: [.lexicalClass], options: 0)
+            tagger.string = text
+            let nsRange = NSRange(location: 0, length: (text as NSString).length)
+            tagger.enumerateTags(in: nsRange, unit: .word, scheme: .lexicalClass, options: []) {
+                tag, range, _ in
+                guard tag == .punctuation, let tokenRange = Range(range, in: text) else { return }
+                let token = text[tokenRange]
+                if token.unicodeScalars.contains(where: { breakCharacters.contains($0) }) {
+                    var endIndex = tokenRange.upperBound
+                    for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
+                        endIndex = text.index(endIndex, offsetBy: separator.count)
+                        break
+                    }
+                    let segment = text[currentStart..<endIndex]
+                    let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        segments.append(trimmed)
+                    }
+                    currentStart = endIndex
+                }
+            }
+        }
+        #else
+        for (offset, character) in text.enumerated() {
+            if let scalar = character.unicodeScalars.first, breakCharacters.contains(scalar) {
+                var endIndex = text.index(text.startIndex, offsetBy: offset + 1)
+                for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
+                    endIndex = text.index(endIndex, offsetBy: separator.count)
+                    break
+                }
+                let segment = text[currentStart..<endIndex]
+                let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    segments.append(trimmed)
+                }
+                currentStart = endIndex
+            }
+        }
+        #endif
+
+        if currentStart < text.endIndex {
+            let tail = text[currentStart..<text.endIndex]
+            let trimmedTail = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedTail.isEmpty {
+                segments.append(trimmedTail)
+            }
+        }
+
+        return segments.isEmpty ? [text] : segments
+    }
+
+    private static func normalize(_ word: String) -> String {
+        let lowered = word.lowercased()
+        let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
+        let filteredScalars = lowered.unicodeScalars.filter { allowedSet.contains($0) }
+        return String(String.UnicodeScalarView(filteredScalars))
+    }
+
+    private static func collapseNewlines(_ text: String) -> String {
+        guard text.contains(where: { $0.isNewline }) else { return text }
+        let segments = text.split(whereSeparator: { $0.isNewline })
+        return segments.map(String.init).joined(separator: " ")
+    }
+
+    private static func appendSegment(_ base: String, with next: String) -> String {
         let trimmedNext = next.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedNext.isEmpty else { return base }
-        if base.isEmpty {
-            return trimmedNext
-        }
+        if base.isEmpty { return trimmedNext }
         if let first = trimmedNext.first, noPrespaceCharacters.contains(first) {
             return base + trimmedNext
         }
@@ -62,466 +665,44 @@ enum KokoroChunker {
         guard let value = Int(token) else { return nil }
         guard let spelled = spelledOutFormatter.string(from: NSNumber(value: value)) else { return nil }
         let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-"))
-        let parts = spelled
+        let components =
+            spelled
             .lowercased()
             .components(separatedBy: separators)
             .filter { !$0.isEmpty }
-        return parts.isEmpty ? nil : parts
+        return components.isEmpty ? nil : components
     }
-    /// Build chunks under the token budget.
-    /// - Parameters:
-    ///   - text: Raw input text
-    ///   - wordToPhonemes: Mapping of lowercase words to phoneme arrays
-    ///   - targetTokens: Model token capacity for `input_ids`
-    ///   - hasLanguageToken: Whether to reserve one token for a language marker
-    /// - Returns: Array of TextChunk with punctuation-driven `pauseAfterMs`
-    static func chunk(
-        text: String,
-        wordToPhonemes: [String: [String]],
-        targetTokens: Int,
-        hasLanguageToken: Bool
-    ) -> [TextChunk] {
-        let baseOverhead = 2 + (hasLanguageToken ? 1 : 0)  // BOS/EOS + optional language token
-        // Safety margin to avoid hard edge near model capacity (prevents mid-sentence cut-offs)
-        let safety = 12
-        let cap = max(1, targetTokens - safety)
 
-        let vocabulary = KokoroVocabulary.getVocabulary()
-        let punctuationTokensToStrip: Set<String> = [","]
-        let punctuationEndingTokens: Set<String> = [".", "!", "?", "…"]
-        // Conjunctions & prepositions we try not to end a chunk on (keep in lowercase)
-        let boundaryStopWords: Set<String> = [
-            // Coordinating conjunctions
-            "and", "but", "or", "nor", "so", "yet", "for",
-            // Common prepositions
-            "with", "without", "about", "above", "below", "across",
-            "after", "before", "into", "onto", "upon", "between",
-            "among", "around", "near", "to", "of", "in", "on",
-            "at", "by", "from", "over", "under", "through",
-            // Subordinating conjunctions / prepositional variants
-            "during", "regarding", "concerning", "because", "since",
-            "though", "although", "while"
-        ]
-        let periodTokenAvailable = vocabulary["."] != nil
+    private static let noPrespaceCharacters: Set<Character> = [
+        ",", ";", ":", "!", "?", ".", "…", "—", "–", "'", "\"", ")", "]", "}", "”", "’",
+    ]
 
-        // Pause mapping (ms)
-        let pauseSentence = 0
-        let pauseParagraph = 0
-
-        let normalizationSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
-
-        func normalizeWord(_ s: String) -> String {
-            let lowered = s.lowercased()
-                .replacingOccurrences(of: "\u{2019}", with: "'")
-                .replacingOccurrences(of: "\u{2018}", with: "'")
-            return String(lowered.unicodeScalars.filter { normalizationSet.contains($0) })
-        }
-
-        func phonemizeWords(_ words: [String]) -> [String] {
-            let allowed = Set(vocabulary.keys)
-
-            func isPunct(_ ch: Character) -> Bool {
-                return !(ch.isLetter || ch.isNumber || ch.isWhitespace || ch == "'")
-            }
-
-            var out: [String] = []
-            for (wi, w) in words.enumerated() {
-                // Split w into runs: word segments and single punctuation chars
-                var seg = ""
-                func flushSeg() {
-                    guard !seg.isEmpty else { return }
-                    let key = normalizeWord(seg)
-                    if let arr = wordToPhonemes[key] {
-                        out.append(contentsOf: arr)
-                    } else {
-                        var handled = false
-                        if let spelledTokens = spelledOutTokens(for: key) {
-                            var spelledPhonemes: [String] = []
-                            var success = true
-                            for spelled in spelledTokens {
-                                if let arr = wordToPhonemes[spelled] {
-                                    if !spelledPhonemes.isEmpty { spelledPhonemes.append(" ") }
-                                    spelledPhonemes.append(contentsOf: arr)
-                                } else {
-                                    #if canImport(ESpeakNG) || canImport(CEspeakNG)
-                                    if let ipa = EspeakG2P.shared.phonemize(word: spelled) {
-                                        let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
-                                        if !mapped.isEmpty {
-                                            if !spelledPhonemes.isEmpty { spelledPhonemes.append(" ") }
-                                            spelledPhonemes.append(contentsOf: mapped)
-                                            KokoroChunker.logger.info("EspeakG2P used for spelled-out token: \(spelled)")
-                                        } else {
-                                            success = false
-                                            break
-                                        }
-                                    } else {
-                                        success = false
-                                        break
-                                    }
-                                    #else
-                                    success = false
-                                    break
-                                    #endif
-                                }
-                            }
-                            if success && !spelledPhonemes.isEmpty {
-                                out.append(contentsOf: spelledPhonemes)
-                                seg.removeAll()
-                                handled = true
-                            }
-                        }
-                        if handled { return }
-                        // Use C eSpeak NG for OOV phonemization only (if available)
-                        #if canImport(ESpeakNG) || canImport(CEspeakNG)
-                        if let ipa = EspeakG2P.shared.phonemize(word: key) {
-                            let mapped = PhonemeMapper.mapIPA(ipa, allowed: allowed)
-                            if !mapped.isEmpty {
-                                print(
-                                    "[G2P] word=\(key) | ipa=\(ipa.joined(separator: " ")) | map=\(mapped.joined(separator: " "))"
-                                )
-                                out.append(contentsOf: mapped)
-                                KokoroChunker.logger.info("EspeakG2P used for OOV word: \(key)")
-                            } else {
-                                print("[G2P] word=\(key) | ipa=<none> | map=<empty>")
-                                KokoroChunker.logger.warning("OOV word yielded no mappable IPA tokens: \(key)")
-                            }
-                        } else {
-                            print("[G2P] word=\(key) | ipa=<failed> | map=<empty>")
-                            KokoroChunker.logger.warning("EspeakG2P failed for OOV word: \(key)")
-                        }
-                        #else
-                        // G2P not available in this build; skip OOV word
-                        KokoroChunker.logger.warning("CEspeakNG not available; skipping OOV word: \(key)")
-                        #endif
-                    }
-                    seg.removeAll()
-                }
-                for ch in w {
-                    if isPunct(ch) {
-                        flushSeg()
-                        let p = String(ch)
-                        if allowed.contains(p) { out.append(p) }
-                    } else {
-                        seg.append(ch)
-                    }
-                }
-                flushSeg()
-                if wi != words.count - 1 { out.append(" ") }
-            }
-            if out.last == " " { out.removeLast() }
-            return out
-        }
-
-        func tokenCount(for sentence: String) -> Int {
-            let displayWords = sentence
-                .split(whereSeparator: { $0.isWhitespace })
-                .map { String($0) }
-            guard !displayWords.isEmpty else { return 0 }
-            let words = displayWords.map { $0.lowercased() }
-            let tokens = phonemizeWords(words)
-            return tokens.count
-        }
-
-        func mergeSentences(_ sentences: [(String, Character?)]) -> [(String, Character?)] {
-            var merged: [(String, Character?)] = []
-            var currentText = ""
-            var currentEnd: Character? = nil
-
-            for (sentence, punctuation) in sentences {
-                let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-
-                if currentText.isEmpty {
-                    currentText = trimmed
-                    currentEnd = punctuation
-                    continue
-                }
-
-                let candidateText = currentText + " " + trimmed
-                let candidateTokens = tokenCount(for: candidateText)
-
-                if candidateTokens <= cap {
-                    currentText = candidateText
-                    currentEnd = punctuation
-                } else {
-                    merged.append((currentText, currentEnd))
-                    currentText = trimmed
-                    currentEnd = punctuation
-                }
-            }
-
-            if !currentText.isEmpty {
-                merged.append((currentText, currentEnd))
-            }
-
-            return merged
-        }
-
-        func appendPeriod(to atoms: inout [String]) {
-            guard !atoms.isEmpty else {
-                atoms.append(".")
-                return
-            }
-            var updated = atoms[atoms.count - 1]
-            while let last = updated.last, last.isWhitespace {
-                updated.removeLast()
-            }
-            while let last = updated.last, punctuationTokensToStrip.contains(String(last)) {
-                updated.removeLast()
-            }
-            if updated.isEmpty {
-                atoms[atoms.count - 1] = "."
-            } else {
-                atoms[atoms.count - 1] = updated + "."
-            }
-        }
-
-        /// Remove trailing whitespace tokens and suppress terminal colon/semicolon/comma tokens so
-        /// punctuation pauses do not produce artifacts in the synthesised audio. Optionally appends
-        /// a terminating period when a chunk ends on a conjunction or preposition (if budget allows).
-        func sanitizeChunkTokens(
-            _ tokens: [String],
-            lastWord: String?,
-            currentTokenCount: Int
-        ) -> ([String], Bool) {
-            var cleaned = tokens
-            var appendedPeriod = false
-            var replacedPunctuation = false
-            while let last = cleaned.last, last == " " {
-                cleaned.removeLast()
-            }
-            if let last = cleaned.last, punctuationTokensToStrip.contains(last) {
-                if periodTokenAvailable {
-                    cleaned[cleaned.count - 1] = "."
-                    appendedPeriod = true
-                    replacedPunctuation = true
-                } else {
-                    cleaned.removeLast()
-                    while let tail = cleaned.last, tail == " " {
-                        cleaned.removeLast()
-                    }
-                }
-            }
-
-            let currentlyTerminated = cleaned.last.map { punctuationEndingTokens.contains($0) || punctuationTokensToStrip.contains($0) } ?? false
-
-            if periodTokenAvailable {
-                let normalized = lastWord.map { normalizeWord($0) }
-                if let normalized,
-                    !normalized.isEmpty,
-                    boundaryStopWords.contains(normalized)
-                {
-                    let alreadyTerminated = currentlyTerminated
-                    let additionalCost = appendedPeriod ? 0 : 1
-                    if alreadyTerminated == false && currentTokenCount + additionalCost <= targetTokens {
-                        cleaned.append(".")
-                        appendedPeriod = true
-                    }
-                }
-            } else if !currentlyTerminated, !replacedPunctuation {
-                // If we removed punctuation and cannot emit '.', the chunk will end without added token.
-            }
-
-            return (cleaned, appendedPeriod)
-        }
-
-        func splitSentences(_ paragraph: String) -> [(String, Character?)] {
-            let tokenizer = NLTokenizer(unit: .sentence)
-            tokenizer.string = paragraph
-            var units: [(String, Character?)] = []
-            tokenizer.enumerateTokens(in: paragraph.startIndex..<paragraph.endIndex) { range, _ in
-                let sentence = String(paragraph[range]).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !sentence.isEmpty else { return true }
-                let endPunct = sentence.trimmingCharacters(in: .whitespaces).last
-                units.append((sentence, endPunct))
-                return true
-            }
-            return units
-        }
-
-        func splitClauses(_ sentence: String, endPunct: Character?) -> [(String, Int)] {
-            let trimmed = sentence.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { return [] }
-            let pause = endPunct != nil ? pauseSentence : 0
-            KokoroChunker.logger.info("    Clause: '\(trimmed)' (pause=\(pause))")
-            return [(trimmed, pause)]
-        }
-
-        let paragraphs = text.components(separatedBy: "\n\n").filter {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-
-        var chunks: [TextChunk] = []
-        for (pIndex, para) in paragraphs.enumerated() {
-            let sentences = mergeSentences(splitSentences(para))
-            var units: [(text: String, words: [String], displayWords: [String], pause: Int)] = []
-            for (sent, endP) in sentences {
-                let clauses = splitClauses(sent, endPunct: endP)
-                KokoroChunker.logger.info("Sentence: '\(sent)' -> \(clauses.count) clauses")
-                for (idx, (cl, pause)) in clauses.enumerated() {
-                    let trimmed = cl.trimmingCharacters(in: .whitespaces)
-                    guard !trimmed.isEmpty else { continue }
-                    let displayWords = trimmed.split(whereSeparator: { $0.isWhitespace }).map { String($0) }
-                    let words = displayWords.map { $0.lowercased() }
-                    if !words.isEmpty {
-                        units.append((text: trimmed, words: words, displayWords: displayWords, pause: pause))
-                        KokoroChunker.logger.info(
-                            "  Clause \(idx): '\(trimmed)' -> \(words.count) words, pause=\(pause)")
-                    }
-                }
-            }
-
-            var curWords: [String] = []
-            var curAtoms: [String] = []
-            var curPhon: [String] = []
-            var curTokenCount = baseOverhead
-            var lastPause = pIndex < paragraphs.count - 1 ? pauseParagraph : 0
-
-            for unit in units {
-                let ph = phonemizeWords(unit.words)
-                // If the entire unit doesn't fit into an empty chunk, split by words to respect budget.
-                let fitsEmpty = (baseOverhead + ph.count) <= cap
-
-                if ph.isEmpty {
-                    // Unit has no known phonemes; treat as zero-cost. Skip, but carry over pause.
-                    lastPause = unit.pause
-                    continue
-                }
-
-                if fitsEmpty == false {
-                    // First, flush any existing buffer before micro-splitting
-                    if !curPhon.isEmpty {
-                        let (cleaned, appendedPeriod) = sanitizeChunkTokens(
-                            curPhon,
-                            lastWord: curWords.last,
-                            currentTokenCount: curTokenCount)
-                        if appendedPeriod { appendPeriod(to: &curAtoms) }
-                        if !cleaned.isEmpty {
-                    chunks.append(
-                        TextChunk(
-                            words: curWords,
-                            atoms: curAtoms,
-                            phonemes: cleaned,
-                            totalFrames: 0,
-                            pauseAfterMs: 0))
-                        }
-                        curWords.removeAll()
-                        curAtoms.removeAll()
-                        curPhon.removeAll()
-                        curTokenCount = baseOverhead
-                    }
-
-                    // Micro-split: accumulate word-by-word within this unit.
-                    var subWords: [String] = []
-                    var subAtoms: [String] = []
-                    var subPhon: [String] = []
-                    var subCount = baseOverhead
-
-                    func flushSub(finalPause: Int) {
-                        if !subPhon.isEmpty {
-                            let (cleaned, appendedPeriod) = sanitizeChunkTokens(
-                                subPhon,
-                                lastWord: subWords.last,
-                                currentTokenCount: subCount)
-                            if appendedPeriod { appendPeriod(to: &subAtoms) }
-                            if !cleaned.isEmpty {
-                                chunks.append(
-                                    TextChunk(
-                                        words: subWords,
-                                        atoms: subAtoms,
-                                        phonemes: cleaned,
-                                        totalFrames: 0,
-                                        pauseAfterMs: 0))
-                            }
-                            subWords.removeAll(keepingCapacity: true)
-                            subAtoms.removeAll(keepingCapacity: true)
-                            subPhon.removeAll(keepingCapacity: true)
-                            subCount = baseOverhead
-                        }
-                    }
-
-                    for (i, w) in unit.words.enumerated() {
-                        let displayWord = unit.displayWords[i]
-                        let wPh = phonemizeWords([w])
-                        // Fallback cost for unknown words: treat as small cost so we still split; no phonemes appended.
-                        let wCost = (wPh.isEmpty ? 1 : wPh.count) + (subPhon.isEmpty ? 0 : 1)
-                        if subCount + wCost <= cap {
-                            if !wPh.isEmpty {
-                                if !subPhon.isEmpty { subPhon.append(" ") }
-                                subPhon.append(contentsOf: wPh)
-                            }
-                            subWords.append(w)
-                            subAtoms.append(displayWord)
-                            subCount += wCost
-                        } else {
-                            // flush with no internal pause between sub-chunks
-                            flushSub(finalPause: 0)
-                            if !wPh.isEmpty {
-                                subPhon.append(contentsOf: wPh)
-                            }
-                            subWords.append(w)
-                            subAtoms.append(displayWord)
-                            subCount = baseOverhead + (wPh.isEmpty ? 1 : wPh.count)
-                        }
-                        // At end of unit, flush with the unit's pause
-                        if i == unit.words.count - 1 {
-                            flushSub(finalPause: unit.pause)
-                            lastPause = unit.pause
-                        }
-                    }
-                    continue
-                }
-
-                // Normal packing at unit granularity
-                let additional = ph.count + (curPhon.isEmpty ? 0 : 1)  // +1 for join space
-                if curTokenCount + additional <= cap {
-                    if !curPhon.isEmpty { curPhon.append(" ") }
-                    curPhon.append(contentsOf: ph)
-                    curWords.append(contentsOf: unit.words)
-                    curAtoms.append(unit.text)
-                    curTokenCount += additional
-                    lastPause = unit.pause
-                } else {
-                    if !curPhon.isEmpty {
-                        let (cleaned, appendedPeriod) = sanitizeChunkTokens(
-                            curPhon,
-                            lastWord: curWords.last,
-                            currentTokenCount: curTokenCount)
-                        if appendedPeriod { appendPeriod(to: &curAtoms) }
-                        if !cleaned.isEmpty {
-                        chunks.append(
-                            TextChunk(
-                                words: curWords,
-                                atoms: curAtoms,
-                                phonemes: cleaned,
-                                totalFrames: 0,
-                                pauseAfterMs: 0))
-                        }
-                    }
-                    curWords = unit.words
-                    curAtoms = [unit.text]
-                    curPhon = ph
-                    curTokenCount = baseOverhead + ph.count
-                    lastPause = unit.pause
-                }
-            }
-            if !curPhon.isEmpty {
-                let (cleaned, appendedPeriod) = sanitizeChunkTokens(
-                    curPhon,
-                    lastWord: curWords.last,
-                    currentTokenCount: curTokenCount)
-                guard !cleaned.isEmpty else { continue }
-                if appendedPeriod { appendPeriod(to: &curAtoms) }
-                let paraPause = 0
-                chunks.append(
-                    TextChunk(
-                        words: curWords,
-                        atoms: curAtoms,
-                        phonemes: cleaned,
-                        totalFrames: 0,
-                        pauseAfterMs: paraPause))
-            }
-        }
-        return chunks
-    }
+    private static let letterPronunciations: [String: [String]] = [
+        "a": ["e", "ɪ"],
+        "b": ["b", "i"],
+        "c": ["s", "i"],
+        "d": ["d", "i"],
+        "e": ["i"],
+        "f": ["ɛ", "f"],
+        "g": ["ʤ", "i"],
+        "h": ["e", "ɪ", "ʧ"],
+        "i": ["a", "ɪ"],
+        "j": ["ʤ", "e"],
+        "k": ["k", "e"],
+        "l": ["ɛ", "l"],
+        "m": ["ɛ", "m"],
+        "n": ["ɛ", "n"],
+        "o": ["o"],
+        "p": ["p", "i"],
+        "q": ["k", "j", "u"],
+        "r": ["ɑ", "r"],
+        "s": ["ɛ", "s"],
+        "t": ["t", "i"],
+        "u": ["j", "u"],
+        "v": ["v", "i"],
+        "w": ["d", "ʌ", "b", "əl", "j", "u"],
+        "x": ["ɛ", "k", "s"],
+        "y": ["w", "a", "ɪ"],
+        "z": ["z", "i"],
+    ]
 }

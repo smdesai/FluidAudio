@@ -29,6 +29,7 @@ public struct KokoroModel {
         public let text: String
         public let wordCount: Int
         public let words: [String]
+        public let atoms: [String]
         public let pauseAfterMs: Int
         public let tokenCount: Int
         public let samples: [Float]
@@ -39,6 +40,7 @@ public struct KokoroModel {
             text: String,
             wordCount: Int,
             words: [String],
+            atoms: [String],
             pauseAfterMs: Int,
             tokenCount: Int,
             samples: [Float],
@@ -48,6 +50,7 @@ public struct KokoroModel {
             self.text = text
             self.wordCount = wordCount
             self.words = words
+            self.atoms = atoms
             self.pauseAfterMs = pauseAfterMs
             self.tokenCount = tokenCount
             self.samples = samples
@@ -66,6 +69,7 @@ public struct KokoroModel {
 
     // Preferred: Simple word -> phonemes mapping from US lexicon JSON files
     private static var wordToPhonemes: [String: [String]] = [:]
+    private static var caseSensitiveWordToPhonemes: [String: [String]] = [:]
     private static var isSimpleDictLoaded = false
 
     // Model and data URLs
@@ -158,7 +162,8 @@ public struct KokoroModel {
             let localModelURL = cwd.appendingPathComponent(fileName)
 
             if fm.fileExists(atPath: localModelURL.path) {
-                logger.info("Loading Kokoro \(variantDescription(variant)) model from local bundle: \(localModelURL.path)")
+                logger.info(
+                    "Loading Kokoro \(variantDescription(variant)) model from local bundle: \(localModelURL.path)")
                 let model: MLModel
                 if localModelURL.pathExtension == "mlpackage" {
                     let compiledURL = try await MLModel.compileModel(at: localModelURL)
@@ -198,7 +203,9 @@ public struct KokoroModel {
     /// Load simple word->phonemes dictionary (preferred)
     /// Uses the richer US English lexicons (gold/silver) as the primary source.
     public static func loadSimplePhonemeDictionary() throws {
-        guard !isSimpleDictLoaded else { return }
+        if isSimpleDictLoaded && !caseSensitiveWordToPhonemes.isEmpty {
+            return
+        }
 
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
@@ -211,6 +218,7 @@ public struct KokoroModel {
 
         let lexiconFiles = ["us_gold.json", "us_silver.json"]
         var mapping: [String: [String]] = [:]
+        var caseSensitive: [String: [String]] = [:]
         var totalAdded = 0
 
         for filename in lexiconFiles {
@@ -238,6 +246,10 @@ public struct KokoroModel {
 
                     guard !tokens.isEmpty else { continue }
 
+                    if caseSensitive[key] == nil {
+                        caseSensitive[key] = tokens
+                    }
+
                     if mapping[normalizedKey] == nil {
                         mapping[normalizedKey] = tokens
                         addedHere += 1
@@ -258,6 +270,7 @@ public struct KokoroModel {
         }
 
         wordToPhonemes = mapping
+        caseSensitiveWordToPhonemes = caseSensitive
         isSimpleDictLoaded = true
         logger.info("Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))")
     }
@@ -287,6 +300,7 @@ public struct KokoroModel {
         return KokoroChunker.chunk(
             text: text,
             wordToPhonemes: wordToPhonemes,
+            caseSensitiveLexicon: caseSensitiveWordToPhonemes,
             targetTokens: target,
             hasLanguageToken: hasLang
         )
@@ -336,14 +350,22 @@ public struct KokoroModel {
 
     private static func selectVariant(forTokenCount tokenCount: Int) throws -> ModelNames.TTS.Variant {
         let shortCapacity = try tokenLength(for: .fiveSecond)
-        if tokenCount <= shortCapacity {
+        let longCapacity = try tokenLength(for: .fifteenSecond)
+        guard tokenCount <= longCapacity else {
+            throw TTSError.processingFailed(
+                "Chunk token count \(tokenCount) exceeds supported capacities (short=\(shortCapacity), long=\(longCapacity))"
+            )
+        }
+
+        let shortThreshold = min(71, shortCapacity)
+        if tokenCount <= shortThreshold {
             return .fiveSecond
         }
-        let longCapacity = try tokenLength(for: .fifteenSecond)
-        if tokenCount <= longCapacity {
-            return .fifteenSecond
-        }
-        throw TTSError.processingFailed("Chunk token count \(tokenCount) exceeds supported capacities (short=\(shortCapacity), long=\(longCapacity))")
+
+        logger.notice(
+            "Promoting chunk to Kokoro 15s variant: token count \(tokenCount) exceeds short threshold=\(shortThreshold) (short capacity=\(shortCapacity), long capacity=\(longCapacity))"
+        )
+        return .fifteenSecond
     }
 
     /// Load voice embedding (simplified for 3-second model)
@@ -477,8 +499,14 @@ public struct KokoroModel {
         // Pad or truncate to match model expectation
         var trimmedIds = inputIds
         if trimmedIds.count > targetTokens {
+            logger.warning(
+                "input_ids length (\(trimmedIds.count)) exceeds targetTokens=\(targetTokens) for chunk '\(chunk.text)' — truncating"
+            )
             trimmedIds = Array(trimmedIds.prefix(targetTokens))
         } else if trimmedIds.count < targetTokens {
+            logger.debug(
+                "input_ids length (\(trimmedIds.count)) below targetTokens=\(targetTokens) for chunk '\(chunk.text)' — padding with zeros"
+            )
             trimmedIds.append(contentsOf: Array(repeating: Int32(0), count: targetTokens - trimmedIds.count))
         }
 
@@ -513,7 +541,9 @@ public struct KokoroModel {
         let predictionStart = Date()
         let output = try kokoro.prediction(from: modelInput)
         let predictionTime = Date().timeIntervalSince(predictionStart)
-        print("[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))")
+        print(
+            "[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"
+        )
 
         // Extract audio output explicitly by key used by model
         guard let audioArrayUnwrapped = output.featureValue(for: "audio")?.multiArrayValue,
@@ -556,21 +586,6 @@ public struct KokoroModel {
         }
 
         return samples
-    }
-
-    /// Apply a short linear ramp-to-zero at the end of a sample buffer to avoid discontinuities.
-    private static func applyTailRamp(
-        _ samples: inout [Float],
-        sampleRate: Int = 24_000,
-        rampDurationMs: Int = 6
-    ) {
-        guard !samples.isEmpty else { return }
-        let rampCount = max(1, min(samples.count, sampleRate * rampDurationMs / 1_000))
-        let start = samples.count - rampCount
-        for i in 0..<rampCount {
-            let weight = Float(rampCount - i) / Float(rampCount)
-            samples[start + i] *= weight
-        }
     }
 
     /// Main synthesis function returning audio bytes only.
@@ -646,6 +661,7 @@ public struct KokoroModel {
             let text: String
             let wordCount: Int
             let words: [String]
+            let atoms: [String]
             let pauseAfterMs: Int
             let tokenCount: Int
             let variant: ModelNames.TTS.Variant
@@ -674,6 +690,7 @@ public struct KokoroModel {
                 text: chunk.text,
                 wordCount: chunk.words.count,
                 words: chunk.words,
+                atoms: chunk.atoms,
                 pauseAfterMs: chunk.pauseAfterMs,
                 tokenCount: min(inputIds.count, targetTokens),
                 variant: variant,
@@ -700,17 +717,13 @@ public struct KokoroModel {
                 "Processing chunk \(index + 1)/\(entries.count): \(chunk.words.count) words")
             logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
             logger.info("Chunk \(index + 1) using Kokoro \(variantDescription(entry.template.variant)) model")
-            var chunkSamples = try await synthesizeChunk(
+            let chunkSamples = try await synthesizeChunk(
                 entry.chunk,
                 voice: voice,
                 inputIds: entry.inputIds,
                 variant: entry.template.variant,
                 targetTokens: entry.template.targetTokens)
 
-            let needsTailRamp = entry.chunk.pauseAfterMs > 0 || index == entries.count - 1
-            if needsTailRamp {
-                applyTailRamp(&chunkSamples)
-            }
             chunkSampleBuffers.append(chunkSamples)
             chunkTemplates.append(entry.template)
 
@@ -766,6 +779,7 @@ public struct KokoroModel {
                 text: template.text,
                 wordCount: template.wordCount,
                 words: template.words,
+                atoms: template.atoms,
                 pauseAfterMs: template.pauseAfterMs,
                 tokenCount: template.tokenCount,
                 samples: samples,

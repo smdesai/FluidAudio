@@ -62,6 +62,9 @@ final class EspeakG2P {
             "./Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Resources/espeak-ng-data.bundle/espeak-ng-data",
             "./Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Versions/A/Resources/espeak-ng-data.bundle/espeak-ng-data",
             "./Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Versions/Current/Resources/espeak-ng-data.bundle/espeak-ng-data",
+            "./mlx-audio/mlx_audio_swift/tts/Swift-TTS/Kokoro/Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Resources/espeak-ng-data.bundle/espeak-ng-data",
+            "./mlx-audio/mlx_audio_swift/tts/Swift-TTS/Kokoro/Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Versions/A/Resources/espeak-ng-data.bundle/espeak-ng-data",
+            "./mlx-audio/mlx_audio_swift/tts/Swift-TTS/Kokoro/Frameworks/ESpeakNG.xcframework/macos-arm64/ESpeakNG.framework/Versions/Current/Resources/espeak-ng-data.bundle/espeak-ng-data",
         ]
 
         // Convert relative paths to absolute
@@ -91,7 +94,8 @@ final class EspeakG2P {
 
         // 3. Finally check the models cache (download from HF)
         if let base = try? TtsModels.cacheDirectoryURL() {
-            let models = base.appendingPathComponent("Models/kokoro/Resources/espeak-ng/espeak-ng-data.bundle/espeak-ng-data")
+            let models = base.appendingPathComponent(
+                "Models/kokoro/Resources/espeak-ng/espeak-ng-data.bundle/espeak-ng-data")
             if let ok = valid(models.path) { return ok }
         }
 

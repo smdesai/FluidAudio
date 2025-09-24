@@ -30,7 +30,8 @@ public struct Kokoro {
 
         func tokenizeIPA(_ s: String) -> [String] {
             if s.contains(where: { $0.isWhitespace }) {
-                return s
+                return
+                    s
                     .components(separatedBy: .whitespacesAndNewlines)
                     .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ",.;:()[]{}\"'")) }
                     .filter { !$0.isEmpty }
