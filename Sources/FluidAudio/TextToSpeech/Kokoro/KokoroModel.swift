@@ -200,6 +200,19 @@ public struct KokoroModel {
         logger.info("Kokoro models ready: [\(loadedVariants)]")
     }
 
+    /// Register a bundle of preloaded Core ML models so future calls to `loadModel()` reuse them.
+    /// This allows higher-level managers to inject models that were downloaded elsewhere (e.g. pod lint).
+    internal static func registerPreloadedModels(_ models: TtsModels) {
+        downloadedModelBundle = models
+
+        for variant in ModelNames.TTS.Variant.allCases {
+            if let model = models.model(for: variant) {
+                kokoroModels[variant] = model
+                tokenLengthCache[variant] = inferTokenLength(from: model)
+            }
+        }
+    }
+
     /// Load simple word->phonemes dictionary (preferred)
     /// Uses the richer US English lexicons (gold/silver) as the primary source.
     public static func loadSimplePhonemeDictionary() throws {
@@ -539,7 +552,7 @@ public struct KokoroModel {
 
         // Time ONLY the model prediction
         let predictionStart = Date()
-        let output = try kokoro.prediction(from: modelInput)
+        let output = try await kokoro.prediction(from: modelInput)
         let predictionTime = Date().timeIntervalSince(predictionStart)
         print(
             "[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"

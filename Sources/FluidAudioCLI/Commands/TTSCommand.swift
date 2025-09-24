@@ -58,20 +58,19 @@ public struct TTS {
             // Timing buckets
             let tStart = Date()
 
-            // 1) Ensure required resources (dictionary)
-            try await KokoroModel.ensureRequiredFiles()
+            let manager = TtSManager()
 
-            // 2) Ensure voice embedding in cache
-            try? await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: voice)
-
-            // 3) Load/compile model if needed
             let tLoad0 = Date()
-            try await KokoroModel.loadModel()
+            try await manager.initialize()
             let tLoad1 = Date()
 
-            // 4) Synthesize (includes chunking + inference + stitching + WAV pack)
             let tSynth0 = Date()
-            let detailed = try await KokoroModel.synthesizeDetailed(text: text, voice: voice)
+            let requestedVoice = voice.trimmingCharacters(in: .whitespacesAndNewlines)
+            let usedVoice = requestedVoice.isEmpty ? "af_heart" : requestedVoice
+            let detailed = try await manager.synthesizeDetailed(
+                text: text,
+                voice: requestedVoice.isEmpty ? nil : requestedVoice
+            )
             let wav = detailed.audio
             let tSynth1 = Date()
 
@@ -159,7 +158,7 @@ public struct TTS {
                     let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
                         var entry: [String: Any] = [
                             "index": chunk.index,
-                            "text": chunk.text,
+                    "text": chunk.text,
                             "pause_after_ms": chunk.pauseAfterMs,
                             "tokens": chunk.tokenCount,
                         ]
@@ -188,7 +187,7 @@ public struct TTS {
 
                 let dict: [String: Any] = [
                     "text": text,
-                    "voice": voice,
+                    "voice": usedVoice,
                     "output": outURL.path,
                     "metrics": metricsDict,
                 ]

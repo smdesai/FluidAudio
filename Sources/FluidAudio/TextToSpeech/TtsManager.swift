@@ -1,5 +1,3 @@
-import AVFoundation
-import CoreML
 import Foundation
 import OSLog
 
@@ -8,29 +6,33 @@ public final class TtSManager {
 
     private let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "TtSManager")
 
-    private var kokoroModel: MLModel?
     private var ttsModels: TtsModels?
+    private var isInitialized = false
 
-    private lazy var predictionOptions: MLPredictionOptions = {
-        TtsModels.optimizedPredictionOptions()
-    }()
+    private let availableVoices = [
+        "af_heart",
+        "am_adam",
+        "af_alloy",
+    ]
 
     public init() {}
 
     public var isAvailable: Bool {
-        kokoroModel != nil
+        isInitialized
     }
 
     public func initialize(models: TtsModels) async throws {
         logger.info("Initializing TtSManager with provided models")
 
         self.ttsModels = models
-        guard let defaultModel = models.model(for: ModelNames.TTS.defaultVariant) else {
-            throw TTSError.modelNotFound(ModelNames.TTS.defaultBundle)
-        }
-        self.kokoroModel = defaultModel
 
-        logger.info("TtSManager initialized successfully")
+        KokoroModel.registerPreloadedModels(models)
+        try await KokoroModel.ensureRequiredFiles()
+        try KokoroModel.loadSimplePhonemeDictionary()
+        try await KokoroModel.loadModel()
+        isInitialized = true
+
+        logger.info("TtSManager initialized successfully with preloaded models")
     }
 
     public func initialize() async throws {
@@ -45,31 +47,15 @@ public final class TtSManager {
         voiceSpeed: Float = 1.0,
         speakerId: Int = 0
     ) async throws -> Data {
-        guard let model = kokoroModel else {
-            throw TTSError.modelNotFound("Kokoro model not initialized")
-        }
-
-        logger.info("Synthesizing text: \"\(text)\" with speed: \(voiceSpeed)")
-
-        let phonemeIds = try tokenizeText(text)
-        let input = try createModelInput(
-            phonemeIds: phonemeIds,
+        let detailed = try await synthesizeDetailed(
+            text: text,
+            voice: nil,
             voiceSpeed: voiceSpeed,
             speakerId: speakerId
         )
 
-        let output = try await Task {
-            try model.prediction(from: input, options: predictionOptions)
-        }.value
-
-        guard let audioArray = output.featureValue(for: "audio")?.multiArrayValue else {
-            throw TTSError.processingFailed("Failed to get audio output from model")
-        }
-
-        let audioData = try processAudioOutput(audioArray)
-
-        logger.info("Successfully synthesized \(audioData.count) bytes of audio")
-        return audioData
+        logger.info("Successfully synthesized \(detailed.audio.count) bytes of audio")
+        return detailed.audio
     }
 
     public func synthesizeToFile(
@@ -78,6 +64,10 @@ public final class TtSManager {
         voiceSpeed: Float = 1.0,
         speakerId: Int = 0
     ) async throws {
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.removeItem(at: outputURL)
+        }
+
         let audioData = try await synthesize(
             text: text,
             voiceSpeed: voiceSpeed,
@@ -88,142 +78,107 @@ public final class TtSManager {
         logger.info("Saved synthesized audio to: \(outputURL.path)")
     }
 
-    private func tokenizeText(_ text: String) throws -> [Int32] {
+    public func synthesizeDetailed(
+        text: String,
+        voice: String? = nil,
+        voiceSpeed: Float = 1.0,
+        speakerId: Int = 0
+    ) async throws -> KokoroModel.SynthesisResult {
+        guard isInitialized else {
+            throw TTSError.modelNotFound("Kokoro model not initialized")
+        }
+
+        logger.info("Synthesizing detailed output for text: \"\(text)\"")
+
+        let cleanedText = try sanitizeInput(text)
+        let selectedVoice = resolveVoice(voice, speakerId: speakerId)
+
+        try await KokoroModel.ensureRequiredFiles()
+        try await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: selectedVoice)
+
+        let synthesis = try await KokoroModel.synthesizeDetailed(text: cleanedText, voice: selectedVoice)
+        let factor = max(0.1, voiceSpeed)
+
+        if abs(factor - 1.0) < 0.01 {
+            logger.info("Generated audio bytes: \(synthesis.audio.count)")
+            return synthesis
+        }
+
+        let adjustedChunks = synthesis.chunks.map { chunk -> KokoroModel.ChunkInfo in
+            let stretched = adjustSamples(chunk.samples, factor: factor)
+            return KokoroModel.ChunkInfo(
+                index: chunk.index,
+                text: chunk.text,
+                wordCount: chunk.wordCount,
+                words: chunk.words,
+                atoms: chunk.atoms,
+                pauseAfterMs: chunk.pauseAfterMs,
+                tokenCount: chunk.tokenCount,
+                samples: stretched,
+                variant: chunk.variant
+            )
+        }
+
+        let combinedSamples = adjustedChunks.flatMap { $0.samples }
+        let audioData = try AudioWAV.data(from: combinedSamples, sampleRate: 24_000)
+
+        logger.info("Generated audio bytes: \(audioData.count) (speed factor=\(factor))")
+        return KokoroModel.SynthesisResult(audio: audioData, chunks: adjustedChunks)
+    }
+
+    private func sanitizeInput(_ text: String) throws -> String {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !cleanText.isEmpty else {
             throw TTSError.processingFailed("Input text is empty")
         }
 
-        let basicTokens = cleanText.unicodeScalars.map { scalar in
-            Int32(scalar.value)
-        }
-
-        return basicTokens
+        return cleanText
     }
 
-    private func createModelInput(
-        phonemeIds: [Int32],
-        voiceSpeed: Float,
-        speakerId: Int
-    ) throws -> MLFeatureProvider {
-        let phonemeShape = [1, phonemeIds.count] as [NSNumber]
-        guard let phonemeArray = try? MLMultiArray(shape: phonemeShape, dataType: .int32) else {
-            throw TTSError.processingFailed("Failed to create phoneme array")
+    private func resolveVoice(_ requested: String?, speakerId: Int) -> String {
+        guard let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
+            return voiceName(for: speakerId)
         }
-
-        for (index, id) in phonemeIds.enumerated() {
-            phonemeArray[index] = NSNumber(value: id)
-        }
-
-        let speedShape = [1] as [NSNumber]
-        guard let speedArray = try? MLMultiArray(shape: speedShape, dataType: .float32) else {
-            throw TTSError.processingFailed("Failed to create speed array")
-        }
-        speedArray[0] = NSNumber(value: voiceSpeed)
-
-        let speakerShape = [1] as [NSNumber]
-        guard let speakerArray = try? MLMultiArray(shape: speakerShape, dataType: .int32) else {
-            throw TTSError.processingFailed("Failed to create speaker array")
-        }
-        speakerArray[0] = NSNumber(value: speakerId)
-
-        var features: [String: MLFeatureValue] = [:]
-        features["text"] = MLFeatureValue(multiArray: phonemeArray)
-        features["speed"] = MLFeatureValue(multiArray: speedArray)
-        features["speaker_id"] = MLFeatureValue(multiArray: speakerArray)
-
-        return try MLDictionaryFeatureProvider(dictionary: features)
-    }
-
-    private func processAudioOutput(_ audioArray: MLMultiArray) throws -> Data {
-        let sampleRate: Double = 24000
-        let numSamples: Int =
-            (audioArray.shape.count > 1 ? audioArray.shape.last?.intValue : audioArray.count) ?? audioArray.count
-
-        guard numSamples > 0 else {
-            throw TTSError.processingFailed("No audio samples generated")
-        }
-
-        guard
-            let audioFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: sampleRate,
-                channels: 1,
-                interleaved: false
-            )
-        else {
-            throw TTSError.processingFailed("Failed to create source audio format")
-        }
-
-        guard
-            let buffer = AVAudioPCMBuffer(
-                pcmFormat: audioFormat,
-                frameCapacity: AVAudioFrameCount(numSamples)
-            )
-        else {
-            throw TTSError.processingFailed("Failed to create audio buffer")
-        }
-
-        buffer.frameLength = AVAudioFrameCount(numSamples)
-
-        guard let channelBase = buffer.floatChannelData else {
-            throw TTSError.processingFailed("Missing floatChannelData in source buffer")
-        }
-        let channelData = channelBase[0]
-        let dataPointer = audioArray.dataPointer.bindMemory(
-            to: Float.self,
-            capacity: numSamples
-        )
-
-        for i in 0..<numSamples {
-            channelData[i] = dataPointer[i]
-        }
-
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: false,
-        ]
-
-        guard let format = AVAudioFormat(settings: settings) else {
-            throw TTSError.processingFailed("Failed to create audio format")
-        }
-
-        guard let converter = AVAudioConverter(from: audioFormat, to: format) else {
-            throw TTSError.processingFailed("Failed to create AVAudioConverter")
-        }
-
-        guard
-            let outputBuffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                frameCapacity: buffer.frameLength
-            )
-        else {
-            throw TTSError.processingFailed("Failed to create output buffer")
-        }
-
-        do {
-            try converter.convert(to: outputBuffer, from: buffer)
-        } catch {
-            throw TTSError.processingFailed("Audio conversion failed: \(error.localizedDescription)")
-        }
-
-        guard let outBase = outputBuffer.floatChannelData else {
-            throw TTSError.processingFailed("Missing floatChannelData in output buffer")
-        }
-        let outPtr = outBase[0]
-        let byteCount = Int(outputBuffer.frameLength) * MemoryLayout<Float>.size
-        return Data(bytes: outPtr, count: byteCount)
+        return requested
     }
 
     public func cleanup() {
-        kokoroModel = nil
         ttsModels = nil
+        isInitialized = false
         logger.info("TtSManager cleaned up")
+    }
+
+    private func voiceName(for speakerId: Int) -> String {
+        guard !availableVoices.isEmpty else { return "af_heart" }
+        let index = abs(speakerId) % availableVoices.count
+        return availableVoices[index]
+    }
+
+    private func adjustSamples(_ samples: [Float], factor: Float) -> [Float] {
+        let clamped = max(0.1, factor)
+        if abs(clamped - 1.0) < 0.01 { return samples }
+
+        if clamped < 1.0 {
+            let repeatCount = max(1, Int(round(1.0 / clamped)))
+            var stretched: [Float] = []
+            stretched.reserveCapacity(samples.count * repeatCount)
+            for sample in samples {
+                for _ in 0..<repeatCount {
+                    stretched.append(sample)
+                }
+            }
+            return stretched
+        } else {
+            let skip = max(1, Int(round(clamped)))
+            var reduced: [Float] = []
+            reduced.reserveCapacity(samples.count / skip)
+            var index = 0
+            while index < samples.count {
+                reduced.append(samples[index])
+                index += skip
+            }
+            return reduced.isEmpty ? samples : reduced
+        }
     }
 }

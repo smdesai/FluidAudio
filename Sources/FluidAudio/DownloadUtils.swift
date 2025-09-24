@@ -578,7 +578,8 @@ extension DownloadUtils {
             logger.info("Downloaded espeak-ng-data.zip")
         }
 
-        // Extract the zip
+#if os(macOS)
+        // Extract the zip using the system unzip utility (available on macOS toolchains)
         let resourcesDir = repoPath.appendingPathComponent("Resources")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
@@ -591,6 +592,10 @@ extension DownloadUtils {
         if process.terminationStatus == 0 {
             logger.info("Extracted espeak-ng-data successfully")
         }
+#else
+        // On iOS/tvOS/watchOS we expect the bundle to be pre-packaged. If it is missing, surface an error.
+        logger.warning("Skipping espeak-ng.zip extraction on this platform; expecting pre-extracted Resources bundle")
+#endif
 
         // Validate after extraction
         guard FileManager.default.fileExists(atPath: voices.path) else {

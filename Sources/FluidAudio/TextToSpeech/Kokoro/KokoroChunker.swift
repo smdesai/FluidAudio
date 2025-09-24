@@ -33,7 +33,8 @@ enum KokoroChunker {
         wordToPhonemes: [String: [String]],
         caseSensitiveLexicon: [String: [String]],
         targetTokens: Int,
-        hasLanguageToken: Bool
+        hasLanguageToken: Bool,
+        allowedPhonemeOverride: Set<String>? = nil
     ) -> [TextChunk] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -50,7 +51,7 @@ enum KokoroChunker {
         }
 
         let capacity = computeCapacity(targetTokens: targetTokens, hasLanguageToken: hasLanguageToken)
-        let allowedPhonemes = Set(KokoroVocabulary.getVocabulary().keys)
+        let allowedPhonemes = allowedPhonemeOverride ?? Set(KokoroVocabulary.getVocabulary().keys)
 
         for (index, segment) in segmentsByPeriods.enumerated() {
             logger.info("segmentsByPeriods[\(index)]: \(segment)")
