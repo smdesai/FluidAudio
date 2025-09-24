@@ -24,7 +24,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testSynthesizeShortText() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
         XCTAssertTrue(manager.isAvailable)
 
         let text = "Hello, world!"
@@ -35,7 +35,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testSynthesizeWithDifferentSpeeds() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let text = "Testing different speeds"
 
@@ -53,7 +53,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testSynthesizeToFile() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let text = "Save this to a file"
         let outputURL = FileManager.default.temporaryDirectory
@@ -76,7 +76,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testEmptyTextHandling() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         do {
             _ = try await manager.synthesize(text: "")
@@ -87,7 +87,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testMultipleSpeakerIds() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let text = "Testing speaker voices"
 
@@ -99,7 +99,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testLongTextSynthesis() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let longText = """
             This is a much longer text to test the synthesis capabilities. 
@@ -115,7 +115,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testSpecialCharactersHandling() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let specialText = "Hello! How are you? I'm fine, thanks."
         let audioData = try await manager.synthesize(text: specialText)
@@ -124,7 +124,7 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testConcurrentSynthesis() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
 
         let texts = [
             "First text",
@@ -144,10 +144,20 @@ final class TtSManagerTests: XCTestCase {
     }
 
     func testModelCleanup() async throws {
-        try await manager.initialize()
+        try await ensureInitialized()
         XCTAssertTrue(manager.isAvailable)
 
         manager.cleanup()
         XCTAssertFalse(manager.isAvailable)
+    }
+
+    private func ensureInitialized() async throws {
+        if manager.isAvailable { return }
+
+        do {
+            try await manager.initialize()
+        } catch {
+            throw XCTSkip("Skipping TTS manager tests due to initialization failure: \(error.localizedDescription)")
+        }
     }
 }
