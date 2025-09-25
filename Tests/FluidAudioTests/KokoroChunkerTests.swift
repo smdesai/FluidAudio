@@ -35,7 +35,7 @@ final class KokoroChunkerTests: XCTestCase {
             caseSensitiveLexicon: caseSensitiveLexicon,
             targetTokens: 120,
             hasLanguageToken: false,
-            allowedPhonemeOverride: allowed
+            allowedPhonemes: allowed
         )
 
         XCTAssertEqual(chunks.count, 1)
@@ -70,7 +70,7 @@ final class KokoroChunkerTests: XCTestCase {
             caseSensitiveLexicon: [:],
             targetTokens: 20,
             hasLanguageToken: false,
-            allowedPhonemeOverride: allowed
+            allowedPhonemes: allowed
         )
 
         XCTAssertGreaterThan(chunks.count, 1, "Expected run-on text to be split under tight token budget")

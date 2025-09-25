@@ -62,15 +62,105 @@ public struct KokoroModel {
         }
     }
 
+    private struct ChunkInfoTemplate {
+        let index: Int
+        let text: String
+        let wordCount: Int
+        let words: [String]
+        let atoms: [String]
+        let pauseAfterMs: Int
+        let tokenCount: Int
+        let variant: ModelNames.TTS.Variant
+        let targetTokens: Int
+    }
+
+    private struct ChunkEntry {
+        let chunk: TextChunk
+        let inputIds: [Int32]
+        let template: ChunkInfoTemplate
+    }
+
     // Cached CoreML models per Kokoro variant
     // Legacy: Phoneme dictionary with frame counts (kept for backward compatibility)
-    private static var phonemeDictionary: [String: (frameCount: Float, phonemes: [String])] = [:]
-    private static var isDictionaryLoaded = false
+    private actor LexiconCache {
+        private var wordToPhonemes: [String: [String]] = [:]
+        private var caseSensitiveWordToPhonemes: [String: [String]] = [:]
+        private var isLoaded = false
 
-    // Preferred: Simple word -> phonemes mapping from US lexicon JSON files
-    private static var wordToPhonemes: [String: [String]] = [:]
-    private static var caseSensitiveWordToPhonemes: [String: [String]] = [:]
-    private static var isSimpleDictLoaded = false
+        func ensureLoaded(kokoroDirectory: URL, allowedTokens: Set<String>) async throws {
+            if isLoaded && !caseSensitiveWordToPhonemes.isEmpty { return }
+
+            func filteredTokens(_ tokens: [String]) -> [String] {
+                tokens.filter { allowedTokens.contains($0) }
+            }
+
+            let lexiconFiles = ["us_gold.json", "us_silver.json"]
+            var mapping: [String: [String]] = [:]
+            var caseSensitive: [String: [String]] = [:]
+            var totalAdded = 0
+
+            for filename in lexiconFiles {
+                let lexiconURL = kokoroDirectory.appendingPathComponent(filename)
+                guard FileManager.default.fileExists(atPath: lexiconURL.path) else { continue }
+
+                do {
+                    let rawLexicon = try Data(contentsOf: lexiconURL)
+                    guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
+                        KokoroModel.logger.warning("Skipping \(filename) (unexpected format)")
+                        continue
+                    }
+
+                    var addedHere = 0
+                    for (key, value) in entries {
+                        let normalizedKey = key.lowercased()
+                        let tokens: [String]
+                        if let stringValue = value as? String {
+                            tokens = filteredTokens(KokoroModel.tokenizeIPAString(stringValue))
+                        } else if let arrayValue = value as? [String] {
+                            tokens = filteredTokens(arrayValue)
+                        } else {
+                            continue
+                        }
+
+                        guard !tokens.isEmpty else { continue }
+
+                        if caseSensitive[key] == nil {
+                            caseSensitive[key] = tokens
+                        }
+
+                        if mapping[normalizedKey] == nil {
+                            mapping[normalizedKey] = tokens
+                            addedHere += 1
+                        }
+                    }
+
+                    if addedHere > 0 {
+                        totalAdded += addedHere
+                        KokoroModel.logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
+                    }
+                } catch {
+                    KokoroModel.logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
+                }
+            }
+
+            guard !mapping.isEmpty else {
+                throw TTSError.processingFailed("No US English lexicon entries found (missing us_gold.json/us_silver.json)")
+            }
+
+            wordToPhonemes = mapping
+            caseSensitiveWordToPhonemes = caseSensitive
+            isLoaded = true
+            KokoroModel.logger.info(
+                "Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))"
+            )
+        }
+
+        func lexicons() -> (word: [String: [String]], caseSensitive: [String: [String]]) {
+            (wordToPhonemes, caseSensitiveWordToPhonemes)
+        }
+    }
+
+    private static let lexiconCache = LexiconCache()
 
     // Model and data URLs
     private static func variantDescription(_ variant: ModelNames.TTS.Variant) -> String {
@@ -116,77 +206,12 @@ public struct KokoroModel {
 
     /// Load simple word->phonemes dictionary (preferred)
     /// Uses the richer US English lexicons (gold/silver) as the primary source.
-    public static func loadSimplePhonemeDictionary() throws {
-        if isSimpleDictLoaded && !caseSensitiveWordToPhonemes.isEmpty {
-            return
-        }
-
+    public static func loadSimplePhonemeDictionary() async throws {
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
-        let vocabulary = KokoroVocabulary.getVocabulary()
+        let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
         let allowed = Set(vocabulary.keys)
-
-        func filteredTokens(_ tokens: [String]) -> [String] {
-            tokens.filter { allowed.contains($0) }
-        }
-
-        let lexiconFiles = ["us_gold.json", "us_silver.json"]
-        var mapping: [String: [String]] = [:]
-        var caseSensitive: [String: [String]] = [:]
-        var totalAdded = 0
-
-        for filename in lexiconFiles {
-            let lexiconURL = kokoroDir.appendingPathComponent(filename)
-            guard FileManager.default.fileExists(atPath: lexiconURL.path) else { continue }
-
-            do {
-                let rawLexicon = try Data(contentsOf: lexiconURL)
-                guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
-                    Self.logger.warning("Skipping \(filename) (unexpected format)")
-                    continue
-                }
-
-                var addedHere = 0
-                for (key, value) in entries {
-                    let normalizedKey = key.lowercased()
-                    let tokens: [String]
-                    if let stringValue = value as? String {
-                        tokens = filteredTokens(tokenizeIPAString(stringValue))
-                    } else if let arrayValue = value as? [String] {
-                        tokens = filteredTokens(arrayValue)
-                    } else {
-                        continue
-                    }
-
-                    guard !tokens.isEmpty else { continue }
-
-                    if caseSensitive[key] == nil {
-                        caseSensitive[key] = tokens
-                    }
-
-                    if mapping[normalizedKey] == nil {
-                        mapping[normalizedKey] = tokens
-                        addedHere += 1
-                    }
-                }
-
-                if addedHere > 0 {
-                    totalAdded += addedHere
-                    logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
-                }
-            } catch {
-                logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
-            }
-        }
-
-        guard !mapping.isEmpty else {
-            throw TTSError.processingFailed("No US English lexicon entries found (missing us_gold.json/us_silver.json)")
-        }
-
-        wordToPhonemes = mapping
-        caseSensitiveWordToPhonemes = caseSensitive
-        isSimpleDictLoaded = true
-        logger.info("Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))")
+        try await lexiconCache.ensureLoaded(kokoroDirectory: kokoroDir, allowedTokens: allowed)
     }
 
     /// Tokenize an IPA string into model tokens.
@@ -203,26 +228,118 @@ public struct KokoroModel {
         return s.unicodeScalars.map { String($0) }
     }
 
+    private static func validateTextHasDictionaryCoverage(_ text: String) async throws {
+        let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
+        func normalize(_ s: String) -> String {
+            let lowered = s.lowercased()
+                .replacingOccurrences(of: "\u{2019}", with: "'")
+                .replacingOccurrences(of: "\u{2018}", with: "'")
+            return String(lowered.unicodeScalars.filter { allowedSet.contains($0) })
+        }
+
+        let tokens =
+            text
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .map { String($0) }
+
+        let lexicons = await lexiconCache.lexicons()
+        let mapping = lexicons.word
+
+        var oov: [String] = []
+        oov.reserveCapacity(8)
+        for raw in tokens {
+            let key = normalize(raw)
+            if key.isEmpty { continue }
+            if mapping[key] == nil {
+                oov.append(key)
+                if oov.count >= 8 { break }
+            }
+        }
+
+        #if canImport(ESpeakNG)
+        if !oov.isEmpty && EspeakG2P.isDataAvailable() == false {
+            let sample = Set(oov).sorted().prefix(5).joined(separator: ", ")
+            throw TTSError.processingFailed(
+                "G2P (eSpeak NG) data missing but required for OOV words: \(sample). Ensure the eSpeak NG data bundle is available in the models cache (use DownloadUtils.ensureEspeakDataBundle)."
+            )
+        }
+        #else
+        if !oov.isEmpty {
+            let sample = Set(oov).sorted().prefix(5).joined(separator: ", ")
+            throw TTSError.processingFailed(
+                "G2P (eSpeak NG) not included in this build but required for OOV words: \(sample)."
+            )
+        }
+        #endif
+    }
+
     /// Structure to hold a chunk of text that fits within 3.17 seconds
     // TextChunk is defined in KokoroChunker.swift
 
     /// Chunk text into segments under the model token budget, using punctuation-driven pauses.
-    private static func chunkText(_ text: String) async throws -> [TextChunk] {
-        try loadSimplePhonemeDictionary()
+    private static func chunkText(
+        _ text: String,
+        vocabulary: [String: Int32]
+    ) async throws -> [TextChunk] {
+        try await loadSimplePhonemeDictionary()
         let target = try await tokenLength(for: .fifteenSecond)
         let hasLang = false
+        let lexicons = await lexiconCache.lexicons()
         return KokoroChunker.chunk(
             text: text,
-            wordToPhonemes: wordToPhonemes,
-            caseSensitiveLexicon: caseSensitiveWordToPhonemes,
+            wordToPhonemes: lexicons.word,
+            caseSensitiveLexicon: lexicons.caseSensitive,
             targetTokens: target,
-            hasLanguageToken: hasLang
+            hasLanguageToken: hasLang,
+            allowedPhonemes: Set(vocabulary.keys)
         )
     }
 
+    private static func buildChunkEntries(
+        from chunks: [TextChunk],
+        vocabulary: [String: Int32]
+    ) async throws -> [ChunkEntry] {
+        var entries: [ChunkEntry] = []
+        entries.reserveCapacity(chunks.count)
+
+        for (index, chunk) in chunks.enumerated() {
+            let inputIds = phonemesToInputIds(chunk.phonemes, vocabulary: vocabulary)
+            guard !inputIds.isEmpty else {
+                let joinedWords = chunk.words.joined(separator: " ")
+                throw TTSError.processingFailed(
+                    "No input IDs generated for chunk: \(joinedWords)")
+            }
+            let variant = try await selectVariant(forTokenCount: inputIds.count)
+            let targetTokens = try await tokenLength(for: variant)
+            let template = ChunkInfoTemplate(
+                index: index,
+                text: chunk.text,
+                wordCount: chunk.words.count,
+                words: chunk.words,
+                atoms: chunk.atoms,
+                pauseAfterMs: chunk.pauseAfterMs,
+                tokenCount: min(inputIds.count, targetTokens),
+                variant: variant,
+                targetTokens: targetTokens
+            )
+            entries.append(ChunkEntry(chunk: chunk, inputIds: inputIds, template: template))
+        }
+
+        if entries.count == 1 {
+            Self.logger.info("Text fits in single chunk")
+        } else {
+            Self.logger.info("Text split into \(entries.count) chunks")
+        }
+
+        return entries
+    }
+
     /// Convert phonemes to input IDs
-    public static func phonemesToInputIds(_ phonemes: [String]) -> [Int32] {
-        let vocabulary = KokoroVocabulary.getVocabulary()
+    public static func phonemesToInputIds(
+        _ phonemes: [String],
+        vocabulary: [String: Int32]
+    ) -> [Int32] {
         var ids: [Int32] = [0]  // BOS/EOS token per Python harness
         for phoneme in phonemes {
             if let id = vocabulary[phoneme] {
@@ -249,6 +366,11 @@ public struct KokoroModel {
         #endif
 
         return ids
+    }
+
+    public static func phonemesToInputIds(_ phonemes: [String]) async throws -> [Int32] {
+        let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
+        return phonemesToInputIds(phonemes, vocabulary: vocabulary)
     }
 
     /// Inspect model to determine the expected token length for input_ids
@@ -278,40 +400,40 @@ public struct KokoroModel {
 
     /// Load voice embedding (simplified for 3-second model)
     public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) async throws -> MLMultiArray {
-        let voice = "af_heart"
-        // Try to load from cache: ~/.cache/fluidaudio/Models/kokoro/voices/<voice>.json
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let voicesDir = cacheDir.appendingPathComponent("Models/kokoro/voices")
         try FileManager.default.createDirectory(at: voicesDir, withIntermediateDirectories: true)
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 
-        // Try multiple candidates (prefer local repo files first)
-        let candidates: [URL] = [
-            cwd.appendingPathComponent("voices/\(voice).json"),
-            cwd.appendingPathComponent("\(voice).json"),
-            voicesDir.appendingPathComponent("\(voice).json"),
-        ]
-        let voiceJSON = candidates.first { FileManager.default.fileExists(atPath: $0.path) } ?? candidates[0]
+        func resolveVector(for voiceID: String) -> ([Float]?, URL) {
+            let candidates: [URL] = [
+                cwd.appendingPathComponent("voices/\(voiceID).json"),
+                cwd.appendingPathComponent("\(voiceID).json"),
+                voicesDir.appendingPathComponent("\(voiceID).json"),
+            ]
+            guard let source = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+                return (nil, candidates[0])
+            }
 
-        var vector: [Float]?
-        if FileManager.default.fileExists(atPath: voiceJSON.path) {
+            var vector: [Float]? = nil
             do {
-                let data = try Data(contentsOf: voiceJSON)
+                let data = try Data(contentsOf: source)
                 let json = try JSONSerialization.jsonObject(with: data)
+
                 func parseArray(_ any: Any) -> [Float]? {
-                    if let ds = any as? [Double] { return ds.map { Float($0) } }
-                    if let fs = any as? [Float] { return fs }
-                    if let ns = any as? [NSNumber] { return ns.map { $0.floatValue } }
-                    if let arr = any as? [Any] {
+                    if let doubles = any as? [Double] { return doubles.map(Float.init) }
+                    if let floats = any as? [Float] { return floats }
+                    if let numbers = any as? [NSNumber] { return numbers.map { $0.floatValue } }
+                    if let anyArray = any as? [Any] {
                         var out: [Float] = []
-                        out.reserveCapacity(arr.count)
-                        for v in arr {
-                            if let n = v as? NSNumber {
-                                out.append(n.floatValue)
-                            } else if let d = v as? Double {
-                                out.append(Float(d))
-                            } else if let f = v as? Float {
-                                out.append(f)
+                        out.reserveCapacity(anyArray.count)
+                        for value in anyArray {
+                            if let num = value as? NSNumber {
+                                out.append(num.floatValue)
+                            } else if let dbl = value as? Double {
+                                out.append(Float(dbl))
+                            } else if let flt = value as? Float {
+                                out.append(flt)
                             } else {
                                 return nil
                             }
@@ -321,47 +443,67 @@ public struct KokoroModel {
                     return nil
                 }
 
-                if let arr = parseArray(json) {
-                    vector = arr
+                if let direct = parseArray(json) {
+                    vector = direct
                 } else if let dict = json as? [String: Any] {
-                    if let embed = dict["embedding"], let arr = parseArray(embed) {
-                        vector = arr
-                    } else if let byVoice = dict[voice], let arr = parseArray(byVoice) {
-                        vector = arr
+                    if let embed = dict["embedding"], let parsed = parseArray(embed) {
+                        vector = parsed
+                    } else if let voiceSpecific = dict[voiceID], let parsed = parseArray(voiceSpecific) {
+                        vector = parsed
                     } else {
-                        let keys = dict.keys.compactMap { Int($0) }.sorted()
+                        let numericKeys = dict.keys.compactMap { Int($0) }.sorted()
                         var chosen: [Float]? = nil
                         if let exact = dict["\(phonemeCount)"] {
                             chosen = parseArray(exact)
-                        } else if let k = keys.last(where: { $0 <= phonemeCount }), let cand = dict["\(k)"] {
-                            chosen = parseArray(cand)
+                        } else if let key = numericKeys.last(where: { $0 <= phonemeCount }), let fallback = dict["\(key)"] {
+                            chosen = parseArray(fallback)
                         }
-                        if let c = chosen {
-                            vector = c
-                        } else if let any = dict.values.first {
-                            vector = parseArray(any)
+                        if let parsed = chosen {
+                            vector = parsed
+                        } else if let anyValue = dict.values.first {
+                            vector = parseArray(anyValue)
                         }
                     }
                 }
             } catch {
-                // Ignore parse errors; will fall back
+                Self.logger.warning("Failed to parse voice embedding for \(voiceID): \(error.localizedDescription)")
             }
+
+            return (vector, source)
         }
 
-        // Require a valid voice embedding; fail if missing or invalid
+        var voiceUsed = voice
+        var attempted = [voice]
+        var (vector, sourceURL) = resolveVector(for: voice)
+
+        if vector == nil && voice != "af_heart" {
+            Self.logger.warning("Voice embedding for \(voice) not found; falling back to af_heart")
+            voiceUsed = "af_heart"
+            attempted.append("af_heart")
+            (vector, sourceURL) = resolveVector(for: voiceUsed)
+        }
+
+        guard let vec = vector else {
+            throw TTSError.modelNotFound(
+                "Voice embedding unavailable for \(attempted.joined(separator: ", ")); checked \(sourceURL.path)")
+        }
+
         let dim = try await KokoroModelLoader.shared.referenceEmbeddingDimension()
-        guard let vec = vector, vec.count == dim else {
-            throw TTSError.modelNotFound("Voice embedding for \(voice) not found or invalid at \(voiceJSON.path)")
+        guard vec.count == dim else {
+            throw TTSError.modelNotFound(
+                "Voice embedding for \(voiceUsed) has unexpected length (expected \(dim), got \(vec.count))")
         }
+
         let embedding = try MLMultiArray(shape: [1, NSNumber(value: dim)] as [NSNumber], dataType: .float32)
-        var varsum: Float = 0
+        var sumSquares: Float = 0
         for i in 0..<dim {
-            let v = vec[i]
-            embedding[i] = NSNumber(value: v)
-            varsum += v * v
+            let value = vec[i]
+            embedding[i] = NSNumber(value: value)
+            sumSquares += value * value
         }
-        logger.info(
-            "Loaded voice embedding: \(voice), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(varsum))))")
+
+        Self.logger.info(
+            "Loaded voice embedding: \(voiceUsed), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(sumSquares))))")
         return embedding
     }
 
@@ -437,7 +579,7 @@ public struct KokoroModel {
 
         // Time ONLY the model prediction
         let predictionStart = Date()
-        let output = try await kokoro.prediction(from: modelInput)
+        let output = try await kokoro.compatPrediction(from: modelInput, options: MLPredictionOptions())
         let predictionTime = Date().timeIntervalSince(predictionStart)
         print(
             "[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"
@@ -517,101 +659,21 @@ public struct KokoroModel {
 
         try await loadModel()
 
-        try loadSimplePhonemeDictionary()
+        try await loadSimplePhonemeDictionary()
 
-        // If there are OOV words without lexicon coverage, fail fast so the caller can supply entries.
-        do {
-            let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
-            func normalize(_ s: String) -> String {
-                let lowered = s.lowercased()
-                    .replacingOccurrences(of: "\u{2019}", with: "'")
-                    .replacingOccurrences(of: "\u{2018}", with: "'")
-                return String(lowered.unicodeScalars.filter { allowedSet.contains($0) })
-            }
 
-            let tokens =
-                text
-                .lowercased()
-                .split(whereSeparator: { $0.isWhitespace })
-                .map { String($0) }
-            var oov: [String] = []
-            oov.reserveCapacity(8)
-            for raw in tokens {
-                let key = normalize(raw)
-                if key.isEmpty { continue }
-                if wordToPhonemes[key] == nil {
-                    oov.append(key)
-                    if oov.count >= 8 { break }
-                }
-            }
-            #if canImport(ESpeakNG)
-            if !oov.isEmpty && EspeakG2P.isDataAvailable() == false {
-                throw TTSError.processingFailed(
-                    "G2P (eSpeak NG) data missing but required for OOV words: \(Set(oov).sorted().prefix(5).joined(separator: ", ")). Ensure the eSpeak NG data bundle is available in the models cache (use DownloadUtils.ensureEspeakDataBundle)."
-                )
-            }
-            #else
-            if !oov.isEmpty {
-                throw TTSError.processingFailed(
-                    "G2P (eSpeak NG) not included in this build but required for OOV words: \(Set(oov).sorted().prefix(5).joined(separator: ", "))."
-                )
-            }
-            #endif
-        }
+        try await validateTextHasDictionaryCoverage(text)
 
-        let chunks = try await chunkText(text)
+
+
+        let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
+
+        let chunks = try await chunkText(text, vocabulary: vocabulary)
         guard !chunks.isEmpty else {
             throw TTSError.processingFailed("No valid words found in text")
         }
 
-        struct ChunkInfoTemplate {
-            let index: Int
-            let text: String
-            let wordCount: Int
-            let words: [String]
-            let atoms: [String]
-            let pauseAfterMs: Int
-            let tokenCount: Int
-            let variant: ModelNames.TTS.Variant
-            let targetTokens: Int
-        }
-
-        struct ChunkEntry {
-            let chunk: TextChunk
-            let inputIds: [Int32]
-            let template: ChunkInfoTemplate
-        }
-
-        var entries: [ChunkEntry] = []
-        entries.reserveCapacity(chunks.count)
-
-        for (index, chunk) in chunks.enumerated() {
-            let inputIds = phonemesToInputIds(chunk.phonemes)
-            guard !inputIds.isEmpty else {
-                throw TTSError.processingFailed(
-                    "No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
-            }
-            let variant = try await selectVariant(forTokenCount: inputIds.count)
-            let targetTokens = try await tokenLength(for: variant)
-            let template = ChunkInfoTemplate(
-                index: index,
-                text: chunk.text,
-                wordCount: chunk.words.count,
-                words: chunk.words,
-                atoms: chunk.atoms,
-                pauseAfterMs: chunk.pauseAfterMs,
-                tokenCount: min(inputIds.count, targetTokens),
-                variant: variant,
-                targetTokens: targetTokens
-            )
-            entries.append(ChunkEntry(chunk: chunk, inputIds: inputIds, template: template))
-        }
-
-        if entries.count == 1 {
-            logger.info("Text fits in single chunk")
-        } else {
-            logger.info("Text split into \(entries.count) chunks")
-        }
+        let entries = try await buildChunkEntries(from: chunks, vocabulary: vocabulary)
 
         var allSamples: [Float] = []
         var chunkTemplates: [ChunkInfoTemplate] = []

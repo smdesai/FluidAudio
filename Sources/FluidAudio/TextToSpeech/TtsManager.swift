@@ -28,7 +28,7 @@ public final class TtSManager {
 
         await KokoroModelLoader.shared.registerPreloadedModels(models)
         try await KokoroModelLoader.shared.ensureRequiredFiles()
-        try KokoroModel.loadSimplePhonemeDictionary()
+        try await KokoroModel.loadSimplePhonemeDictionary()
         try await KokoroModelLoader.shared.loadModelsIfNeeded()
         isInitialized = true
 
