@@ -155,6 +155,15 @@ public struct TTS {
                 }
 
                 if !detailed.chunks.isEmpty {
+                    let frameSamples = 600
+                    var totalChunkSamples = 0
+                    detailed.chunks.enumerated().forEach { index, chunk in
+                        let chunkSeconds = Double(chunk.samples.count) / 24_000.0
+                        let frameCount = frameSamples > 0 ? chunk.samples.count / frameSamples : 0
+                        totalChunkSamples += chunk.samples.count
+                        print(
+                            String(format: "Chunk %d duration: %.3fs (%d frames)", index + 1, chunkSeconds, frameCount))
+                    }
                     let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
                         var entry: [String: Any] = [
                             "index": chunk.index,
@@ -167,11 +176,13 @@ public struct TTS {
                             entry["normalized_words"] = chunk.words
                         }
                         let chunkSeconds = Double(chunk.samples.count) / 24_000.0
+                        let frameCount = frameSamples > 0 ? chunk.samples.count / frameSamples : 0
                         entry["audio_duration_s"] = chunkSeconds
+                        entry["frame_count"] = frameCount
                         let variantLabel: String = {
                             switch chunk.variant {
                             case .fiveSecond:
-                                return "kokoro_24_5s"
+                                return "kokoro_24_5s_v2"
                             case .fifteenSecond:
                                 return "kokoro_24_15s"
                             }
@@ -183,6 +194,13 @@ public struct TTS {
                         return entry
                     }
                     metricsDict["chunks"] = chunkMetrics
+                    let totalFrames = frameSamples > 0 ? totalChunkSamples / frameSamples : 0
+                    print(String(format: "Total audio duration: %.3fs (%d frames)", audioSecs, totalFrames))
+                } else {
+                    print(
+                        String(
+                            format: "Total audio duration: %.3fs (%d frames)", audioSecs,
+                            Int((audioSecs * 24_000.0) / 600.0)))
                 }
 
                 let dict: [String: Any] = [

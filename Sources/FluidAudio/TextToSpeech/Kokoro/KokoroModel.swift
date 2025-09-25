@@ -11,6 +11,10 @@ import FoundationNetworking
 @available(macOS 13.0, iOS 16.0, *)
 public struct KokoroModel {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
+    private static let sampleRateHz = 24_000
+    private static let shortVariantGuardThresholdSeconds = 2.75
+    private static let shortVariantGuardFrameCount = 4
+    private static let kokoroFrameSamples = 600  // Kokoro vocoder output samples per frame
 
     /// Detailed synthesis output including audio data and per-chunk metadata.
     public struct SynthesisResult: Sendable {
@@ -583,6 +587,16 @@ public struct KokoroModel {
             }
         }
 
+        if variant == .fiveSecond {
+            let thresholdSamples = Int(shortVariantGuardThresholdSeconds * Double(sampleRateHz))
+            if effectiveCount < thresholdSamples {
+                let guardSamples = shortVariantGuardFrameCount * kokoroFrameSamples
+                if effectiveCount > guardSamples {
+                    effectiveCount -= guardSamples
+                }
+            }
+        }
+
         // Convert to float samples
         var samples: [Float] = []
         for i in 0..<effectiveCount {
@@ -739,6 +753,11 @@ public struct KokoroModel {
 
             chunkSampleBuffers.append(chunkSamples)
             chunkTemplates.append(entry.template)
+            let chunkDurationSeconds = Double(chunkSamples.count) / Double(sampleRateHz)
+            let chunkFrameCount = kokoroFrameSamples > 0 ? chunkSamples.count / kokoroFrameSamples : 0
+            logger.info(
+                "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkDurationSeconds))s (\(chunkFrameCount) frames)"
+            )
 
             if index == 0 {
                 allSamples.append(contentsOf: chunkSamples)
@@ -804,6 +823,9 @@ public struct KokoroModel {
         logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
         logger.info("Audio size: \(audioData.count) bytes")
         logger.info("Total samples: \(allSamples.count)")
+        let totalDurationSeconds = Double(allSamples.count) / Double(sampleRateHz)
+        let totalFrameCount = kokoroFrameSamples > 0 ? allSamples.count / kokoroFrameSamples : 0
+        logger.info("Total duration: \(String(format: "%.3f", totalDurationSeconds))s (\(totalFrameCount) frames)")
 
         return SynthesisResult(audio: audioData, chunks: chunkInfos)
     }
