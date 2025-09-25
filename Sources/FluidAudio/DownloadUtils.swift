@@ -102,6 +102,8 @@ public class DownloadUtils {
         directory: URL,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine
     ) async throws -> [String: MLModel] {
+        // Ensure host environment is logged for debugging (once per process)
+        await SystemInfo.logOnce(using: logger)
         do {
             // 1st attempt: normal load
             return try await loadModelsOnce(
@@ -109,8 +111,8 @@ public class DownloadUtils {
                 directory: directory, computeUnits: computeUnits)
         } catch {
             // 1st attempt failed → wipe cache to signal redownload
-            logger.warning("⚠️ First load failed: \(error.localizedDescription)")
-            logger.info("🔄 Deleting cache and re-downloading…")
+            logger.warning("First load failed: \(error.localizedDescription)")
+            logger.info("Deleting cache and re-downloading…")
             let repoPath = directory.appendingPathComponent(repo.folderName)
             try? FileManager.default.removeItem(at: repoPath)
 
@@ -134,6 +136,8 @@ public class DownloadUtils {
         directory: URL,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine
     ) async throws -> [String: MLModel] {
+        // Ensure host environment is logged for debugging (once per process)
+        await SystemInfo.logOnce(using: logger)
         // Ensure base directory exists
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
@@ -198,20 +202,16 @@ public class DownloadUtils {
 
                 models[name] = model
 
-                // Always log model load; additionally report timing for ASR (parakeet) models
-                logger.info("Loaded model: \(name)")
-                if repo == .parakeet {
-                    let ms = elapsed * 1000
-                    let formatted = String(format: "%.2f", ms)
-                    logger.info("Compiled ASR model \(name) in \(formatted) ms")
-                }
+                let ms = elapsed * 1000
+                let formatted = String(format: "%.2f", ms)
+                logger.info("Compiled model \(name) in \(formatted) ms :: \(SystemInfo.summary())")
             } catch {
                 logger.error("Failed to load model \(name): \(error)")
 
                 if let contents = try? FileManager.default.contentsOfDirectory(
                     atPath: modelPath.deletingLastPathComponent().path)
                 {
-                    logger.error("   Nearby contents: \(contents)")
+                    logger.error("Model directory contents: \(contents.map { $0.lastPathComponent })")
                 }
 
                 throw error
@@ -239,8 +239,7 @@ public class DownloadUtils {
 
     /// Download a HuggingFace repository
     private static func downloadRepo(_ repo: Repo, to directory: URL) async throws {
-        logger.info("📥 Downloading \(repo.folderName) from HuggingFace...")
-        print("📥 Downloading \(repo.folderName)...")
+        logger.info("Downloading \(repo.folderName) from HuggingFace...")
 
         let repoPath = directory.appendingPathComponent(repo.folderName)
         try FileManager.default.createDirectory(at: repoPath, withIntermediateDirectories: true)
@@ -323,7 +322,7 @@ public class DownloadUtils {
 
                 // Only log large files (>10MB) to reduce noise
                 if expectedSize > 10_000_000 {
-                    logger.info("📥 Downloading \(item.path) (\(formatBytes(expectedSize)))")
+                    logger.info("Downloading \(item.path) (\(formatBytes(expectedSize)))")
                 } else {
                     logger.debug("Downloading \(item.path) (\(formatBytes(expectedSize)))")
                 }
@@ -355,8 +354,7 @@ public class DownloadUtils {
             let percentage = Int(progress * 100)
             if percentage >= lastReportedPercentage + 10 {
                 lastReportedPercentage = percentage
-                logger.info("   Progress: \(percentage)% of \(fileName)")
-                print("   ⏳ \(percentage)% downloaded of \(fileName)")
+                logger.info("Progress: \(percentage)% of \(fileName)")
             }
         }
     }

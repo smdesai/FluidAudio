@@ -83,16 +83,21 @@ actor LogConsole {
     static let shared = LogConsole()
 
     private var enabled: Bool = {
-        // Allow environment variable to toggle without code changes
+        #if DEBUG
+        // Enable console output for debug builds by default
+        return true
+        #else
+        // Allow environment variable to toggle without code changes for non-debug builds
         if let env = ProcessInfo.processInfo.environment["FLUIDAUDIO_LOG_TO_CONSOLE"],
-            env == "1" || env.lowercased() == "true"
+           env == "1" || env.lowercased() == "true"
         {
             return true
         }
         return false
+        #endif
     }()
 
-    private var minimumLevel: AppLogger.Level = .debug
+    private var minimumLevel: AppLogger.Level = .info
     private let dateFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "HH:mm:ss.SSS"
