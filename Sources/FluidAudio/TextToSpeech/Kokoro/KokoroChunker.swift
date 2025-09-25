@@ -351,7 +351,7 @@ enum KokoroChunker {
             phonemes = lexicon[normalized]
         }
 
-        #if canImport(ESpeakNG) || canImport(CEspeakNG)
+        #if canImport(ESpeakNG)
         if phonemes == nil {
             if #available(macOS 13.0, iOS 16.0, *) {
                 if let ipa = EspeakG2P.shared.phonemize(word: normalized) {
@@ -374,7 +374,7 @@ enum KokoroChunker {
             for spelled in spelledTokens {
                 var segment = lexicon[spelled]
 
-                #if canImport(ESpeakNG) || canImport(CEspeakNG)
+                #if canImport(ESpeakNG)
                 if segment == nil {
                     if #available(macOS 13.0, iOS 16.0, *) {
                         if let ipa = EspeakG2P.shared.phonemize(word: spelled) {

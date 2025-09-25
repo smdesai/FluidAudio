@@ -26,10 +26,10 @@ public final class TtSManager {
 
         self.ttsModels = models
 
-        KokoroModel.registerPreloadedModels(models)
-        try await KokoroModel.ensureRequiredFiles()
+        await KokoroModelLoader.shared.registerPreloadedModels(models)
+        try await KokoroModelLoader.shared.ensureRequiredFiles()
         try KokoroModel.loadSimplePhonemeDictionary()
-        try await KokoroModel.loadModel()
+        try await KokoroModelLoader.shared.loadModelsIfNeeded()
         isInitialized = true
 
         logger.info("TtSManager initialized successfully with preloaded models")
@@ -93,7 +93,7 @@ public final class TtSManager {
         let cleanedText = try sanitizeInput(text)
         let selectedVoice = resolveVoice(voice, speakerId: speakerId)
 
-        try await KokoroModel.ensureRequiredFiles()
+        try await KokoroModelLoader.shared.ensureRequiredFiles()
         try await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: selectedVoice)
 
         let synthesis = try await KokoroModel.synthesizeDetailed(text: cleanedText, voice: selectedVoice)

@@ -63,10 +63,6 @@ public struct KokoroModel {
     }
 
     // Cached CoreML models per Kokoro variant
-    private static var kokoroModels: [ModelNames.TTS.Variant: MLModel] = [:]
-    private static var tokenLengthCache: [ModelNames.TTS.Variant: Int] = [:]
-    private static var downloadedModelBundle: TtsModels?
-
     // Legacy: Phoneme dictionary with frame counts (kept for backward compatibility)
     private static var phonemeDictionary: [String: (frameCount: Float, phonemes: [String])] = [:]
     private static var isDictionaryLoaded = false
@@ -77,8 +73,6 @@ public struct KokoroModel {
     private static var isSimpleDictLoaded = false
 
     // Model and data URLs
-    private static let baseURL = "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main"
-
     private static func variantDescription(_ variant: ModelNames.TTS.Variant) -> String {
         switch variant {
         case .fiveSecond:
@@ -88,14 +82,11 @@ public struct KokoroModel {
         }
     }
 
-    private static func model(for variant: ModelNames.TTS.Variant) throws -> MLModel {
-        guard let model = kokoroModels[variant] else {
-            throw TTSError.modelNotFound(ModelNames.TTS.bundle(for: variant))
-        }
-        return model
+    private static func model(for variant: ModelNames.TTS.Variant) async throws -> MLModel {
+        try await KokoroModelLoader.shared.model(for: variant)
     }
 
-    private static func inferTokenLength(from model: MLModel) -> Int {
+    internal static func inferTokenLength(from model: MLModel) -> Int {
         let inputs = model.modelDescription.inputDescriptionsByName
         if let inputDesc = inputs["input_ids"], let constraint = inputDesc.multiArrayConstraint {
             let shape = constraint.shape
@@ -107,114 +98,20 @@ public struct KokoroModel {
         return 124
     }
 
-    /// Download file from URL if needed (uses DownloadUtils for consistency)
-    private static func downloadFileIfNeeded(filename: String, urlPath: String) async throws {
-        let cacheDir = try TtsModels.cacheDirectoryURL()
-        let kokoroDir = cacheDir.appendingPathComponent("Models/kokoro")
-
-        // Create directory if needed
-        try FileManager.default.createDirectory(at: kokoroDir, withIntermediateDirectories: true)
-
-        let localURL = kokoroDir.appendingPathComponent(filename)
-
-        guard !FileManager.default.fileExists(atPath: localURL.path) else {
-            logger.info("File already exists: \(filename)")
-            return
-        }
-
-        logger.info("Downloading \(filename)...")
-        let downloadURL = URL(string: "\(baseURL)/\(urlPath)")!
-
-        // Use DownloadUtils.sharedSession for consistent proxy and configuration handling
-        let (data, response) = try await DownloadUtils.sharedSession.data(from: downloadURL)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-            httpResponse.statusCode == 200
-        else {
-            throw TTSError.modelNotFound("Failed to download \(filename)")
-        }
-
-        try data.write(to: localURL)
-        logger.info("Downloaded \(filename) (\(data.count) bytes)")
-    }
-
     /// Ensure required dictionary files exist
     public static func ensureRequiredFiles() async throws {
-        try await downloadFileIfNeeded(filename: "us_gold.json", urlPath: "us_gold.json")
-        try await downloadFileIfNeeded(filename: "us_silver.json", urlPath: "us_silver.json")
-
-        // Ensure eSpeak NG data bundle exists (download from HuggingFace Resources if missing)
-        let cacheDir = try TtsModels.cacheDirectoryURL()
-        let modelsDirectory = cacheDir.appendingPathComponent("Models")
-        _ = try? await DownloadUtils.ensureEspeakDataBundle(in: modelsDirectory)
+        try await KokoroModelLoader.shared.ensureRequiredFiles()
     }
 
     /// Load Kokoro CoreML models for all supported variants.
     public static func loadModel() async throws {
-        if kokoroModels.count == ModelNames.TTS.Variant.allCases.count {
-            return
-        }
-
-        let fm = FileManager.default
-        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
-        var variantsNeedingDownload: [ModelNames.TTS.Variant] = []
-        let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndNeuralEngine
-
-        for variant in ModelNames.TTS.Variant.allCases where kokoroModels[variant] == nil {
-            let fileName = ModelNames.TTS.bundle(for: variant)
-            let localModelURL = cwd.appendingPathComponent(fileName)
-
-            if fm.fileExists(atPath: localModelURL.path) {
-                logger.info(
-                    "Loading Kokoro \(variantDescription(variant)) model from local bundle: \(localModelURL.path)")
-                let model: MLModel
-                if localModelURL.pathExtension == "mlpackage" {
-                    let compiledURL = try await MLModel.compileModel(at: localModelURL)
-                    model = try MLModel(contentsOf: compiledURL, configuration: configuration)
-                } else {
-                    model = try MLModel(contentsOf: localModelURL, configuration: configuration)
-                }
-                kokoroModels[variant] = model
-                tokenLengthCache[variant] = inferTokenLength(from: model)
-            } else {
-                variantsNeedingDownload.append(variant)
-            }
-        }
-
-        if !variantsNeedingDownload.isEmpty {
-            if downloadedModelBundle == nil {
-                downloadedModelBundle = try await TtsModels.download()
-            }
-            guard let bundle = downloadedModelBundle else {
-                throw TTSError.modelNotFound("Kokoro models unavailable after download attempt")
-            }
-            for variant in variantsNeedingDownload {
-                let fileName = ModelNames.TTS.bundle(for: variant)
-                guard let model = bundle.model(for: variant) else {
-                    throw TTSError.modelNotFound(fileName)
-                }
-                kokoroModels[variant] = model
-                tokenLengthCache[variant] = inferTokenLength(from: model)
-                logger.info("Loaded Kokoro \(variantDescription(variant)) model from cache")
-            }
-        }
-
-        let loadedVariants = kokoroModels.keys.map { variantDescription($0) }.sorted().joined(separator: ", ")
-        logger.info("Kokoro models ready: [\(loadedVariants)]")
+        try await KokoroModelLoader.shared.loadModelsIfNeeded()
     }
 
     /// Register a bundle of preloaded Core ML models so future calls to `loadModel()` reuse them.
     /// This allows higher-level managers to inject models that were downloaded elsewhere (e.g. pod lint).
-    internal static func registerPreloadedModels(_ models: TtsModels) {
-        downloadedModelBundle = models
-
-        for variant in ModelNames.TTS.Variant.allCases {
-            if let model = models.model(for: variant) {
-                kokoroModels[variant] = model
-                tokenLengthCache[variant] = inferTokenLength(from: model)
-            }
-        }
+    internal static func registerPreloadedModels(_ models: TtsModels) async {
+        await KokoroModelLoader.shared.registerPreloadedModels(models)
     }
 
     /// Load simple word->phonemes dictionary (preferred)
@@ -245,7 +142,7 @@ public struct KokoroModel {
             do {
                 let rawLexicon = try Data(contentsOf: lexiconURL)
                 guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
-                    logger.warning("Skipping \(filename) (unexpected format)")
+                    Self.logger.warning("Skipping \(filename) (unexpected format)")
                     continue
                 }
 
@@ -310,9 +207,9 @@ public struct KokoroModel {
     // TextChunk is defined in KokoroChunker.swift
 
     /// Chunk text into segments under the model token budget, using punctuation-driven pauses.
-    private static func chunkText(_ text: String) throws -> [TextChunk] {
+    private static func chunkText(_ text: String) async throws -> [TextChunk] {
         try loadSimplePhonemeDictionary()
-        let target = try tokenLength(for: .fifteenSecond)
+        let target = try await tokenLength(for: .fifteenSecond)
         let hasLang = false
         return KokoroChunker.chunk(
             text: text,
@@ -355,19 +252,13 @@ public struct KokoroModel {
     }
 
     /// Inspect model to determine the expected token length for input_ids
-    private static func tokenLength(for variant: ModelNames.TTS.Variant) throws -> Int {
-        if let cached = tokenLengthCache[variant] {
-            return cached
-        }
-        let model = try model(for: variant)
-        let length = inferTokenLength(from: model)
-        tokenLengthCache[variant] = length
-        return length
+    private static func tokenLength(for variant: ModelNames.TTS.Variant) async throws -> Int {
+        try await KokoroModelLoader.shared.tokenLength(for: variant)
     }
 
-    private static func selectVariant(forTokenCount tokenCount: Int) throws -> ModelNames.TTS.Variant {
-        let shortCapacity = try tokenLength(for: .fiveSecond)
-        let longCapacity = try tokenLength(for: .fifteenSecond)
+    private static func selectVariant(forTokenCount tokenCount: Int) async throws -> ModelNames.TTS.Variant {
+        let shortCapacity = try await tokenLength(for: .fiveSecond)
+        let longCapacity = try await tokenLength(for: .fifteenSecond)
         guard tokenCount <= longCapacity else {
             throw TTSError.processingFailed(
                 "Chunk token count \(tokenCount) exceeds supported capacities (short=\(shortCapacity), long=\(longCapacity))"
@@ -386,7 +277,7 @@ public struct KokoroModel {
     }
 
     /// Load voice embedding (simplified for 3-second model)
-    public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) throws -> MLMultiArray {
+    public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) async throws -> MLMultiArray {
         let voice = "af_heart"
         // Try to load from cache: ~/.cache/fluidaudio/Models/kokoro/voices/<voice>.json
         let cacheDir = try TtsModels.cacheDirectoryURL()
@@ -458,7 +349,7 @@ public struct KokoroModel {
         }
 
         // Require a valid voice embedding; fail if missing or invalid
-        let dim = refDimFromModel()
+        let dim = try await KokoroModelLoader.shared.referenceEmbeddingDimension()
         guard let vec = vector, vec.count == dim else {
             throw TTSError.modelNotFound("Voice embedding for \(voice) not found or invalid at \(voiceJSON.path)")
         }
@@ -475,23 +366,13 @@ public struct KokoroModel {
     }
 
     /// Helper to fetch ref_s expected dimension from model
-    private static func refDim(from model: MLModel) -> Int {
+    internal static func refDim(from model: MLModel) -> Int {
         if let desc = model.modelDescription.inputDescriptionsByName["ref_s"],
             let shape = desc.multiArrayConstraint?.shape,
             shape.count >= 2
         {
             let n = shape.last!.intValue
             if n > 0 { return n }
-        }
-        return 256
-    }
-
-    private static func refDimFromModel() -> Int {
-        if let defaultModel = kokoroModels[ModelNames.TTS.defaultVariant] {
-            return refDim(from: defaultModel)
-        }
-        if let anyModel = kokoroModels.values.first {
-            return refDim(from: anyModel)
         }
         return 256
     }
@@ -508,10 +389,10 @@ public struct KokoroModel {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
         }
 
-        let kokoro = try model(for: variant)
+        let kokoro = try await model(for: variant)
 
         // Get voice embedding
-        let refStyle = try loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
+        let refStyle = try await loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
 
         // Pad or truncate to match model expectation
         var trimmedIds = inputIds
@@ -521,7 +402,7 @@ public struct KokoroModel {
             )
             trimmedIds = Array(trimmedIds.prefix(targetTokens))
         } else if trimmedIds.count < targetTokens {
-            logger.debug(
+            Self.logger.debug(
                 "input_ids length (\(trimmedIds.count)) below targetTokens=\(targetTokens) for chunk '\(chunk.text)' — padding with zeros"
             )
             trimmedIds.append(contentsOf: Array(repeating: Int32(0), count: targetTokens - trimmedIds.count))
@@ -638,7 +519,7 @@ public struct KokoroModel {
 
         try loadSimplePhonemeDictionary()
 
-        // If there are OOV words and G2P data is missing, fail fast per policy.
+        // If there are OOV words without lexicon coverage, fail fast so the caller can supply entries.
         do {
             let allowedSet = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: "'"))
             func normalize(_ s: String) -> String {
@@ -663,7 +544,7 @@ public struct KokoroModel {
                     if oov.count >= 8 { break }
                 }
             }
-            #if canImport(ESpeakNG) || canImport(CEspeakNG)
+            #if canImport(ESpeakNG)
             if !oov.isEmpty && EspeakG2P.isDataAvailable() == false {
                 throw TTSError.processingFailed(
                     "G2P (eSpeak NG) data missing but required for OOV words: \(Set(oov).sorted().prefix(5).joined(separator: ", ")). Ensure the eSpeak NG data bundle is available in the models cache (use DownloadUtils.ensureEspeakDataBundle)."
@@ -678,7 +559,7 @@ public struct KokoroModel {
             #endif
         }
 
-        let chunks = try chunkText(text)
+        let chunks = try await chunkText(text)
         guard !chunks.isEmpty else {
             throw TTSError.processingFailed("No valid words found in text")
         }
@@ -710,8 +591,8 @@ public struct KokoroModel {
                 throw TTSError.processingFailed(
                     "No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
             }
-            let variant = try selectVariant(forTokenCount: inputIds.count)
-            let targetTokens = try tokenLength(for: variant)
+            let variant = try await selectVariant(forTokenCount: inputIds.count)
+            let targetTokens = try await tokenLength(for: variant)
             let template = ChunkInfoTemplate(
                 index: index,
                 text: chunk.text,
@@ -820,12 +701,12 @@ public struct KokoroModel {
         }
 
         let totalTime = Date().timeIntervalSince(synthesisStart)
-        logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
-        logger.info("Audio size: \(audioData.count) bytes")
-        logger.info("Total samples: \(allSamples.count)")
+        Self.logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
+        Self.logger.info("Audio size: \(audioData.count) bytes")
+        Self.logger.info("Total samples: \(allSamples.count)")
         let totalDurationSeconds = Double(allSamples.count) / Double(sampleRateHz)
-        let totalFrameCount = kokoroFrameSamples > 0 ? allSamples.count / kokoroFrameSamples : 0
-        logger.info("Total duration: \(String(format: "%.3f", totalDurationSeconds))s (\(totalFrameCount) frames)")
+        let totalFrameCount = Self.kokoroFrameSamples > 0 ? allSamples.count / Self.kokoroFrameSamples : 0
+        Self.logger.info("Total duration: \(String(format: "%.3f", totalDurationSeconds))s (\(totalFrameCount) frames)")
 
         return SynthesisResult(audio: audioData, chunks: chunkInfos)
     }

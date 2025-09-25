@@ -1,10 +1,6 @@
-#if canImport(ESpeakNG) || canImport(CEspeakNG)
-
 #if canImport(ESpeakNG)
+
 import ESpeakNG
-#else
-import CEspeakNG
-#endif
 import Foundation
 
 /// Thread-safe wrapper around eSpeak NG C API to get IPA phonemes for a word.

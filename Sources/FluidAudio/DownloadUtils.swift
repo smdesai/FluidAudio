@@ -165,13 +165,6 @@ public class DownloadUtils {
             }
 
             do {
-                if modelPath.pathExtension == "mlpackage" {
-                    let compiledURL = try await MLModel.compileModel(at: modelPath)
-                    models[name] = try MLModel(contentsOf: compiledURL, configuration: config)
-                    logger.info("Compiled and loaded model package: \(name)")
-                    continue
-                }
-
                 // Validate model directory structure before loading (.mlmodelc bundle)
                 var isDirectory: ObjCBool = false
                 guard
@@ -535,21 +528,17 @@ extension DownloadUtils {
         let bundleRoot = repoPath.appendingPathComponent("Resources/espeak-ng/espeak-ng-data.bundle/espeak-ng-data")
         let voices = bundleRoot.appendingPathComponent("voices")
 
-        // If present, return immediately
         if FileManager.default.fileExists(atPath: voices.path) {
             return bundleRoot
         }
 
-        // Ensure repo directory exists
         try FileManager.default.createDirectory(at: repoPath, withIntermediateDirectories: true)
 
         logger.info("Downloading eSpeak NG data bundle from HuggingFace…")
 
-        // Download the zip file
         let zipPath = repoPath.appendingPathComponent("espeak-ng.zip")
         let zipURL = URL(string: "https://huggingface.co/\(repo.remotePath)/resolve/main/espeak-ng.zip")!
 
-        // Download if not present
         if !FileManager.default.fileExists(atPath: zipPath.path) {
             try FileManager.default.createDirectory(
                 at: zipPath.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -560,7 +549,6 @@ extension DownloadUtils {
         }
 
         #if os(macOS)
-        // Extract the zip using the system unzip utility (available on macOS toolchains)
         let resourcesDir = repoPath.appendingPathComponent("Resources")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
@@ -574,11 +562,9 @@ extension DownloadUtils {
             logger.info("Extracted espeak-ng-data successfully")
         }
         #else
-        // On iOS/tvOS/watchOS we expect the bundle to be pre-packaged. If it is missing, surface an error.
         logger.warning("Skipping espeak-ng.zip extraction on this platform; expecting pre-extracted Resources bundle")
         #endif
 
-        // Validate after extraction
         guard FileManager.default.fileExists(atPath: voices.path) else {
             throw TTSError.downloadFailed("eSpeak NG data bundle missing 'voices' after extraction")
         }
