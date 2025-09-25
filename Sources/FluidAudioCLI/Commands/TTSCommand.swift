@@ -125,8 +125,10 @@ public struct TTS {
                     let transcription = try await asr.transcribe(outURL)
                     asrHypothesis = transcription.text
 
-                    // Calculate WER
-                    werValue = calculateWER(reference: text, hypothesis: transcription.text)
+                    // Calculate WER metrics using shared utility
+                    let werMetrics = WERCalculator.calculateWERMetrics(
+                        hypothesis: transcription.text, reference: text)
+                    werValue = werMetrics.wer
 
                     print("Reference: \(text)")
                     print("ASR Output: \(transcription.text)")
@@ -235,77 +237,5 @@ public struct TTS {
               --help, -h           Show this help
             """
         )
-    }
-
-    private static func calculateWER(reference: String, hypothesis: String) -> Double {
-        // Normalize text for comparison
-        func normalize(_ text: String) -> String {
-            return
-                text
-                .lowercased()
-                .replacingOccurrences(of: "\u{2019}", with: "'")  // smart quotes
-                .replacingOccurrences(of: "\u{2018}", with: "'")
-                .replacingOccurrences(of: "\u{201c}", with: "\"")
-                .replacingOccurrences(of: "\u{201d}", with: "\"")
-                .replacingOccurrences(of: "\u{2014}", with: "-")  // em dash
-                .replacingOccurrences(of: "\u{2026}", with: "...")  // ellipsis
-        }
-
-        // Tokenize into words (alphanumeric + apostrophe only)
-        func tokenize(_ text: String) -> [String] {
-            var tokens: [String] = []
-            var currentToken = ""
-
-            for char in normalize(text) {
-                if char.isLetter || char.isNumber || char == "'" {
-                    currentToken.append(char)
-                } else {
-                    if !currentToken.isEmpty {
-                        tokens.append(currentToken)
-                        currentToken = ""
-                    }
-                }
-            }
-            if !currentToken.isEmpty {
-                tokens.append(currentToken)
-            }
-            return tokens
-        }
-
-        let refTokens = tokenize(reference)
-        let hypTokens = tokenize(hypothesis)
-
-        // Handle empty cases
-        if refTokens.isEmpty {
-            return hypTokens.isEmpty ? 0.0 : 1.0
-        }
-
-        // Calculate Levenshtein distance using dynamic programming
-        let n = refTokens.count
-        let m = hypTokens.count
-        var dp = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
-
-        // Initialize base cases
-        for i in 0...n {
-            dp[i][0] = i
-        }
-        for j in 0...m {
-            dp[0][j] = j
-        }
-
-        // Fill the DP table
-        for i in 1...n {
-            for j in 1...m {
-                let cost = refTokens[i - 1] == hypTokens[j - 1] ? 0 : 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,  // deletion
-                    dp[i][j - 1] + 1,  // insertion
-                    dp[i - 1][j - 1] + cost  // substitution
-                )
-            }
-        }
-
-        // WER = edits / reference_length
-        return Double(dp[n][m]) / Double(n)
     }
 }
