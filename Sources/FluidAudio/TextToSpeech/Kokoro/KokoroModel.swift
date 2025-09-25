@@ -12,7 +12,7 @@ import FoundationNetworking
 public struct KokoroModel {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
     private static let sampleRateHz = 24_000
-    private static let shortVariantGuardThresholdSeconds = 2.75
+    private static let shortVariantGuardThresholdSeconds = 3.0
     private static let shortVariantGuardFrameCount = 4
     private static let kokoroFrameSamples = 600  // Kokoro vocoder output samples per frame
 
