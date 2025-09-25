@@ -211,7 +211,7 @@ public class DownloadUtils {
                 if let contents = try? FileManager.default.contentsOfDirectory(
                     atPath: modelPath.deletingLastPathComponent().path)
                 {
-                    logger.error("Model directory contents: \(contents.map { $0.lastPathComponent })")
+                    logger.error("Model directory contents: \(contents)")
                 }
 
                 throw error
