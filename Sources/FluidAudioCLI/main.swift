@@ -92,9 +92,6 @@ func exitWithPeakMemory(_ code: Int32) -> Never {
 // Main entry point
 let arguments = CommandLine.arguments
 
-// Mirror OSLog messages to console when running CLI
-AppLogger.enableConsoleOutput(true)
-
 guard arguments.count > 1 else {
     printUsage()
     exitWithPeakMemory(1)

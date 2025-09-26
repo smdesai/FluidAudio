@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 import OSLog
@@ -622,10 +623,12 @@ public struct KokoroSynthesizer {
 
         let embedding = try MLMultiArray(shape: [1, NSNumber(value: dim)] as [NSNumber], dataType: .float32)
         var sumSquares: Float = 0
-        for i in 0..<dim {
-            let value = resolvedVector[i]
-            embedding[i] = NSNumber(value: value)
-            sumSquares += value * value
+        resolvedVector.withUnsafeBufferPointer { sourcePointer in
+            guard let sourceBase = sourcePointer.baseAddress, !sourcePointer.isEmpty else { return }
+            let elementCount = sourcePointer.count
+            let destinationPointer = embedding.dataPointer.assumingMemoryBound(to: Float.self)
+            destinationPointer.update(from: sourceBase, count: elementCount)
+            vDSP_svesq(sourceBase, 1, &sumSquares, vDSP_Length(elementCount))
         }
 
         Self.logger.info(
@@ -915,20 +918,30 @@ public struct KokoroSynthesizer {
             throw TTSError.processingFailed("Synthesis produced no samples")
         }
 
-        let maxVal = allSamples.map { abs($0) }.max() ?? 1.0
-        let normalize: (Float) -> Float = { sample in
-            guard maxVal > 0 else { return sample }
-            return sample / maxVal
+        var maxMagnitude: Float = 0
+        allSamples.withUnsafeBufferPointer { pointer in
+            guard let baseAddress = pointer.baseAddress, !pointer.isEmpty else { return }
+            vDSP_maxmgv(baseAddress, 1, &maxMagnitude, vDSP_Length(pointer.count))
         }
 
-        let normalizedSamples = allSamples.map(normalize)
-        let audioData = try AudioWAV.data(from: normalizedSamples, sampleRate: 24000)
-
-        let normalizedChunkSamples = chunkSampleBuffers.map { buffer -> [Float] in
-            buffer.map(normalize)
+        if maxMagnitude > 0 {
+            var divisor = maxMagnitude
+            allSamples.withUnsafeMutableBufferPointer { destination in
+                guard let destBase = destination.baseAddress else { return }
+                vDSP_vsdiv(destBase, 1, &divisor, destBase, 1, vDSP_Length(destination.count))
+            }
+            for index in chunkSampleBuffers.indices {
+                chunkSampleBuffers[index].withUnsafeMutableBufferPointer { destination in
+                    guard let destBase = destination.baseAddress, !destination.isEmpty else { return }
+                    var chunkDivisor = maxMagnitude
+                    vDSP_vsdiv(destBase, 1, &chunkDivisor, destBase, 1, vDSP_Length(destination.count))
+                }
+            }
         }
 
-        let chunkInfos = zip(chunkTemplates, normalizedChunkSamples).map { template, samples in
+        let audioData = try AudioWAV.data(from: allSamples, sampleRate: 24000)
+
+        let chunkInfos = zip(chunkTemplates, chunkSampleBuffers).map { template, samples in
             ChunkInfo(
                 index: template.index,
                 text: template.text,
