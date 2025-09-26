@@ -87,76 +87,61 @@ public struct KokoroSynthesizer {
         private var caseSensitiveWordToPhonemes: [String: [String]] = [:]
         private var isLoaded = false
 
+        private struct CachePayload: Codable {
+            let lower: [String: [String]]
+            let caseSensitive: [String: [String]]
+        }
+
         func ensureLoaded(kokoroDirectory: URL, allowedTokens: Set<String>) async throws {
             if isLoaded && !caseSensitiveWordToPhonemes.isEmpty { return }
 
-            func filteredTokens(_ tokens: [String]) -> [String] {
-                tokens.filter { allowedTokens.contains($0) }
+            let cacheURL = kokoroDirectory.appendingPathComponent("us_lexicon_cache.json")
+            if await loadFromCache(cacheURL, allowedTokens: allowedTokens) {
+                return
             }
-
-            let lexiconFiles = ["us_gold.json", "us_silver.json"]
-            var mapping: [String: [String]] = [:]
-            var caseSensitive: [String: [String]] = [:]
-            var totalAdded = 0
-
-            for filename in lexiconFiles {
-                let lexiconURL = kokoroDirectory.appendingPathComponent(filename)
-                guard FileManager.default.fileExists(atPath: lexiconURL.path) else { continue }
-
-                do {
-                    let rawLexicon = try Data(contentsOf: lexiconURL)
-                    guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
-                        KokoroSynthesizer.logger.warning("Skipping \(filename) (unexpected format)")
-                        continue
-                    }
-
-                    var addedHere = 0
-                    for (key, value) in entries {
-                        let normalizedKey = key.lowercased()
-                        let tokens: [String]
-                        if let stringValue = value as? String {
-                            tokens = filteredTokens(KokoroSynthesizer.tokenizeIPAString(stringValue))
-                        } else if let arrayValue = value as? [String] {
-                            tokens = filteredTokens(arrayValue)
-                        } else {
-                            continue
-                        }
-
-                        guard !tokens.isEmpty else { continue }
-
-                        if caseSensitive[key] == nil {
-                            caseSensitive[key] = tokens
-                        }
-
-                        if mapping[normalizedKey] == nil {
-                            mapping[normalizedKey] = tokens
-                            addedHere += 1
-                        }
-                    }
-
-                    if addedHere > 0 {
-                        totalAdded += addedHere
-                        KokoroSynthesizer.logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
-                    }
-                } catch {
-                    KokoroSynthesizer.logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
-                }
-            }
-
-            guard !mapping.isEmpty else {
-                throw TTSError.processingFailed("No US English lexicon entries found (missing us_gold.json/us_silver.json)")
-            }
-
-            wordToPhonemes = mapping
-            caseSensitiveWordToPhonemes = caseSensitive
-            isLoaded = true
-            KokoroSynthesizer.logger.info(
-                "Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))"
-            )
+            throw TTSError.processingFailed("No lexicon cache found and raw lexicon merge disabled")
         }
 
         func lexicons() -> (word: [String: [String]], caseSensitive: [String: [String]]) {
             (wordToPhonemes, caseSensitiveWordToPhonemes)
+        }
+
+        private func loadFromCache(_ url: URL, allowedTokens: Set<String>) async -> Bool {
+            guard FileManager.default.fileExists(atPath: url.path) else { return false }
+            do {
+                let data = try Data(contentsOf: url)
+                let payload = try JSONDecoder().decode(CachePayload.self, from: data)
+                let filteredLower = payload.lower.mapValues { $0.filter { allowedTokens.contains($0) } }
+                let filteredCase = payload.caseSensitive.mapValues { $0.filter { allowedTokens.contains($0) } }
+
+                guard !filteredLower.isEmpty else { return false }
+
+                wordToPhonemes = filteredLower
+                caseSensitiveWordToPhonemes = filteredCase
+                isLoaded = true
+                KokoroSynthesizer.logger.info("Loaded lexicon cache: \(filteredLower.count) entries")
+                return true
+            } catch {
+                KokoroSynthesizer.logger.warning("Failed to load lexicon cache: \(error.localizedDescription)")
+                wordToPhonemes = [:]
+                caseSensitiveWordToPhonemes = [:]
+                isLoaded = false
+                return false
+            }
+        }
+
+        private func writeCache(payload: CachePayload, to url: URL) async {
+            do {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(payload)
+                try data.write(to: url, options: [.atomic])
+                KokoroSynthesizer.logger.info("Wrote lexicon cache to \(url.path)")
+            } catch {
+                KokoroSynthesizer.logger.warning("Failed to persist lexicon cache: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -298,7 +283,8 @@ public struct KokoroSynthesizer {
 
     private static func buildChunkEntries(
         from chunks: [TextChunk],
-        vocabulary: [String: Int32]
+        vocabulary: [String: Int32],
+        preference: ModelNames.TTS.Variant?
     ) async throws -> [ChunkEntry] {
         var entries: [ChunkEntry] = []
         entries.reserveCapacity(chunks.count)
@@ -310,7 +296,7 @@ public struct KokoroSynthesizer {
                 throw TTSError.processingFailed(
                     "No input IDs generated for chunk: \(joinedWords)")
             }
-            let variant = try await selectVariant(forTokenCount: inputIds.count)
+            let variant = try await selectVariant(forTokenCount: inputIds.count, preference: preference)
             let targetTokens = try await tokenLength(for: variant)
             let template = ChunkInfoTemplate(
                 index: index,
@@ -378,7 +364,26 @@ public struct KokoroSynthesizer {
         try await KokoroModelCache.shared.tokenLength(for: variant)
     }
 
-    private static func selectVariant(forTokenCount tokenCount: Int) async throws -> ModelNames.TTS.Variant {
+    private static func selectVariant(
+        forTokenCount tokenCount: Int,
+        preference: ModelNames.TTS.Variant?
+    ) async throws -> ModelNames.TTS.Variant {
+        if let preference {
+            let capacity = try await tokenLength(for: preference)
+            if tokenCount <= capacity {
+                return preference
+            }
+
+            logger.notice(
+                "Requested \(variantDescription(preference)) variant but token count \(tokenCount) exceeds capacity=\(capacity); falling back to automatic selection"
+            )
+            if preference == .fifteenSecond {
+                throw TTSError.processingFailed(
+                    "Chunk token count \(tokenCount) exceeds \(variantDescription(preference)) capacity \(capacity)"
+                )
+            }
+            // fall through to automatic selection
+        }
         let shortCapacity = try await tokenLength(for: .fiveSecond)
         let longCapacity = try await tokenLength(for: .fifteenSecond)
         guard tokenCount <= longCapacity else {
@@ -639,15 +644,24 @@ public struct KokoroSynthesizer {
     }
 
     /// Main synthesis function returning audio bytes only.
-    public static func synthesize(text: String, voice: String = "af_heart") async throws -> Data {
-        let result = try await synthesizeDetailed(text: text, voice: voice)
+    public static func synthesize(
+        text: String,
+        voice: String = "af_heart",
+        variantPreference: ModelNames.TTS.Variant? = nil
+    ) async throws -> Data {
+        let result = try await synthesizeDetailed(
+            text: text,
+            voice: voice,
+            variantPreference: variantPreference
+        )
         return result.audio
     }
 
     /// Synthesize audio while returning per-chunk metadata used during inference.
     public static func synthesizeDetailed(
         text: String,
-        voice: String = "af_heart"
+        voice: String = "af_heart",
+        variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws -> SynthesisResult {
         let synthesisStart = Date()
 
@@ -673,7 +687,11 @@ public struct KokoroSynthesizer {
             throw TTSError.processingFailed("No valid words found in text")
         }
 
-        let entries = try await buildChunkEntries(from: chunks, vocabulary: vocabulary)
+        let entries = try await buildChunkEntries(
+            from: chunks,
+            vocabulary: vocabulary,
+            preference: variantPreference
+        )
 
         var allSamples: [Float] = []
         var chunkTemplates: [ChunkInfoTemplate] = []

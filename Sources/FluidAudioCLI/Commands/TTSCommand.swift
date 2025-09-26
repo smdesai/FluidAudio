@@ -18,6 +18,7 @@ public struct TTS {
         var voice = "af_heart"
         var metricsPath: String? = nil
         var chunkDirectory: String? = nil
+        var variantPreference: ModelNames.TTS.Variant? = nil
         // Always ensure required files in CLI
 
         var i = 1
@@ -46,6 +47,19 @@ public struct TTS {
                     chunkDirectory = arguments[i + 1]
                     i += 1
                 }
+            case "--variant", "--model-variant":
+                if i + 1 < arguments.count {
+                    let value = arguments[i + 1].lowercased()
+                    switch value {
+                    case "5", "5s", "short":
+                        variantPreference = .fiveSecond
+                    case "15", "15s", "long":
+                        variantPreference = .fifteenSecond
+                    default:
+                        logger.warning("Unknown variant preference '\(arguments[i + 1])'; ignoring")
+                    }
+                    i += 1
+                }
             case "--auto-download":
                 // No-op: downloads are always ensured by the CLI
                 ()
@@ -71,7 +85,8 @@ public struct TTS {
             let usedVoice = requestedVoice.isEmpty ? "af_heart" : requestedVoice
             let detailed = try await manager.synthesizeDetailed(
                 text: text,
-                voice: requestedVoice.isEmpty ? nil : requestedVoice
+                voice: requestedVoice.isEmpty ? nil : requestedVoice,
+                variantPreference: variantPreference
             )
             let wav = detailed.audio
             let tSynth1 = Date()
@@ -149,6 +164,10 @@ public struct TTS {
                     "model_load_time_s": loadS,
                     "total_time_s": totalS,
                 ]
+
+                if let variantPreference {
+                    metricsDict["variant_preference"] = variantPreference == .fiveSecond ? "5s" : "15s"
+                }
 
                 // Add ASR comparison if available
                 if let asrHypothesis = asrHypothesis {
@@ -238,6 +257,7 @@ public struct TTS {
             Options:
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart)
+              --variant            Force Kokoro 5s or 15s model (values: 5s,15s)
               --metrics            Write timing metrics to a JSON file (also runs ASR for evaluation)
               --chunk-dir          Directory where individual chunk WAVs will be written
               (models/dictionary auto-download is always on in CLI)

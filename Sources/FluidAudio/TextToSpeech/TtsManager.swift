@@ -45,13 +45,15 @@ public final class TtSManager {
     public func synthesize(
         text: String,
         voiceSpeed: Float = 1.0,
-        speakerId: Int = 0
+        speakerId: Int = 0,
+        variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws -> Data {
         let detailed = try await synthesizeDetailed(
             text: text,
             voice: nil,
             voiceSpeed: voiceSpeed,
-            speakerId: speakerId
+            speakerId: speakerId,
+            variantPreference: variantPreference
         )
 
         logger.info("Successfully synthesized \(detailed.audio.count) bytes of audio")
@@ -71,7 +73,8 @@ public final class TtSManager {
         let audioData = try await synthesize(
             text: text,
             voiceSpeed: voiceSpeed,
-            speakerId: speakerId
+            speakerId: speakerId,
+            variantPreference: variantPreference
         )
 
         try audioData.write(to: outputURL)
@@ -82,7 +85,8 @@ public final class TtSManager {
         text: String,
         voice: String? = nil,
         voiceSpeed: Float = 1.0,
-        speakerId: Int = 0
+        speakerId: Int = 0,
+        variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws -> KokoroSynthesizer.SynthesisResult {
         guard isInitialized else {
             throw TTSError.modelNotFound("Kokoro model not initialized")
@@ -96,7 +100,11 @@ public final class TtSManager {
         try await LexiconAssetManager.ensureCoreAssets()
         try await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: selectedVoice)
 
-        let synthesis = try await KokoroSynthesizer.synthesizeDetailed(text: cleanedText, voice: selectedVoice)
+        let synthesis = try await KokoroSynthesizer.synthesizeDetailed(
+            text: cleanedText,
+            voice: selectedVoice,
+            variantPreference: variantPreference
+        )
         let factor = max(0.1, voiceSpeed)
 
         if abs(factor - 1.0) < 0.01 {

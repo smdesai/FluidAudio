@@ -38,6 +38,14 @@ actor LexiconAssetManager {
         try await downloadFileIfNeeded(filename: "us_silver.json", urlPath: "us_silver.json")
     }
 
+    private func ensureLexiconCache() async {
+        do {
+            try await downloadFileIfNeeded(filename: "us_lexicon_cache.json", urlPath: "us_lexicon_cache.json")
+        } catch {
+            logger.warning("Failed to download lexicon cache (will fall back to merge): \(error.localizedDescription)")
+        }
+    }
+
     private func ensureEspeakAssets() async {
         let cacheDir = try? TtsModels.cacheDirectoryURL()
         guard let cacheDir else { return }
@@ -46,6 +54,7 @@ actor LexiconAssetManager {
     }
 
     func ensureCoreAssets() async throws {
+        await ensureLexiconCache()
         try await ensureLexiconFiles()
         await ensureEspeakAssets()
     }
