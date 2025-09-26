@@ -62,7 +62,7 @@ public struct KokoroSynthesizer {
         }
     }
 
-    private struct ChunkInfoTemplate {
+    private struct ChunkInfoTemplate: Sendable {
         let index: Int
         let text: String
         let wordCount: Int
@@ -74,13 +74,13 @@ public struct KokoroSynthesizer {
         let targetTokens: Int
     }
 
-    private struct ChunkEntry {
+    private struct ChunkEntry: Sendable {
         let chunk: TextChunk
         let inputIds: [Int32]
         let template: ChunkInfoTemplate
     }
 
-    private struct TokenCapacities {
+    private struct TokenCapacities: Sendable {
         let short: Int
         let long: Int
 
@@ -842,46 +842,68 @@ public struct KokoroSynthesizer {
             capacities: capacities
         )
 
+        struct ChunkSynthesisResult: Sendable {
+            let index: Int
+            let samples: [Float]
+            let predictionTime: TimeInterval
+        }
+
+        let totalChunks = entries.count
+        let chunkTemplates = entries.map { $0.template }
+        var chunkSampleBuffers = Array(repeating: [Float](), count: totalChunks)
         var allSamples: [Float] = []
-        var chunkTemplates: [ChunkInfoTemplate] = []
-        var chunkSampleBuffers: [[Float]] = []
         let crossfadeMs = 8
         let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
         var totalPredictionTime: TimeInterval = 0
-        var voiceEmbeddingCache: [String: MLMultiArray] = [:]
-        Self.logger.info("Starting audio inference across \(entries.count) chunk(s)")
-        for (index, entry) in entries.enumerated() {
-            let chunk = entry.chunk
-            logger.info(
-                "Processing chunk \(index + 1)/\(entries.count): \(chunk.words.count) words")
-            logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
-            logger.info("Chunk \(index + 1) using Kokoro \(variantDescription(entry.template.variant)) model")
-            let phonemeCount = entry.inputIds.count
-            let cacheKey = "\(voice)-\(phonemeCount)"
-            let refStyle: MLMultiArray
-            if let cached = voiceEmbeddingCache[cacheKey] {
-                refStyle = cached
-            } else {
-                let embedding = try await loadVoiceEmbedding(voice: voice, phonemeCount: phonemeCount)
-                voiceEmbeddingCache[cacheKey] = embedding
-                refStyle = embedding
-            }
-            let (chunkSamples, predictionTime) = try await synthesizeChunk(
-                entry.chunk,
-                voice: voice,
-                inputIds: entry.inputIds,
-                variant: entry.template.variant,
-                targetTokens: entry.template.targetTokens,
-                cachedRefStyle: refStyle)
-            totalPredictionTime += predictionTime
-            Self.logger.info(
-                "Chunk \(index + 1) model prediction latency: \(String(format: "%.3f", predictionTime))s")
+        Self.logger.info("Starting audio inference across \(totalChunks) chunk(s)")
 
-            chunkSampleBuffers.append(chunkSamples)
-            chunkTemplates.append(entry.template)
+        let chunkOutputs = try await withThrowingTaskGroup(of: ChunkSynthesisResult.self) { group in
+            for (index, entry) in entries.enumerated() {
+                let chunk = entry.chunk
+                let inputIds = entry.inputIds
+                let template = entry.template
+                let chunkIndex = index
+                let voiceID = voice
+                group.addTask(priority: .userInitiated) {
+                    Self.logger.info(
+                        "Processing chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.words.count) words")
+                    Self.logger.info("Chunk \(chunkIndex + 1) text: '\(template.text)'")
+                    Self.logger.info(
+                        "Chunk \(chunkIndex + 1) using Kokoro \(variantDescription(template.variant)) model")
+                    let (chunkSamples, predictionTime) = try await synthesizeChunk(
+                        chunk,
+                        voice: voiceID,
+                        inputIds: inputIds,
+                        variant: template.variant,
+                        targetTokens: template.targetTokens)
+                    return ChunkSynthesisResult(
+                        index: chunkIndex,
+                        samples: chunkSamples,
+                        predictionTime: predictionTime)
+                }
+            }
+
+            var results: [ChunkSynthesisResult] = []
+            results.reserveCapacity(totalChunks)
+            for try await result in group {
+                results.append(result)
+            }
+            return results
+        }
+
+        let sortedOutputs = chunkOutputs.sorted { $0.index < $1.index }
+
+        for output in sortedOutputs {
+            let index = output.index
+            let chunkSamples = output.samples
+            chunkSampleBuffers[index] = chunkSamples
+            totalPredictionTime += output.predictionTime
+
+            Self.logger.info(
+                "Chunk \(index + 1) model prediction latency: \(String(format: "%.3f", output.predictionTime))s")
             let chunkDurationSeconds = Double(chunkSamples.count) / Double(sampleRateHz)
             let chunkFrameCount = kokoroFrameSamples > 0 ? chunkSamples.count / kokoroFrameSamples : 0
-            logger.info(
+            Self.logger.info(
                 "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkDurationSeconds))s (\(chunkFrameCount) frames)"
             )
 

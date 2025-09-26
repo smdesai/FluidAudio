@@ -5,7 +5,7 @@ import NaturalLanguage
 #endif
 
 /// Lightweight chunk representation passed into Kokoro synthesis.
-struct TextChunk {
+struct TextChunk: Sendable {
     let words: [String]
     let atoms: [String]
     let phonemes: [String]
