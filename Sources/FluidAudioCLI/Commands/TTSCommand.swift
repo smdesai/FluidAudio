@@ -79,7 +79,7 @@ public struct TTS {
             // Write WAV
             let outURL = URL(fileURLWithPath: output)
             try wav.write(to: outURL)
-            print("Saved: \(outURL.path)")
+            logger.info("Saved output WAV: \(outURL.path)")
 
             var chunkFileMap: [Int: String] = [:]
             if let chunkDirectory = chunkDirectory {
@@ -92,7 +92,7 @@ public struct TTS {
                     try chunkData.write(to: fileURL)
                     chunkFileMap[chunk.index] = fileURL.path
                 }
-                print("Saved \(chunkFileMap.count) chunk WAV files to \(dirURL.path)")
+                logger.info("Saved \(chunkFileMap.count) chunk WAV files to \(dirURL.path)")
             }
 
             // Metrics
@@ -116,7 +116,7 @@ public struct TTS {
                 var asrHypothesis: String? = nil
                 var werValue: Double? = nil
 
-                print("\n--- Running ASR for TTS evaluation ---")
+                logger.info("--- Running ASR for TTS evaluation ---")
                 do {
                     // Load ASR models and initialize
                     let models = try await AsrModels.downloadAndLoad()
@@ -132,14 +132,14 @@ public struct TTS {
                         hypothesis: transcription.text, reference: text)
                     werValue = werMetrics.wer
 
-                    print("Reference: \(text)")
-                    print("ASR Output: \(transcription.text)")
-                    print(String(format: "WER: %.1f%%", werValue! * 100))
+                    logger.info("Reference: \(text)")
+                    logger.info("ASR Output: \(transcription.text)")
+                    logger.info(String(format: "WER: %.1f%%", werValue! * 100))
 
                     // Clean up ASR resources
                     asr.cleanup()
                 } catch {
-                    print("ASR evaluation failed: \(error.localizedDescription)")
+                    logger.warning("ASR evaluation failed: \(error.localizedDescription)")
                 }
 
                 var metricsDict: [String: Any] = [
@@ -161,13 +161,18 @@ public struct TTS {
                 if !detailed.chunks.isEmpty {
                     let frameSamples = 600
                     var totalChunkSamples = 0
+                    var chunkLogLines: [String] = []
+
                     detailed.chunks.enumerated().forEach { index, chunk in
                         let chunkSeconds = Double(chunk.samples.count) / 24_000.0
                         let frameCount = frameSamples > 0 ? chunk.samples.count / frameSamples : 0
                         totalChunkSamples += chunk.samples.count
-                        logger.info(
-                            "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkSeconds))s (\(frameCount) frames)")
+                        let line = String(
+                            format: "Chunk %d duration: %.3fs (%d frames)", index + 1, chunkSeconds,
+                            frameCount)
+                        chunkLogLines.append(line)
                     }
+                    logger.info(chunkLogLines.joined(separator: "\n"))
                     let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
                         var entry: [String: Any] = [
                             "index": chunk.index,
@@ -221,7 +226,7 @@ public struct TTS {
                 logger.info("Metrics saved: \(mURL.path)")
             }
         } catch {
-            print("Error: \(error.localizedDescription)")
+            logger.error("Error: \(error.localizedDescription)")
         }
     }
 

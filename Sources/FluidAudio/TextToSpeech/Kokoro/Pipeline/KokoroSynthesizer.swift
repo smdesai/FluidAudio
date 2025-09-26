@@ -9,8 +9,8 @@ import FoundationNetworking
 /// Kokoro TTS implementation using unified CoreML model
 /// Supports both 5s and 15s variants with US English phoneme lexicons
 @available(macOS 13.0, iOS 16.0, *)
-public struct KokoroModel {
-    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroModel")
+public struct KokoroSynthesizer {
+    private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroSynthesizer")
     private static let sampleRateHz = 24_000
     private static let shortVariantGuardThresholdSeconds = 3.0
     private static let shortVariantGuardFrameCount = 4
@@ -106,7 +106,7 @@ public struct KokoroModel {
                 do {
                     let rawLexicon = try Data(contentsOf: lexiconURL)
                     guard let entries = try JSONSerialization.jsonObject(with: rawLexicon) as? [String: Any] else {
-                        KokoroModel.logger.warning("Skipping \(filename) (unexpected format)")
+                        KokoroSynthesizer.logger.warning("Skipping \(filename) (unexpected format)")
                         continue
                     }
 
@@ -115,7 +115,7 @@ public struct KokoroModel {
                         let normalizedKey = key.lowercased()
                         let tokens: [String]
                         if let stringValue = value as? String {
-                            tokens = filteredTokens(KokoroModel.tokenizeIPAString(stringValue))
+                            tokens = filteredTokens(KokoroSynthesizer.tokenizeIPAString(stringValue))
                         } else if let arrayValue = value as? [String] {
                             tokens = filteredTokens(arrayValue)
                         } else {
@@ -136,10 +136,10 @@ public struct KokoroModel {
 
                     if addedHere > 0 {
                         totalAdded += addedHere
-                        KokoroModel.logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
+                        KokoroSynthesizer.logger.info("Merged \(addedHere) entries from \(filename) into phoneme dictionary")
                     }
                 } catch {
-                    KokoroModel.logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
+                    KokoroSynthesizer.logger.warning("Failed to merge lexicon \(filename): \(error.localizedDescription)")
                 }
             }
 
@@ -150,7 +150,7 @@ public struct KokoroModel {
             wordToPhonemes = mapping
             caseSensitiveWordToPhonemes = caseSensitive
             isLoaded = true
-            KokoroModel.logger.info(
+            KokoroSynthesizer.logger.info(
                 "Phoneme dictionary loaded from US lexicons: total=\(mapping.count) entries (merged=\(totalAdded))"
             )
         }
@@ -173,7 +173,7 @@ public struct KokoroModel {
     }
 
     private static func model(for variant: ModelNames.TTS.Variant) async throws -> MLModel {
-        try await KokoroModelLoader.shared.model(for: variant)
+        try await KokoroModelCache.shared.model(for: variant)
     }
 
     internal static func inferTokenLength(from model: MLModel) -> Int {
@@ -190,18 +190,18 @@ public struct KokoroModel {
 
     /// Ensure required dictionary files exist
     public static func ensureRequiredFiles() async throws {
-        try await KokoroModelLoader.shared.ensureRequiredFiles()
+        try await LexiconAssetManager.ensureCoreAssets()
     }
 
     /// Load Kokoro CoreML models for all supported variants.
     public static func loadModel() async throws {
-        try await KokoroModelLoader.shared.loadModelsIfNeeded()
+        try await KokoroModelCache.shared.loadModelsIfNeeded()
     }
 
     /// Register a bundle of preloaded Core ML models so future calls to `loadModel()` reuse them.
     /// This allows higher-level managers to inject models that were downloaded elsewhere (e.g. pod lint).
     internal static func registerPreloadedModels(_ models: TtsModels) async {
-        await KokoroModelLoader.shared.registerPreloadedModels(models)
+        await KokoroModelCache.shared.registerPreloadedModels(models)
     }
 
     /// Load simple word->phonemes dictionary (preferred)
@@ -375,7 +375,7 @@ public struct KokoroModel {
 
     /// Inspect model to determine the expected token length for input_ids
     private static func tokenLength(for variant: ModelNames.TTS.Variant) async throws -> Int {
-        try await KokoroModelLoader.shared.tokenLength(for: variant)
+        try await KokoroModelCache.shared.tokenLength(for: variant)
     }
 
     private static func selectVariant(forTokenCount tokenCount: Int) async throws -> ModelNames.TTS.Variant {
@@ -488,7 +488,7 @@ public struct KokoroModel {
                 "Voice embedding unavailable for \(attempted.joined(separator: ", ")); checked \(sourceURL.path)")
         }
 
-        let dim = try await KokoroModelLoader.shared.referenceEmbeddingDimension()
+        let dim = try await KokoroModelCache.shared.referenceEmbeddingDimension()
         guard vec.count == dim else {
             throw TTSError.modelNotFound(
                 "Voice embedding for \(voiceUsed) has unexpected length (expected \(dim), got \(vec.count))")
@@ -698,7 +698,7 @@ public struct KokoroModel {
             chunkTemplates.append(entry.template)
             let chunkDurationSeconds = Double(chunkSamples.count) / Double(sampleRateHz)
             let chunkFrameCount = kokoroFrameSamples > 0 ? chunkSamples.count / kokoroFrameSamples : 0
-            logger.info(
+                logger.info(
                 "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkDurationSeconds))s (\(chunkFrameCount) frames)"
             )
 
@@ -719,7 +719,7 @@ public struct KokoroModel {
                 if n > 0 {
                     for k in 0..<n {
                         let aIdx = allSamples.count - n + k
-                        let t = Float(k) / Float(n)
+                        let t: Float = n == 1 ? 1.0 : Float(k) / Float(n - 1)
                         allSamples[aIdx] = allSamples[aIdx] * (1.0 - t) + chunkSamples[k] * t
                     }
                     if chunkSamples.count > n {

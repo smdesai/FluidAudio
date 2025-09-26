@@ -26,10 +26,10 @@ public final class TtSManager {
 
         self.ttsModels = models
 
-        await KokoroModelLoader.shared.registerPreloadedModels(models)
-        try await KokoroModelLoader.shared.ensureRequiredFiles()
-        try await KokoroModel.loadSimplePhonemeDictionary()
-        try await KokoroModelLoader.shared.loadModelsIfNeeded()
+        await KokoroModelCache.shared.registerPreloadedModels(models)
+        try await LexiconAssetManager.ensureCoreAssets()
+        try await KokoroSynthesizer.loadSimplePhonemeDictionary()
+        try await KokoroModelCache.shared.loadModelsIfNeeded()
         isInitialized = true
 
         logger.info("TtSManager initialized successfully with preloaded models")
@@ -83,7 +83,7 @@ public final class TtSManager {
         voice: String? = nil,
         voiceSpeed: Float = 1.0,
         speakerId: Int = 0
-    ) async throws -> KokoroModel.SynthesisResult {
+    ) async throws -> KokoroSynthesizer.SynthesisResult {
         guard isInitialized else {
             throw TTSError.modelNotFound("Kokoro model not initialized")
         }
@@ -93,10 +93,10 @@ public final class TtSManager {
         let cleanedText = try sanitizeInput(text)
         let selectedVoice = resolveVoice(voice, speakerId: speakerId)
 
-        try await KokoroModelLoader.shared.ensureRequiredFiles()
+        try await LexiconAssetManager.ensureCoreAssets()
         try await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: selectedVoice)
 
-        let synthesis = try await KokoroModel.synthesizeDetailed(text: cleanedText, voice: selectedVoice)
+        let synthesis = try await KokoroSynthesizer.synthesizeDetailed(text: cleanedText, voice: selectedVoice)
         let factor = max(0.1, voiceSpeed)
 
         if abs(factor - 1.0) < 0.01 {
@@ -104,9 +104,9 @@ public final class TtSManager {
             return synthesis
         }
 
-        let adjustedChunks = synthesis.chunks.map { chunk -> KokoroModel.ChunkInfo in
+        let adjustedChunks = synthesis.chunks.map { chunk -> KokoroSynthesizer.ChunkInfo in
             let stretched = adjustSamples(chunk.samples, factor: factor)
-            return KokoroModel.ChunkInfo(
+            return KokoroSynthesizer.ChunkInfo(
                 index: chunk.index,
                 text: chunk.text,
                 wordCount: chunk.wordCount,
@@ -123,7 +123,7 @@ public final class TtSManager {
         let audioData = try AudioWAV.data(from: combinedSamples, sampleRate: 24_000)
 
         logger.info("Generated audio bytes: \(audioData.count) (speed factor=\(factor))")
-        return KokoroModel.SynthesisResult(audio: audioData, chunks: adjustedChunks)
+        return KokoroSynthesizer.SynthesisResult(audio: audioData, chunks: adjustedChunks)
     }
 
     private func sanitizeInput(_ text: String) throws -> String {

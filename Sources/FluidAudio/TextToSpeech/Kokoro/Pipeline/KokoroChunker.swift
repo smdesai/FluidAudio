@@ -18,7 +18,7 @@ struct TextChunk {
 enum KokoroChunker {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
     private static let decimalDigits = CharacterSet.decimalDigits
-    /// Public entry point used by `KokoroModel`
+    /// Public entry point used by `KokoroSynthesizer`
     static func chunk(
         text: String,
         wordToPhonemes: [String: [String]],
