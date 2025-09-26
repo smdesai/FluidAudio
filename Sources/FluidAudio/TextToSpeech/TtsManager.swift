@@ -64,7 +64,8 @@ public final class TtSManager {
         text: String,
         outputURL: URL,
         voiceSpeed: Float = 1.0,
-        speakerId: Int = 0
+        speakerId: Int = 0,
+        variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws {
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
