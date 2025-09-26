@@ -6,7 +6,6 @@ import OSLog
 import FoundationNetworking
 #endif
 
-/// Kokoro TTS implementation using unified CoreML model
 /// Supports both 5s and 15s variants with US English phoneme lexicons
 @available(macOS 13.0, iOS 16.0, *)
 public struct KokoroSynthesizer {
@@ -146,6 +145,122 @@ public struct KokoroSynthesizer {
     }
 
     private static let lexiconCache = LexiconCache()
+
+    private struct VoiceEmbeddingPayload {
+        let sourceURL: URL
+        let json: Any
+    }
+
+    private static var voiceEmbeddingPayloads: [String: VoiceEmbeddingPayload] = [:]
+    private static let voiceEmbeddingLock = NSLock()
+
+    private static func candidateVoiceEmbeddingURLs(
+        for voiceID: String,
+        cwd: URL,
+        voicesDir: URL
+    ) -> [URL] {
+        [
+            cwd.appendingPathComponent("voices/\(voiceID).json"),
+            cwd.appendingPathComponent("\(voiceID).json"),
+            voicesDir.appendingPathComponent("\(voiceID).json"),
+        ]
+    }
+
+    private static func cachedVoiceEmbeddingPayload(
+        for voiceID: String,
+        candidates: [URL]
+    ) throws -> VoiceEmbeddingPayload {
+        voiceEmbeddingLock.lock()
+        if let payload = voiceEmbeddingPayloads[voiceID] {
+            voiceEmbeddingLock.unlock()
+            return payload
+        }
+        voiceEmbeddingLock.unlock()
+
+        guard let source = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            let checkedPaths = candidates.map { $0.path }.joined(separator: ", ")
+            throw TTSError.modelNotFound(
+                "Voice embedding unavailable for \(voiceID); checked paths: \(checkedPaths)")
+        }
+
+        let data = try Data(contentsOf: source)
+        let json = try JSONSerialization.jsonObject(with: data)
+        let payload = VoiceEmbeddingPayload(sourceURL: source, json: json)
+
+        voiceEmbeddingLock.lock()
+        voiceEmbeddingPayloads[voiceID] = payload
+        voiceEmbeddingLock.unlock()
+
+        return payload
+    }
+
+    private static func parseVoiceEmbeddingVector(
+        _ json: Any,
+        voiceID: String,
+        phonemeCount: Int
+    ) -> [Float]? {
+        func parseArray(_ any: Any) -> [Float]? {
+            if let doubles = any as? [Double] { return doubles.map(Float.init) }
+            if let floats = any as? [Float] { return floats }
+            if let numbers = any as? [NSNumber] { return numbers.map { $0.floatValue } }
+            if let anyArray = any as? [Any] {
+                var out: [Float] = []
+                out.reserveCapacity(anyArray.count)
+                for value in anyArray {
+                    if let num = value as? NSNumber {
+                        out.append(num.floatValue)
+                    } else if let dbl = value as? Double {
+                        out.append(Float(dbl))
+                    } else if let flt = value as? Float {
+                        out.append(flt)
+                    } else {
+                        return nil
+                    }
+                }
+                return out
+            }
+            return nil
+        }
+
+        if let direct = parseArray(json) {
+            return direct
+        }
+
+        guard let dict = json as? [String: Any] else { return nil }
+
+        if let embed = dict["embedding"], let parsed = parseArray(embed) {
+            return parsed
+        }
+
+        if let voiceSpecific = dict[voiceID], let parsed = parseArray(voiceSpecific) {
+            return parsed
+        }
+
+        var numericCandidates: [(Int, [Float])] = []
+        numericCandidates.reserveCapacity(dict.count)
+        for (key, value) in dict {
+            guard let intKey = Int(key), let parsed = parseArray(value) else { continue }
+            numericCandidates.append((intKey, parsed))
+        }
+
+        numericCandidates.sort { $0.0 < $1.0 }
+
+        if let exact = numericCandidates.first(where: { $0.0 == phonemeCount }) {
+            return exact.1
+        }
+
+        if let fallback = numericCandidates.last(where: { $0.0 <= phonemeCount }) {
+            return fallback.1
+        }
+
+        for value in dict.values {
+            if let parsed = parseArray(value) {
+                return parsed
+            }
+        }
+
+        return nil
+    }
 
     // Model and data URLs
     private static func variantDescription(_ variant: ModelNames.TTS.Variant) -> String {
@@ -403,7 +518,6 @@ public struct KokoroSynthesizer {
         return .fifteenSecond
     }
 
-    /// Load voice embedding (simplified for 3-second model)
     public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) async throws -> MLMultiArray {
         let cacheDir = try TtsModels.cacheDirectoryURL()
         let voicesDir = cacheDir.appendingPathComponent("Models/kokoro/voices")
@@ -411,104 +525,54 @@ public struct KokoroSynthesizer {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 
         func resolveVector(for voiceID: String) -> ([Float]?, URL) {
-            let candidates: [URL] = [
-                cwd.appendingPathComponent("voices/\(voiceID).json"),
-                cwd.appendingPathComponent("\(voiceID).json"),
-                voicesDir.appendingPathComponent("\(voiceID).json"),
-            ]
-            guard let source = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
-                return (nil, candidates[0])
-            }
-
-            var vector: [Float]? = nil
+            let candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
             do {
-                let data = try Data(contentsOf: source)
-                let json = try JSONSerialization.jsonObject(with: data)
-
-                func parseArray(_ any: Any) -> [Float]? {
-                    if let doubles = any as? [Double] { return doubles.map(Float.init) }
-                    if let floats = any as? [Float] { return floats }
-                    if let numbers = any as? [NSNumber] { return numbers.map { $0.floatValue } }
-                    if let anyArray = any as? [Any] {
-                        var out: [Float] = []
-                        out.reserveCapacity(anyArray.count)
-                        for value in anyArray {
-                            if let num = value as? NSNumber {
-                                out.append(num.floatValue)
-                            } else if let dbl = value as? Double {
-                                out.append(Float(dbl))
-                            } else if let flt = value as? Float {
-                                out.append(flt)
-                            } else {
-                                return nil
-                            }
-                        }
-                        return out
-                    }
-                    return nil
+                let payload = try cachedVoiceEmbeddingPayload(for: voiceID, candidates: candidates)
+                let vector = parseVoiceEmbeddingVector(payload.json, voiceID: voiceID, phonemeCount: phonemeCount)
+                if vector == nil {
+                    Self.logger.warning(
+                        "Voice embedding payload lacked usable vector for \(voiceID) at \(payload.sourceURL.path)")
                 }
-
-                if let direct = parseArray(json) {
-                    vector = direct
-                } else if let dict = json as? [String: Any] {
-                    if let embed = dict["embedding"], let parsed = parseArray(embed) {
-                        vector = parsed
-                    } else if let voiceSpecific = dict[voiceID], let parsed = parseArray(voiceSpecific) {
-                        vector = parsed
-                    } else {
-                        let numericKeys = dict.keys.compactMap { Int($0) }.sorted()
-                        var chosen: [Float]? = nil
-                        if let exact = dict["\(phonemeCount)"] {
-                            chosen = parseArray(exact)
-                        } else if let key = numericKeys.last(where: { $0 <= phonemeCount }), let fallback = dict["\(key)"] {
-                            chosen = parseArray(fallback)
-                        }
-                        if let parsed = chosen {
-                            vector = parsed
-                        } else if let anyValue = dict.values.first {
-                            vector = parseArray(anyValue)
-                        }
-                    }
-                }
+                return (vector, payload.sourceURL)
             } catch {
-                Self.logger.warning("Failed to parse voice embedding for \(voiceID): \(error.localizedDescription)")
+                Self.logger.warning("Failed to load voice embedding for \(voiceID): \(error.localizedDescription)")
+                return (nil, candidates.first ?? voicesDir)
             }
-
-            return (vector, source)
         }
 
         var voiceUsed = voice
-        var attempted = [voice]
+        var attemptedVoices = [voice]
         var (vector, sourceURL) = resolveVector(for: voice)
 
         if vector == nil && voice != "af_heart" {
             Self.logger.warning("Voice embedding for \(voice) not found; falling back to af_heart")
             voiceUsed = "af_heart"
-            attempted.append("af_heart")
+            attemptedVoices.append("af_heart")
             (vector, sourceURL) = resolveVector(for: voiceUsed)
         }
 
-        guard let vec = vector else {
+        guard let resolvedVector = vector else {
             throw TTSError.modelNotFound(
-                "Voice embedding unavailable for \(attempted.joined(separator: ", ")); checked \(sourceURL.path)")
+                "Voice embedding unavailable for \(attemptedVoices.joined(separator: ", ")); checked \(sourceURL.path)")
         }
 
         let dim = try await KokoroModelCache.shared.referenceEmbeddingDimension()
-        guard vec.count == dim else {
+        guard resolvedVector.count == dim else {
             throw TTSError.modelNotFound(
-                "Voice embedding for \(voiceUsed) has unexpected length (expected \(dim), got \(vec.count))")
+                "Voice embedding for \(voiceUsed) has unexpected length (expected \(dim), got \(resolvedVector.count))")
         }
 
         let embedding = try MLMultiArray(shape: [1, NSNumber(value: dim)] as [NSNumber], dataType: .float32)
         var sumSquares: Float = 0
         for i in 0..<dim {
-            let value = vec[i]
+            let value = resolvedVector[i]
             embedding[i] = NSNumber(value: value)
             sumSquares += value * value
         }
 
         Self.logger.info(
-            "Loaded voice embedding: \(voiceUsed), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(sumSquares))))")
+            "Loaded voice embedding: \(voiceUsed), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(sumSquares))))"
+        )
         return embedding
     }
 
@@ -694,7 +758,6 @@ public struct KokoroSynthesizer {
         let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
         var totalPredictionTime: TimeInterval = 0
         Self.logger.info("Starting audio inference across \(entries.count) chunk(s)")
-
         for (index, entry) in entries.enumerated() {
             let chunk = entry.chunk
             logger.info(
@@ -715,7 +778,7 @@ public struct KokoroSynthesizer {
             chunkTemplates.append(entry.template)
             let chunkDurationSeconds = Double(chunkSamples.count) / Double(sampleRateHz)
             let chunkFrameCount = kokoroFrameSamples > 0 ? chunkSamples.count / kokoroFrameSamples : 0
-                logger.info(
+            logger.info(
                 "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkDurationSeconds))s (\(chunkFrameCount) frames)"
             )
 

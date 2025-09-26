@@ -16,12 +16,12 @@ public struct TTS {
         "Some users only ever generate brief prompts, while others expect multi-paragraph narrations for reports.",
         "Latency tends to spike when processing punctuation-heavy text, so this sentence includes commas, semicolons, and—of course—dashes.",
         "During real-world use, people may speak in long, meandering ways that stretch the models ability to sustain natural cadence and intonation over dozens of words, testing both quality and throughput.",
-        "Short."
+        "Short.",
+        "In the midst of testing how synthetic speech systems perform under stress, we decided to craft an especially long passage that meanders through several interconnected themes—starting with the simple observation that voice interfaces have become part of everyday life, moving into a reflection on how early text-to-speech systems were criticized for sounding robotic and unnatural, drifting further into technical details about neural vocoders, attention mechanisms, and latency bottlenecks in hardware pipelines, and then circling back to the human element: the way people perceive rhythm, tone, and emotion in spoken language, which makes evaluation of generated audio far more complex than measuring raw throughput or accuracy, because speech is not only a vehicle for information but also an instrument of connection, persuasion, and empathy; so when a benchmark sentence grows this long, with commas and semicolons and digressions that twist and turn like winding mountain roads, it becomes an excellent test of whether the synthesizer can maintain not just intelligibility but also coherence, flow, and a sense of natural cadence across dozens and dozens of words without faltering, stuttering, or flattening into monotony.",
+        "After hours of careful preparation, countless revisions to the experiment setup, and no shortage of nervous anticipation, the team finally gathered around the workstation to watch the synthesizer process an unusually long passage of text that meandered across ideas—touching on the history of voice interfaces, the challenges of real-time inference on limited hardware, and the subtle artistry of making synthetic voices sound natural—before concluding with the hopeful reminder that progress, while sometimes slow and uneven, is always worth the patience it demands."
     ]
 
     public static func run(arguments: [String]) async {
-        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart]
-        // [--metrics metrics.json] [--chunk-dir dir]
         var output = "output.wav"
         var voice = "af_heart"
         var metricsPath: String? = nil
@@ -29,7 +29,6 @@ public struct TTS {
         var variantPreference: ModelNames.TTS.Variant? = nil
         var text: String? = nil
         var benchmarkMode = false
-        // Always ensure required files in CLI
 
         var i = 0
         while i < arguments.count {
