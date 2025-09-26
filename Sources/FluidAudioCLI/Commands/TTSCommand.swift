@@ -5,6 +5,26 @@ import Foundation
 public struct TTS {
 
     private static let logger = AppLogger(category: "TTSCommand")
+    private static let artifactsDirectoryName = "fluidaudio_cli"
+
+    private static func ensureArtifactsRoot() throws -> URL {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let root = cwd.appendingPathComponent(artifactsDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private static func resolveOutputURL(
+        _ suppliedPath: String,
+        artifactsRoot: URL,
+        expectsDirectory: Bool
+    ) -> URL {
+        let expanded = (suppliedPath as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded, isDirectory: expectsDirectory)
+        }
+        return artifactsRoot.appendingPathComponent(expanded, isDirectory: expectsDirectory)
+    }
     private static let benchmarkSentences: [String] = [
         "Quick check to measure short output speed.",
         "The new release pipeline needs reliable voice synthesis benchmarks "
@@ -123,13 +143,27 @@ public struct TTS {
             let tSynth1 = Date()
 
             // Write WAV
-            let outURL = URL(fileURLWithPath: output)
+            let outURL = {
+                let expanded = (output as NSString).expandingTildeInPath
+                if expanded.hasPrefix("/") {
+                    return URL(fileURLWithPath: expanded)
+                }
+                let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+                return cwd.appendingPathComponent(expanded)
+            }()
+            try FileManager.default.createDirectory(
+                at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try wav.write(to: outURL)
             logger.info("Saved output WAV: \(outURL.path)")
 
             var chunkFileMap: [Int: String] = [:]
+            let artifactsRoot = try ensureArtifactsRoot()
+
             if let chunkDirectory = chunkDirectory {
-                let dirURL = URL(fileURLWithPath: chunkDirectory, isDirectory: true)
+                let dirURL = resolveOutputURL(
+                    chunkDirectory,
+                    artifactsRoot: artifactsRoot,
+                    expectsDirectory: true)
                 try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
                 for chunk in detailed.chunks {
                     let fileName = String(format: "chunk_%03d.wav", chunk.index)
@@ -271,7 +305,9 @@ public struct TTS {
 
                 // Write JSON
                 let json = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted])
-                let mURL = URL(fileURLWithPath: metricsPath)
+                let mURL = resolveOutputURL(metricsPath, artifactsRoot: artifactsRoot, expectsDirectory: false)
+                try FileManager.default.createDirectory(
+                    at: mURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try json.write(to: mURL)
                 logger.info("Metrics saved: \(mURL.path)")
             }
