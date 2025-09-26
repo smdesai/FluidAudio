@@ -49,16 +49,56 @@ func printUsage() {
     )
 }
 
+// Returns the Mach high-water resident memory footprint for the current process.
+// This captures the peak physical memory, including shared framework pages, rather than
+// the CLI's current or private usage.
+func fetchPeakMemoryUsageBytes() -> UInt64? {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) /
+        mach_msg_type_number_t(MemoryLayout<natural_t>.size)
+
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(
+                mach_task_self_,
+                task_flavor_t(TASK_VM_INFO),
+                $0,
+                &count)
+        }
+    }
+
+    guard result == KERN_SUCCESS else {
+        return nil
+    }
+
+    return info.resident_size_peak
+}
+
+func logPeakMemoryUsage() {
+    guard let peakBytes = fetchPeakMemoryUsageBytes() else {
+        cliLogger.error("Unable to determine peak memory usage")
+        return
+    }
+
+    let peakGigabytes = Double(peakBytes) / 1024.0 / 1024.0 / 1024.0
+    cliLogger.info("Peak memory usage: \(String(format: "%.3f", peakGigabytes)) GB")
+}
+
+func exitWithPeakMemory(_ code: Int32) -> Never {
+    logPeakMemoryUsage()
+    exit(code)
+}
+
 // Main entry point
 let arguments = CommandLine.arguments
 
-guard arguments.count > 1 else {
-    printUsage()
-    exit(1)
-}
-
 // Mirror OSLog messages to console when running CLI
 AppLogger.enableConsoleOutput(true)
+
+guard arguments.count > 1 else {
+    printUsage()
+    exitWithPeakMemory(1)
+}
 
 // Log system information once at application startup
 Task {
@@ -70,6 +110,11 @@ let semaphore = DispatchSemaphore(value: 0)
 
 // Use Task to handle async commands
 Task {
+    defer {
+        logPeakMemoryUsage()
+        semaphore.signal()
+    }
+
     switch command {
     case "vad-benchmark":
         await VadBenchmark.runVadBenchmark(arguments: Array(arguments.dropFirst(2)))
@@ -86,7 +131,7 @@ Task {
             await MultiStreamCommand.run(arguments: Array(arguments.dropFirst(2)))
         } else {
             cliLogger.error("Multi-stream requires macOS 13.0 or later")
-            exit(1)
+            exitWithPeakMemory(1)
         }
         await MultiStreamCommand.run(arguments: Array(arguments.dropFirst(2)))
 
@@ -95,7 +140,7 @@ Task {
             await TTS.run(arguments: Array(arguments.dropFirst(2)))
         } else {
             print("TTS requires macOS 13.0 or later")
-            exit(1)
+            exitWithPeakMemory(1)
         }
 
     case "diarization-benchmark":
@@ -106,14 +151,12 @@ Task {
         await DownloadCommand.run(arguments: Array(arguments.dropFirst(2)))
     case "help", "--help", "-h":
         printUsage()
-        exit(0)
+        exitWithPeakMemory(0)
     default:
         cliLogger.error("Unknown command: \(command)")
         printUsage()
-        exit(1)
+        exitWithPeakMemory(1)
     }
-
-    semaphore.signal()
 }
 
 // Wait for async task to complete
