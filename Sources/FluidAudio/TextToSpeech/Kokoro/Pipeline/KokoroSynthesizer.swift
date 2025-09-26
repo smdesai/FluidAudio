@@ -652,7 +652,8 @@ public struct KokoroSynthesizer {
         voice: String,
         inputIds: [Int32],
         variant: ModelNames.TTS.Variant,
-        targetTokens: Int
+        targetTokens: Int,
+        cachedRefStyle: MLMultiArray? = nil
     ) async throws -> ([Float], TimeInterval) {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
@@ -661,7 +662,12 @@ public struct KokoroSynthesizer {
         let kokoro = try await model(for: variant)
 
         // Get voice embedding
-        let refStyle = try await loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
+        let refStyle: MLMultiArray
+        if let cachedRefStyle {
+            refStyle = cachedRefStyle
+        } else {
+            refStyle = try await loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
+        }
 
         // Pad or truncate to match model expectation
         var trimmedIds = inputIds
@@ -839,6 +845,7 @@ public struct KokoroSynthesizer {
         let crossfadeMs = 8
         let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
         var totalPredictionTime: TimeInterval = 0
+        var voiceEmbeddingCache: [String: MLMultiArray] = [:]
         Self.logger.info("Starting audio inference across \(entries.count) chunk(s)")
         for (index, entry) in entries.enumerated() {
             let chunk = entry.chunk
@@ -846,12 +853,23 @@ public struct KokoroSynthesizer {
                 "Processing chunk \(index + 1)/\(entries.count): \(chunk.words.count) words")
             logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
             logger.info("Chunk \(index + 1) using Kokoro \(variantDescription(entry.template.variant)) model")
+            let phonemeCount = entry.inputIds.count
+            let cacheKey = "\(voice)-\(phonemeCount)"
+            let refStyle: MLMultiArray
+            if let cached = voiceEmbeddingCache[cacheKey] {
+                refStyle = cached
+            } else {
+                let embedding = try await loadVoiceEmbedding(voice: voice, phonemeCount: phonemeCount)
+                voiceEmbeddingCache[cacheKey] = embedding
+                refStyle = embedding
+            }
             let (chunkSamples, predictionTime) = try await synthesizeChunk(
                 entry.chunk,
                 voice: voice,
                 inputIds: entry.inputIds,
                 variant: entry.template.variant,
-                targetTokens: entry.template.targetTokens)
+                targetTokens: entry.template.targetTokens,
+                cachedRefStyle: refStyle)
             totalPredictionTime += predictionTime
             Self.logger.info(
                 "Chunk \(index + 1) model prediction latency: \(String(format: "%.3f", predictionTime))s")
