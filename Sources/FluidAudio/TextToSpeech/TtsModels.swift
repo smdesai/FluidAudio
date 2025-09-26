@@ -28,7 +28,8 @@ public struct TtsModels {
             .kokoro,
             modelNames: modelNames,
             directory: modelsDirectory,
-            computeUnits: .all,
+            // Only a small fraction of the model can run on ANE, and compile time takes a long time because of the complicated arch
+            computeUnits: .cpuAndGPU,
         )
         var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
         for variant in ModelNames.TTS.Variant.allCases {
