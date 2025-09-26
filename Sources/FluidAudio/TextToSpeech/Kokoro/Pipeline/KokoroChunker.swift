@@ -18,6 +18,7 @@ struct TextChunk {
 enum KokoroChunker {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
     private static let decimalDigits = CharacterSet.decimalDigits
+    private static let apostropheCharacters: Set<Character> = ["'", "’", "ʼ", "‛", "‵", "′"]
     /// Public entry point used by `KokoroSynthesizer`
     static func chunk(
         text: String,
@@ -311,8 +312,8 @@ enum KokoroChunker {
                 continue
             }
 
-            if ch.isLetter || ch.isNumber || ch == "'" {
-                currentWord.append(ch)
+            if ch.isLetter || ch.isNumber || apostropheCharacters.contains(ch) {
+                currentWord.append(apostropheCharacters.contains(ch) ? "'" : ch)
             } else {
                 flushWord()
                 atoms.append(AtomToken(text: String(ch), kind: .punctuation(String(ch))))
