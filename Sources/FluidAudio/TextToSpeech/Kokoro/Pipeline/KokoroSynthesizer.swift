@@ -79,6 +79,20 @@ public struct KokoroSynthesizer {
         let template: ChunkInfoTemplate
     }
 
+    private struct TokenCapacities {
+        let short: Int
+        let long: Int
+
+        func capacity(for variant: ModelNames.TTS.Variant) -> Int {
+            switch variant {
+            case .fiveSecond:
+                return short
+            case .fifteenSecond:
+                return long
+            }
+        }
+    }
+
     // Cached CoreML models per Kokoro variant
     // Legacy: Phoneme dictionary with frame counts (kept for backward compatibility)
     private actor LexiconCache {
@@ -151,7 +165,13 @@ public struct KokoroSynthesizer {
         let json: Any
     }
 
+    private struct VoiceEmbeddingCacheKey: Hashable {
+        let voiceID: String
+        let phonemeCount: Int
+    }
+
     private static var voiceEmbeddingPayloads: [String: VoiceEmbeddingPayload] = [:]
+    private static var voiceEmbeddingVectors: [VoiceEmbeddingCacheKey: [Float]] = [:]
     private static let voiceEmbeddingLock = NSLock()
 
     private static func candidateVoiceEmbeddingURLs(
@@ -192,6 +212,26 @@ public struct KokoroSynthesizer {
         voiceEmbeddingLock.unlock()
 
         return payload
+    }
+
+    private static func cachedVoiceEmbeddingVector(for key: VoiceEmbeddingCacheKey) -> [Float]? {
+        voiceEmbeddingLock.lock()
+        let vector = voiceEmbeddingVectors[key]
+        voiceEmbeddingLock.unlock()
+        return vector
+    }
+
+    private static func storeVoiceEmbeddingVector(_ vector: [Float], for key: VoiceEmbeddingCacheKey) {
+        voiceEmbeddingLock.lock()
+        voiceEmbeddingVectors[key] = vector
+        voiceEmbeddingLock.unlock()
+    }
+
+    private static func isVoiceEmbeddingPayloadCached(for voiceID: String) -> Bool {
+        voiceEmbeddingLock.lock()
+        let cached = voiceEmbeddingPayloads[voiceID] != nil
+        voiceEmbeddingLock.unlock()
+        return cached
     }
 
     private static func parseVoiceEmbeddingVector(
@@ -380,17 +420,17 @@ public struct KokoroSynthesizer {
     /// Chunk text into segments under the model token budget, using punctuation-driven pauses.
     private static func chunkText(
         _ text: String,
-        vocabulary: [String: Int32]
+        vocabulary: [String: Int32],
+        longVariantTokenBudget: Int
     ) async throws -> [TextChunk] {
         try await loadSimplePhonemeDictionary()
-        let target = try await tokenLength(for: .fifteenSecond)
         let hasLang = false
         let lexicons = await lexiconCache.lexicons()
         return KokoroChunker.chunk(
             text: text,
             wordToPhonemes: lexicons.word,
             caseSensitiveLexicon: lexicons.caseSensitive,
-            targetTokens: target,
+            targetTokens: longVariantTokenBudget,
             hasLanguageToken: hasLang,
             allowedPhonemes: Set(vocabulary.keys)
         )
@@ -399,8 +439,9 @@ public struct KokoroSynthesizer {
     private static func buildChunkEntries(
         from chunks: [TextChunk],
         vocabulary: [String: Int32],
-        preference: ModelNames.TTS.Variant?
-    ) async throws -> [ChunkEntry] {
+        preference: ModelNames.TTS.Variant?,
+        capacities: TokenCapacities
+    ) throws -> [ChunkEntry] {
         var entries: [ChunkEntry] = []
         entries.reserveCapacity(chunks.count)
 
@@ -411,8 +452,12 @@ public struct KokoroSynthesizer {
                 throw TTSError.processingFailed(
                     "No input IDs generated for chunk: \(joinedWords)")
             }
-            let variant = try await selectVariant(forTokenCount: inputIds.count, preference: preference)
-            let targetTokens = try await tokenLength(for: variant)
+            let variant = try selectVariant(
+                forTokenCount: inputIds.count,
+                preference: preference,
+                capacities: capacities
+            )
+            let targetTokens = capacities.capacity(for: variant)
             let template = ChunkInfoTemplate(
                 index: index,
                 text: chunk.text,
@@ -479,12 +524,19 @@ public struct KokoroSynthesizer {
         try await KokoroModelCache.shared.tokenLength(for: variant)
     }
 
+    private static func tokenCapacities() async throws -> TokenCapacities {
+        async let short = tokenLength(for: .fiveSecond)
+        async let long = tokenLength(for: .fifteenSecond)
+        return try await TokenCapacities(short: short, long: long)
+    }
+
     private static func selectVariant(
         forTokenCount tokenCount: Int,
-        preference: ModelNames.TTS.Variant?
-    ) async throws -> ModelNames.TTS.Variant {
+        preference: ModelNames.TTS.Variant?,
+        capacities: TokenCapacities
+    ) throws -> ModelNames.TTS.Variant {
         if let preference {
-            let capacity = try await tokenLength(for: preference)
+            let capacity = capacities.capacity(for: preference)
             if tokenCount <= capacity {
                 return preference
             }
@@ -499,8 +551,8 @@ public struct KokoroSynthesizer {
             }
             // fall through to automatic selection
         }
-        let shortCapacity = try await tokenLength(for: .fiveSecond)
-        let longCapacity = try await tokenLength(for: .fifteenSecond)
+        let shortCapacity = capacities.short
+        let longCapacity = capacities.long
         guard tokenCount <= longCapacity else {
             throw TTSError.processingFailed(
                 "Chunk token count \(tokenCount) exceeds supported capacities (short=\(shortCapacity), long=\(longCapacity))"
@@ -528,8 +580,14 @@ public struct KokoroSynthesizer {
             let candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
             do {
                 let payload = try cachedVoiceEmbeddingPayload(for: voiceID, candidates: candidates)
+                let key = VoiceEmbeddingCacheKey(voiceID: voiceID, phonemeCount: phonemeCount)
+                if let cachedVector = Self.cachedVoiceEmbeddingVector(for: key) {
+                    return (cachedVector, payload.sourceURL)
+                }
                 let vector = parseVoiceEmbeddingVector(payload.json, voiceID: voiceID, phonemeCount: phonemeCount)
-                if vector == nil {
+                if let vector {
+                    Self.storeVoiceEmbeddingVector(vector, for: key)
+                } else {
                     Self.logger.warning(
                         "Voice embedding payload lacked usable vector for \(voiceID) at \(payload.sourceURL.path)")
                 }
@@ -621,20 +679,28 @@ public struct KokoroSynthesizer {
 
         // Create model inputs
         let inputArray = try MLMultiArray(shape: [1, NSNumber(value: targetTokens)] as [NSNumber], dataType: .int32)
-        for (i, id) in trimmedIds.enumerated() {
-            inputArray[i] = NSNumber(value: id)
+        let inputPointer = inputArray.dataPointer.bindMemory(to: Int32.self, capacity: targetTokens)
+        inputPointer.initialize(repeating: 0, count: targetTokens)
+        trimmedIds.withUnsafeBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            inputPointer.update(from: baseAddress, count: buffer.count)
         }
 
         // Create attention mask (1 for real tokens up to original count, 0 for padding)
         let attentionMask = try MLMultiArray(shape: [1, NSNumber(value: targetTokens)] as [NSNumber], dataType: .int32)
+        let maskPointer = attentionMask.dataPointer.bindMemory(to: Int32.self, capacity: targetTokens)
+        maskPointer.initialize(repeating: 0, count: targetTokens)
         let trueLen = min(inputIds.count, targetTokens)
-        for i in 0..<targetTokens {
-            attentionMask[i] = NSNumber(value: i < trueLen ? 1 : 0)
+        if trueLen > 0 {
+            for idx in 0..<trueLen {
+                maskPointer[idx] = 1
+            }
         }
 
         // Use zeros for phases for determinism (works well for 3s model)
         let phasesArray = try MLMultiArray(shape: [1, 9] as [NSNumber], dataType: .float32)
-        for i in 0..<9 { phasesArray[i] = 0 }
+        let phasesPointer = phasesArray.dataPointer.bindMemory(to: Float.self, capacity: 9)
+        phasesPointer.initialize(repeating: 0, count: 9)
 
         // Debug: print model IO
 
@@ -685,9 +751,17 @@ public struct KokoroSynthesizer {
         }
 
         // Convert to float samples
-        var samples: [Float] = []
-        for i in 0..<effectiveCount {
-            samples.append(audioArrayUnwrapped[i].floatValue)
+        let samples: [Float]
+        if audioArrayUnwrapped.dataType == .float32 {
+            let sourcePointer = audioArrayUnwrapped.dataPointer.bindMemory(to: Float.self, capacity: audioArrayUnwrapped.count)
+            samples = Array(UnsafeBufferPointer(start: sourcePointer, count: effectiveCount))
+        } else {
+            var fallback: [Float] = []
+            fallback.reserveCapacity(effectiveCount)
+            for i in 0..<effectiveCount {
+                fallback.append(audioArrayUnwrapped[i].floatValue)
+            }
+            samples = fallback
         }
 
         // Basic sanity logging
@@ -730,7 +804,9 @@ public struct KokoroSynthesizer {
         logger.info("Input length: \(text.count) characters")
 
         try await ensureRequiredFiles()
-        try? await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: voice)
+        if !isVoiceEmbeddingPayloadCached(for: voice) {
+            try? await VoiceEmbeddingDownloader.ensureVoiceEmbedding(voice: voice)
+        }
 
         try await loadModel()
 
@@ -739,16 +815,22 @@ public struct KokoroSynthesizer {
         try await validateTextHasDictionaryCoverage(text)
 
         let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
+        let capacities = try await tokenCapacities()
 
-        let chunks = try await chunkText(text, vocabulary: vocabulary)
+        let chunks = try await chunkText(
+            text,
+            vocabulary: vocabulary,
+            longVariantTokenBudget: capacities.long
+        )
         guard !chunks.isEmpty else {
             throw TTSError.processingFailed("No valid words found in text")
         }
 
-        let entries = try await buildChunkEntries(
+        let entries = try buildChunkEntries(
             from: chunks,
             vocabulary: vocabulary,
-            preference: variantPreference
+            preference: variantPreference,
+            capacities: capacities
         )
 
         var allSamples: [Float] = []
