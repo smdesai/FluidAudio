@@ -85,7 +85,7 @@ actor LogConsole {
     private var enabled: Bool = {
         #if DEBUG
         // Enable console output for debug builds by default
-        return false
+        return true
         #else
         // Allow environment variable to toggle without code changes for non-debug builds
         return false
