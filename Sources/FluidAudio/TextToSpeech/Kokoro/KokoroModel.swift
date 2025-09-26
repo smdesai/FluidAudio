@@ -357,11 +357,11 @@ public struct KokoroModel {
             let minId = vocabulary.values.min() ?? 0
             let outOfRange = ids.filter { $0 != 0 && ($0 < minId || $0 > maxId) }
             if !outOfRange.isEmpty {
-                print(
-                    "Warning: Found \(outOfRange.count) token IDs out of range [\(minId), \(maxId)] (excluding BOS/EOS=0)"
+                Self.logger.warning(
+                    "Found \(outOfRange.count) token IDs out of range [\(minId), \(maxId)] (excluding BOS/EOS=0)"
                 )
             }
-            print("Tokenized \(ids.count) ids; first 32: \(ids.prefix(32))")
+            Self.logger.debug("Tokenized \(ids.count) ids; first 32: \(ids.prefix(32))")
         }
         #endif
 
@@ -581,8 +581,8 @@ public struct KokoroModel {
         let predictionStart = Date()
         let output = try await kokoro.compatPrediction(from: modelInput, options: MLPredictionOptions())
         let predictionTime = Date().timeIntervalSince(predictionStart)
-        print(
-            "[PERF] Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"
+        Self.logger.notice(
+            "Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"
         )
 
         // Extract audio output explicitly by key used by model

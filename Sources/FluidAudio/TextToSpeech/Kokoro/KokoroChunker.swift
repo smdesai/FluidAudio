@@ -18,15 +18,6 @@ struct TextChunk {
 enum KokoroChunker {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
     private static let decimalDigits = CharacterSet.decimalDigits
-    private static let spelledOutFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.numberStyle = .spellOut
-        formatter.maximumFractionDigits = 0
-        formatter.roundingMode = .down
-        return formatter
-    }()
-
     /// Public entry point used by `KokoroModel`
     static func chunk(
         text: String,
@@ -663,7 +654,12 @@ enum KokoroChunker {
             return nil
         }
         guard let value = Int(token) else { return nil }
-        guard let spelled = spelledOutFormatter.string(from: NSNumber(value: value)) else { return nil }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .spellOut
+        formatter.maximumFractionDigits = 0
+        formatter.roundingMode = .down
+        guard let spelled = formatter.string(from: NSNumber(value: value)) else { return nil }
         let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-"))
         let components =
             spelled

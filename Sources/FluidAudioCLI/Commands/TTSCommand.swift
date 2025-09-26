@@ -4,6 +4,8 @@ import Foundation
 @available(macOS 13.0, *)
 public struct TTS {
 
+    private static let logger = AppLogger(category: "TTSCommand")
+
     public static func run(arguments: [String]) async {
         // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json] [--chunk-dir dir]
         guard !arguments.isEmpty else {
@@ -163,8 +165,8 @@ public struct TTS {
                         let chunkSeconds = Double(chunk.samples.count) / 24_000.0
                         let frameCount = frameSamples > 0 ? chunk.samples.count / frameSamples : 0
                         totalChunkSamples += chunk.samples.count
-                        print(
-                            String(format: "Chunk %d duration: %.3fs (%d frames)", index + 1, chunkSeconds, frameCount))
+                        logger.info(
+                            "Chunk \(index + 1) duration: \(String(format: "%.3f", chunkSeconds))s (\(frameCount) frames)")
                     }
                     let chunkMetrics = detailed.chunks.map { chunk -> [String: Any] in
                         var entry: [String: Any] = [
@@ -197,12 +199,12 @@ public struct TTS {
                     }
                     metricsDict["chunks"] = chunkMetrics
                     let totalFrames = frameSamples > 0 ? totalChunkSamples / frameSamples : 0
-                    print(String(format: "Total audio duration: %.3fs (%d frames)", audioSecs, totalFrames))
+                    logger.info(
+                        "Total audio duration: \(String(format: "%.3f", audioSecs))s (\(totalFrames) frames)")
                 } else {
-                    print(
-                        String(
-                            format: "Total audio duration: %.3fs (%d frames)", audioSecs,
-                            Int((audioSecs * 24_000.0) / 600.0)))
+                    let frames = Int((audioSecs * 24_000.0) / 600.0)
+                    logger.info(
+                        "Total audio duration: \(String(format: "%.3f", audioSecs))s (\(frames) frames)")
                 }
 
                 let dict: [String: Any] = [
@@ -216,7 +218,7 @@ public struct TTS {
                 let json = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted])
                 let mURL = URL(fileURLWithPath: metricsPath)
                 try json.write(to: mURL)
-                print("\nMetrics saved: \(mURL.path)")
+                logger.info("Metrics saved: \(mURL.path)")
             }
         } catch {
             print("Error: \(error.localizedDescription)")

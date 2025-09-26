@@ -3,6 +3,8 @@ import Foundation
 /// Downloads voice embeddings from HuggingFace
 public enum VoiceEmbeddingDownloader {
 
+    private static let logger = AppLogger(category: "VoiceEmbeddingDownloader")
+
     /// Download a voice embedding JSON file from HuggingFace
     public static func downloadVoiceEmbedding(voice: String) async throws -> Data {
         // Try to download pre-converted JSON first
@@ -16,14 +18,16 @@ public enum VoiceEmbeddingDownloader {
                 if let httpResponse = response as? HTTPURLResponse,
                     httpResponse.statusCode == 200
                 {
-                    print("Downloaded voice embedding: \(voice).json from HuggingFace")
+                    logger.info("Downloaded voice embedding JSON for \(voice)")
                     return data
                 }
             } catch {
                 // JSON not available, try to download .pt file
-                print("Could not download \(voice).json: \(error.localizedDescription)")
+                logger.warning("Could not download \(voice).json: \(error.localizedDescription)")
             }
         }
+
+        var downloadedPtPath: String?
 
         // Download the .pt file for future conversion
         let ptURL = "https://huggingface.co/FluidInference/kokoro-82m-coreml/resolve/main/voices/\(voice).pt"
@@ -42,25 +46,25 @@ public enum VoiceEmbeddingDownloader {
 
                     let ptFileURL = voicesDir.appendingPathComponent("\(voice).pt")
                     try ptData.write(to: ptFileURL)
-                    print("Downloaded voice embedding .pt file: \(voice).pt (\(ptData.count) bytes)")
-                    print("Note: Run 'python3 extract_voice_embeddings.py' to convert .pt to JSON format")
+                    downloadedPtPath = ptFileURL.path
+                    logger.info(
+                        "Downloaded voice embedding .pt file for \(voice) (\(ptData.count) bytes)")
+                    logger.notice(
+                        "Run 'python3 extract_voice_embeddings.py' to convert \(voice).pt to JSON format"
+                    )
                 }
             } catch {
-                print("Could not download \(voice).pt: \(error.localizedDescription)")
+                logger.warning("Could not download \(voice).pt: \(error.localizedDescription)")
             }
         }
 
-        // For now, return a default embedding
-        print("Using default voice embedding for \(voice)")
-
-        // Create default embedding (128 random values)
-        var embedding: [Float] = []
-        for _ in 0..<128 {
-            embedding.append(Float.random(in: -0.1...0.1))
+        if let path = downloadedPtPath {
+            throw TTSError.processingFailed(
+                "Voice embedding JSON unavailable for \(voice). Downloaded .pt to \(path); run 'python3 extract_voice_embeddings.py' to convert it."
+            )
         }
 
-        let json = [voice: embedding]
-        return try JSONSerialization.data(withJSONObject: json)
+        throw TTSError.modelNotFound("Voice embedding JSON for \(voice)")
     }
 
     /// Ensure a voice embedding is available in cache
@@ -82,6 +86,6 @@ public enum VoiceEmbeddingDownloader {
         // Try to download
         let data = try await downloadVoiceEmbedding(voice: voice)
         try data.write(to: jsonURL)
-        print("Voice embedding cached: \(voice)")
+        logger.info("Voice embedding cached: \(voice)")
     }
 }
