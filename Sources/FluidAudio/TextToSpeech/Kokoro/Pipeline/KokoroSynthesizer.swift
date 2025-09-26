@@ -531,7 +531,7 @@ public struct KokoroSynthesizer {
         inputIds: [Int32],
         variant: ModelNames.TTS.Variant,
         targetTokens: Int
-    ) async throws -> [Float] {
+    ) async throws -> ([Float], TimeInterval) {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
         }
@@ -582,14 +582,9 @@ public struct KokoroSynthesizer {
             "random_phases": phasesArray,
         ])
 
-        // Time ONLY the model prediction
         let predictionStart = Date()
         let output = try await kokoro.compatPrediction(from: modelInput, options: MLPredictionOptions())
         let predictionTime = Date().timeIntervalSince(predictionStart)
-        Self.logger.notice(
-            "Pure model.prediction() time: \(String(format: "%.3f", predictionTime))s (variant=\(variantDescription(variant)))"
-        )
-
         // Extract audio output explicitly by key used by model
         guard let audioArrayUnwrapped = output.featureValue(for: "audio")?.multiArrayValue,
             audioArrayUnwrapped.count > 0
@@ -640,7 +635,7 @@ public struct KokoroSynthesizer {
             logger.info("Audio range: [\(String(format: "%.4f", minVal)), \(String(format: "%.4f", maxVal))]")
         }
 
-        return samples
+        return (samples, predictionTime)
     }
 
     /// Main synthesis function returning audio bytes only.
@@ -649,11 +644,14 @@ public struct KokoroSynthesizer {
         voice: String = "af_heart",
         variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws -> Data {
+        let startTime = Date()
         let result = try await synthesizeDetailed(
             text: text,
             voice: voice,
             variantPreference: variantPreference
         )
+        let totalTime = Date().timeIntervalSince(startTime)
+        Self.logger.info("Total synthesis time: \(String(format: "%.3f", totalTime))s for \(text.count) characters")
         return result.audio
     }
 
@@ -663,7 +661,6 @@ public struct KokoroSynthesizer {
         voice: String = "af_heart",
         variantPreference: ModelNames.TTS.Variant? = nil
     ) async throws -> SynthesisResult {
-        let synthesisStart = Date()
 
         logger.info("Starting synthesis: '\(text)'")
         logger.info("Input length: \(text.count) characters")
@@ -675,10 +672,7 @@ public struct KokoroSynthesizer {
 
         try await loadSimplePhonemeDictionary()
 
-
         try await validateTextHasDictionaryCoverage(text)
-
-
 
         let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
 
@@ -698,6 +692,8 @@ public struct KokoroSynthesizer {
         var chunkSampleBuffers: [[Float]] = []
         let crossfadeMs = 8
         let crossfadeN = max(0, Int(Double(crossfadeMs) * 24.0))
+        var totalPredictionTime: TimeInterval = 0
+        Self.logger.info("Starting audio inference across \(entries.count) chunk(s)")
 
         for (index, entry) in entries.enumerated() {
             let chunk = entry.chunk
@@ -705,12 +701,15 @@ public struct KokoroSynthesizer {
                 "Processing chunk \(index + 1)/\(entries.count): \(chunk.words.count) words")
             logger.info("Chunk \(index + 1) text: '\(entry.template.text)'")
             logger.info("Chunk \(index + 1) using Kokoro \(variantDescription(entry.template.variant)) model")
-            let chunkSamples = try await synthesizeChunk(
+            let (chunkSamples, predictionTime) = try await synthesizeChunk(
                 entry.chunk,
                 voice: voice,
                 inputIds: entry.inputIds,
                 variant: entry.template.variant,
                 targetTokens: entry.template.targetTokens)
+            totalPredictionTime += predictionTime
+            Self.logger.info(
+                "Chunk \(index + 1) model prediction latency: \(String(format: "%.3f", predictionTime))s")
 
             chunkSampleBuffers.append(chunkSamples)
             chunkTemplates.append(entry.template)
@@ -780,14 +779,9 @@ public struct KokoroSynthesizer {
             )
         }
 
-        let totalTime = Date().timeIntervalSince(synthesisStart)
-        Self.logger.info("Synthesis complete in \(String(format: "%.3f", totalTime))s")
-        Self.logger.info("Audio size: \(audioData.count) bytes")
-        Self.logger.info("Total samples: \(allSamples.count)")
-        let totalDurationSeconds = Double(allSamples.count) / Double(sampleRateHz)
-        let totalFrameCount = Self.kokoroFrameSamples > 0 ? allSamples.count / Self.kokoroFrameSamples : 0
-        Self.logger.info("Total duration: \(String(format: "%.3f", totalDurationSeconds))s (\(totalFrameCount) frames)")
-
+        Self.logger.notice(
+            "Total model prediction time: \(String(format: "%.3f", totalPredictionTime))s for \(entries.count) chunk(s)"
+        )
         return SynthesisResult(audio: audioData, chunks: chunkInfos)
     }
 

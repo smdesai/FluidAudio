@@ -5,25 +5,36 @@ import Foundation
 public struct TTS {
 
     private static let logger = AppLogger(category: "TTSCommand")
+    private static let benchmarkSentences: [String] = [
+        "Quick check to measure short output speed.",
+        "The new release pipeline needs reliable voice synthesis benchmarks "
+            + "to track regressions in latency and throughput across updates.",
+        "I can't believe we finally made it to the summit after climbing for twelve exhausting hours "
+            + "through wind and rain, but wow, this view of the endless mountain ranges stretching to the horizon "
+            + "makes every single difficult step completely worth the journey.",
+        "Benchmarking medium-length sentences helps reveal how the system balances clarity with speed.",
+        "Some users only ever generate brief prompts, while others expect multi-paragraph narrations for reports.",
+        "Latency tends to spike when processing punctuation-heavy text, so this sentence includes commas, semicolons, and—of course—dashes.",
+        "During real-world use, people may speak in long, meandering ways that stretch the models ability to sustain natural cadence and intonation over dozens of words, testing both quality and throughput.",
+        "Short."
+    ]
 
     public static func run(arguments: [String]) async {
-        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart] [--metrics metrics.json] [--chunk-dir dir]
-        guard !arguments.isEmpty else {
-            printUsage()
-            return
-        }
-
-        let text = arguments[0]
+        // Usage: fluidaudio tts "text" [--output file.wav] [--voice af_heart]
+        // [--metrics metrics.json] [--chunk-dir dir]
         var output = "output.wav"
         var voice = "af_heart"
         var metricsPath: String? = nil
         var chunkDirectory: String? = nil
         var variantPreference: ModelNames.TTS.Variant? = nil
+        var text: String? = nil
+        var benchmarkMode = false
         // Always ensure required files in CLI
 
-        var i = 1
+        var i = 0
         while i < arguments.count {
-            switch arguments[i] {
+            let argument = arguments[i]
+            switch argument {
             case "--help", "-h":
                 printUsage()
                 return
@@ -63,11 +74,32 @@ public struct TTS {
             case "--auto-download":
                 // No-op: downloads are always ensured by the CLI
                 ()
+            case "--benchmark":
+                benchmarkMode = true
             default:
-                // Unknown flag; ignore for forward-compat
-                ()
+                if text == nil {
+                    text = argument
+                } else {
+                    logger.warning("Ignoring unexpected argument '\(argument)'")
+                }
             }
             i += 1
+        }
+
+        if benchmarkMode {
+            await runBenchmark(
+                outputPath: output,
+                voice: voice,
+                metricsPath: metricsPath,
+                chunkDirectory: chunkDirectory,
+                variantPreference: variantPreference
+            )
+            return
+        }
+
+        guard let text = text else {
+            printUsage()
+            return
         }
 
         do {
@@ -257,6 +289,7 @@ public struct TTS {
             Options:
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart)
+              --benchmark          Run a predefined benchmarking suite with multiple sentences
               --variant            Force Kokoro 5s or 15s model (values: 5s,15s)
               --metrics            Write timing metrics to a JSON file (also runs ASR for evaluation)
               --chunk-dir          Directory where individual chunk WAVs will be written
@@ -264,5 +297,275 @@ public struct TTS {
               --help, -h           Show this help
             """
         )
+    }
+}
+
+@available(macOS 13.0, *)
+extension TTS {
+    private struct BenchmarkResult {
+        let text: String
+        let audioDuration: Double
+        let synthesisDuration: Double
+        let rtf: Double
+        let rtfx: Double
+        let outputPath: String?
+    }
+
+    private static func runBenchmark(
+        outputPath: String,
+        voice: String,
+        metricsPath: String?,
+        chunkDirectory: String?,
+        variantPreference: ModelNames.TTS.Variant?
+    ) async {
+        do {
+            let manager = TtSManager()
+
+            let initStart = Date()
+            try await manager.initialize()
+            let initEnd = Date()
+
+            let requestedVoice = voice.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedVoice = requestedVoice.isEmpty ? nil : requestedVoice
+            let usedVoice = normalizedVoice ?? "af_heart"
+
+            var results: [BenchmarkResult] = []
+            var totalAudioDuration: Double = 0
+            var totalSynthesisDuration: Double = 0
+
+            for (index, sentence) in benchmarkSentences.enumerated() {
+                let synthStart = Date()
+                let detailed = try await manager.synthesizeDetailed(
+                    text: sentence,
+                    voice: normalizedVoice,
+                    variantPreference: variantPreference
+                )
+                let synthEnd = Date()
+
+                let audioDuration = audioDurationSeconds(for: detailed)
+                let synthesisDuration = synthEnd.timeIntervalSince(synthStart)
+                let rtf = audioDuration > 0 ? synthesisDuration / audioDuration : 0
+                let rtfx = synthesisDuration > 0 ? audioDuration / synthesisDuration : 0
+
+                let sampleOutputURL = benchmarkOutputURL(basePath: outputPath, index: index)
+                try detailed.audio.write(to: sampleOutputURL)
+                logger.info("Saved benchmark sample \(index + 1) to \(sampleOutputURL.path)")
+
+                if let chunkDirectory {
+                    try writeChunks(
+                        detailed: detailed,
+                        baseDirectory: chunkDirectory,
+                        sampleIndex: index
+                    )
+                }
+
+                let result = BenchmarkResult(
+                    text: sentence,
+                    audioDuration: audioDuration,
+                    synthesisDuration: synthesisDuration,
+                    rtf: rtf,
+                    rtfx: rtfx,
+                    outputPath: sampleOutputURL.path
+                )
+
+                totalAudioDuration += audioDuration
+                totalSynthesisDuration += synthesisDuration
+                results.append(result)
+            }
+
+            printBenchmarkTable(
+                voice: usedVoice,
+                initializationDuration: initEnd.timeIntervalSince(initStart),
+                results: results,
+                totalAudioDuration: totalAudioDuration,
+                totalSynthesisDuration: totalSynthesisDuration,
+                variantPreference: variantPreference
+            )
+
+            if let metricsPath {
+                try writeBenchmarkMetrics(
+                    to: metricsPath,
+                    initializationDuration: initEnd.timeIntervalSince(initStart),
+                    voice: usedVoice,
+                    variantPreference: variantPreference,
+                    results: results,
+                    totalAudioDuration: totalAudioDuration,
+                    totalSynthesisDuration: totalSynthesisDuration
+                )
+            }
+        } catch {
+            logger.error("Benchmark run failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func benchmarkOutputURL(basePath: String, index: Int) -> URL {
+        let baseURL = URL(fileURLWithPath: basePath)
+        let directoryURL: URL
+        let fileStem: String
+        let fileExtension: String
+
+        if baseURL.pathExtension.isEmpty {
+            directoryURL = baseURL.deletingLastPathComponent()
+            fileStem = baseURL.lastPathComponent.isEmpty ? "output" : baseURL.lastPathComponent
+            fileExtension = "wav"
+        } else {
+            directoryURL = baseURL.deletingLastPathComponent()
+            fileStem = baseURL.deletingPathExtension().lastPathComponent
+            fileExtension = baseURL.pathExtension
+        }
+
+        let fileName = String(format: "%@_benchmark_%02d.%@", fileStem, index + 1, fileExtension)
+        if directoryURL.path.isEmpty {
+            return URL(fileURLWithPath: fileName)
+        }
+        return directoryURL.appendingPathComponent(fileName)
+    }
+
+    private static func audioDurationSeconds(for detailed: KokoroSynthesizer.SynthesisResult) -> Double {
+        let totalSamples = detailed.chunks.reduce(0) { $0 + $1.samples.count }
+        if totalSamples > 0 {
+            return Double(totalSamples) / 24_000.0
+        }
+
+        let bytes = detailed.audio.count
+        let payload = max(0, bytes - 44)
+        return Double(payload) / Double(24_000 * 2)
+    }
+
+    private static func writeChunks(
+        detailed: KokoroSynthesizer.SynthesisResult,
+        baseDirectory: String,
+        sampleIndex: Int
+    ) throws {
+        let baseURL = URL(fileURLWithPath: baseDirectory, isDirectory: true)
+        let sampleDirectory = baseURL.appendingPathComponent(
+            String(format: "sample_%02d", sampleIndex + 1), isDirectory: true)
+        try FileManager.default.createDirectory(at: sampleDirectory, withIntermediateDirectories: true)
+
+        for chunk in detailed.chunks {
+            let fileName = String(format: "chunk_%03d.wav", chunk.index)
+            let fileURL = sampleDirectory.appendingPathComponent(fileName)
+            let chunkData = try AudioWAV.data(from: chunk.samples, sampleRate: 24_000)
+            try chunkData.write(to: fileURL)
+        }
+    }
+
+    private static func printBenchmarkTable(
+        voice: String,
+        initializationDuration: TimeInterval,
+        results: [BenchmarkResult],
+        totalAudioDuration: Double,
+        totalSynthesisDuration: Double,
+        variantPreference: ModelNames.TTS.Variant?
+    ) {
+        let indexWidth = 6
+        let charsWidth = 8
+        let durationWidth = 12
+        let ratioWidth = 10
+
+        print("")
+        let initString = String(format: "%.3fs", initializationDuration)
+        print("TTS benchmark for voice \(voice) (warm-up took an extra \(initString))")
+        if let variantPreference {
+            print("Variant preference: \(variantPreferenceLabel(variantPreference))")
+        }
+
+        let header = [
+            padded("Test", width: indexWidth),
+            padded("Chars", width: charsWidth),
+            padded("Ouput (s)", width: durationWidth),
+            padded("Inf(s)", width: durationWidth),
+            padded("RTFx", width: ratioWidth),
+        ].joined(separator: " ")
+        print(header)
+
+        for (index, result) in results.enumerated() {
+            let audioString = formattedRatio(result.audioDuration)
+            let synthString = formattedRatio(result.synthesisDuration)
+            let rtfxString = "\(formattedRatio(result.rtfx))x"
+
+            let row = [
+                padded(String(index + 1), width: indexWidth),
+                padded(String(result.text.count), width: charsWidth),
+                padded(audioString, width: durationWidth),
+                padded(synthString, width: durationWidth),
+                padded(rtfxString, width: ratioWidth),
+            ].joined(separator: " ")
+            print(row)
+        }
+
+        let totalRTFx = totalSynthesisDuration > 0 ? totalAudioDuration / totalSynthesisDuration : 0
+        let totalRow = [
+            padded("Total", width: indexWidth),
+            padded("-", width: charsWidth),
+            padded(String(format: "%.3f", totalAudioDuration), width: durationWidth),
+            padded(String(format: "%.3f", totalSynthesisDuration), width: durationWidth),
+            padded(formattedRatio(totalRTFx), width: ratioWidth),
+        ].joined(separator: " ")
+        print(totalRow)
+        print("")
+    }
+
+    private static func writeBenchmarkMetrics(
+        to metricsPath: String,
+        initializationDuration: TimeInterval,
+        voice: String,
+        variantPreference: ModelNames.TTS.Variant?,
+        results: [BenchmarkResult],
+        totalAudioDuration: Double,
+        totalSynthesisDuration: Double
+    ) throws {
+        let runs: [[String: Any]] = results.enumerated().map { index, result in
+            var entry: [String: Any] = [
+                "index": index + 1,
+                "text": result.text,
+                "character_count": result.text.count,
+                "audio_duration_s": result.audioDuration,
+                "synthesis_time_s": result.synthesisDuration,
+                "rtf": result.rtf,
+                "rtfx": result.rtfx,
+            ]
+
+            if let outputPath = result.outputPath {
+                entry["output"] = outputPath
+            }
+
+            return entry
+        }
+
+        var dictionary: [String: Any] = [
+            "voice": voice,
+            "runs": runs,
+            "total_audio_duration_s": totalAudioDuration,
+            "total_synthesis_time_s": totalSynthesisDuration,
+            "initialization_time_s": initializationDuration,
+        ]
+
+        if let variantPreference {
+            dictionary["variant_preference"] = variantPreferenceLabel(variantPreference)
+        }
+
+        let json = try JSONSerialization.data(withJSONObject: dictionary, options: [.prettyPrinted])
+        try json.write(to: URL(fileURLWithPath: metricsPath))
+        logger.info("Benchmark metrics saved to \(metricsPath)")
+    }
+
+    private static func padded(_ text: String, width: Int) -> String {
+        if text.count >= width { return text }
+        return text + String(repeating: " ", count: width - text.count)
+    }
+
+    private static func formattedRatio(_ value: Double) -> String {
+        guard value.isFinite, value > 0 else { return "n/a" }
+        return String(format: "%.3f", value)
+    }
+
+    private static func variantPreferenceLabel(_ variant: ModelNames.TTS.Variant) -> String {
+        switch variant {
+        case .fiveSecond:
+            return "5s"
+        case .fifteenSecond:
+            return "15s"
+        }
     }
 }

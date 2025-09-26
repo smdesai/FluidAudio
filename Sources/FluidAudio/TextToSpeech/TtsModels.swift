@@ -28,7 +28,7 @@ public struct TtsModels {
             .kokoro,
             modelNames: modelNames,
             directory: modelsDirectory,
-            computeUnits: .cpuAndNeuralEngine
+            computeUnits: .all,
         )
         var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
         for variant in ModelNames.TTS.Variant.allCases {
@@ -36,6 +36,10 @@ public struct TtsModels {
             guard let model = dict[name] else {
                 throw TTSError.modelNotFound(name)
             }
+            let warmUpStart = Date()
+            await warmUpModel(model, variant: variant)
+            let warmUpDuration = Date().timeIntervalSince(warmUpStart)
+            logger.info("Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", warmUpDuration))s")
             loaded[variant] = model
         }
         return TtsModels(models: loaded)
@@ -71,8 +75,75 @@ public struct TtsModels {
 
     public static func optimizedPredictionOptions() -> MLPredictionOptions {
         let options = MLPredictionOptions()
-        options.usesCPUOnly = false
+        // Enable batching for better GPU utilization
+        if #available(macOS 14.0, iOS 17.0, *) {
+            options.outputBackings = [:]  // Reuse output buffers
+        }
         return options
+    }
+
+    // Run a lightweight pseudo generation to prime Core ML caches for subsequent real syntheses.
+    private static func warmUpModel(_ model: MLModel, variant: ModelNames.TTS.Variant) async {
+        do {
+            let tokenLength = max(1, KokoroSynthesizer.inferTokenLength(from: model))
+
+            let inputIds = try MLMultiArray(
+                shape: [1, NSNumber(value: tokenLength)] as [NSNumber],
+                dataType: .int32
+            )
+            let attentionMask = try MLMultiArray(
+                shape: [1, NSNumber(value: tokenLength)] as [NSNumber],
+                dataType: .int32
+            )
+
+            // Fill the complete token window for this variant (5s vs 15s models expose different lengths).
+            for index in 0..<tokenLength {
+                inputIds[index] = NSNumber(value: 0)
+                attentionMask[index] = NSNumber(value: 1)
+            }
+
+            let refDim = max(1, KokoroSynthesizer.refDim(from: model))
+            let refStyle = try MLMultiArray(
+                shape: [1, NSNumber(value: refDim)] as [NSNumber],
+                dataType: .float32
+            )
+            for index in 0..<refDim {
+                refStyle[index] = NSNumber(value: Float(0))
+            }
+
+            let phasesShape = model.modelDescription.inputDescriptionsByName["random_phases"]?.multiArrayConstraint?.shape
+                ?? [NSNumber(value: 1), NSNumber(value: 9)]
+            let randomPhases = try MLMultiArray(
+                shape: phasesShape,
+                dataType: .float32
+            )
+            for index in 0..<randomPhases.count {
+                randomPhases[index] = NSNumber(value: Float(0))
+            }
+
+            let features = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": inputIds,
+                "attention_mask": attentionMask,
+                "ref_s": refStyle,
+                "random_phases": randomPhases,
+            ])
+
+            let options: MLPredictionOptions = optimizedPredictionOptions()
+            _ = try await model.compatPrediction(from: features, options: options)
+        } catch {
+            logger.warning(
+                "Warm-up prediction failed for variant \(variantDescription(variant)): \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private static func variantDescription(_ variant: ModelNames.TTS.Variant) -> String {
+        switch variant {
+        case .fiveSecond:
+            return "5s"
+        case .fifteenSecond:
+            return "15s"
+        }
     }
 }
 

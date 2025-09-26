@@ -15,7 +15,6 @@ actor LexiconAssetManager {
 
         let localURL = kokoroDir.appendingPathComponent(filename)
         guard !FileManager.default.fileExists(atPath: localURL.path) else {
-            logger.info("File already exists: \(filename)")
             return
         }
 

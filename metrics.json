@@ -1,0 +1,82 @@
+{
+  "output" : "\/Users\/brandonweng\/code\/FluidAudio\/journey.wav",
+  "voice" : "af_heart",
+  "text" : "I can't believe we finally made it to the summit after climbing for twelve exhausting hours through wind and rain, but wow, this view of the endless mountain ranges stretching to the horizon makes every single difficult step completely worth the journey.",
+  "metrics" : {
+    "realtime_speed" : 12.583797667156354,
+    "audio_duration_s" : 13.917,
+    "asr_hypothesis" : "I can't believe we finally made it to the summit after climbing for twelve exhausting hours through wind and rain. But wow This view of the endless mountain ranges stretching to the horizon makes every single difficult step completely worth the journey.",
+    "inference_time_s" : 1.1059459447860718,
+    "total_time_s" : 8.2119779586791992,
+    "chunks" : [
+      {
+        "normalized_words" : [
+          "I",
+          "can't",
+          "believe",
+          "we",
+          "finally",
+          "made",
+          "it",
+          "to",
+          "the",
+          "summit",
+          "after",
+          "climbing",
+          "for",
+          "twelve",
+          "exhausting",
+          "hours",
+          "through",
+          "wind",
+          "and",
+          "rain",
+          "but",
+          "wow"
+        ],
+        "word_count" : 22,
+        "frame_count" : 271,
+        "pause_after_ms" : 0,
+        "text" : "I can't believe we finally made it to the summit after climbing for twelve exhausting hours through wind and rain, but wow,",
+        "tokens" : 122,
+        "model_variant" : "kokoro_24_15s",
+        "audio_duration_s" : 6.7750000000000004,
+        "index" : 0
+      },
+      {
+        "index" : 1,
+        "pause_after_ms" : 0,
+        "text" : "this view of the endless mountain ranges stretching to the horizon makes every single difficult step completely worth the journey.",
+        "audio_duration_s" : 7.1500000000000004,
+        "frame_count" : 286,
+        "model_variant" : "kokoro_24_15s",
+        "tokens" : 131,
+        "word_count" : 20,
+        "normalized_words" : [
+          "this",
+          "view",
+          "of",
+          "the",
+          "endless",
+          "mountain",
+          "ranges",
+          "stretching",
+          "to",
+          "the",
+          "horizon",
+          "makes",
+          "every",
+          "single",
+          "difficult",
+          "step",
+          "completely",
+          "worth",
+          "the",
+          "journey"
+        ]
+      }
+    ],
+    "model_load_time_s" : 7.1059679985046387,
+    "wer" : 0
+  }
+}

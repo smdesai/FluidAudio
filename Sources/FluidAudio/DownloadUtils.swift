@@ -372,7 +372,6 @@ public class DownloadUtils {
         let parentDir = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
 
-        // Check if file already exists and is complete
         if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
             let fileSize = attrs[.size] as? Int64,
             fileSize == expectedSize

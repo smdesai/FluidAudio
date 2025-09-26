@@ -93,8 +93,6 @@ public final class TtSManager {
             throw TTSError.modelNotFound("Kokoro model not initialized")
         }
 
-        logger.info("Synthesizing detailed output for text: \"\(text)\"")
-
         let cleanedText = try sanitizeInput(text)
         let selectedVoice = resolveVoice(voice, speakerId: speakerId)
 
@@ -109,7 +107,6 @@ public final class TtSManager {
         let factor = max(0.1, voiceSpeed)
 
         if abs(factor - 1.0) < 0.01 {
-            logger.info("Generated audio bytes: \(synthesis.audio.count)")
             return synthesis
         }
 
@@ -131,7 +128,6 @@ public final class TtSManager {
         let combinedSamples = adjustedChunks.flatMap { $0.samples }
         let audioData = try AudioWAV.data(from: combinedSamples, sampleRate: 24_000)
 
-        logger.info("Generated audio bytes: \(audioData.count) (speed factor=\(factor))")
         return KokoroSynthesizer.SynthesisResult(audio: audioData, chunks: adjustedChunks)
     }
 
