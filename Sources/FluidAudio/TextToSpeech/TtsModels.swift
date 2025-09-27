@@ -29,7 +29,7 @@ public struct TtsModels {
             modelNames: modelNames,
             directory: modelsDirectory,
             // Only a small fraction of the model can run on ANE, and compile time takes a long time because of the complicated arch
-            computeUnits: .cpuAndGPU,
+            computeUnits: .cpuAndGPU
         )
         var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
         for variant in ModelNames.TTS.Variant.allCases {
