@@ -94,6 +94,105 @@ public struct KokoroSynthesizer {
         }
     }
 
+    private struct MultiArrayKey: Hashable {
+        let dataTypeRawValue: Int
+        let shape: [Int]
+
+        init(dataType: MLMultiArrayDataType, shape: [NSNumber]) {
+            dataTypeRawValue = dataType.rawValue
+            self.shape = shape.map { $0.intValue }
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(dataTypeRawValue)
+            for dimension in shape {
+                hasher.combine(dimension)
+            }
+        }
+    }
+
+    private actor MultiArrayPool {
+        private var storage: [MultiArrayKey: [MLMultiArray]] = [:]
+
+        func rent(
+            shape: [NSNumber],
+            dataType: MLMultiArrayDataType,
+            zeroFill: Bool
+        ) async throws -> MLMultiArray {
+            let key = MultiArrayKey(dataType: dataType, shape: shape)
+            let array: MLMultiArray
+            if var cached = storage[key], let candidate = cached.popLast() {
+                storage[key] = cached
+                array = candidate
+            } else {
+                array = try MLMultiArray(shape: shape, dataType: dataType)
+            }
+
+            if zeroFill {
+                zero(array)
+            }
+            return array
+        }
+
+        func recycle(_ array: MLMultiArray, zeroFill: Bool) {
+            if zeroFill {
+                zero(array)
+            }
+            let key = MultiArrayKey(dataType: array.dataType, shape: array.shape)
+            storage[key, default: []].append(array)
+        }
+
+        func preallocate(
+            shape: [NSNumber],
+            dataType: MLMultiArrayDataType,
+            count: Int,
+            zeroFill: Bool
+        ) async throws {
+            guard count > 0 else { return }
+            let key = MultiArrayKey(dataType: dataType, shape: shape)
+            var pool = storage[key] ?? []
+            if pool.count >= count {
+                storage[key] = pool
+                return
+            }
+
+            let additional = count - pool.count
+            pool.reserveCapacity(count)
+            for _ in 0..<additional {
+                let array = try MLMultiArray(shape: shape, dataType: dataType)
+                if zeroFill {
+                    zero(array)
+                }
+                pool.append(array)
+            }
+            storage[key] = pool
+        }
+
+        private func zero(_ array: MLMultiArray) {
+            let elementCount = array.count
+            guard elementCount > 0 else { return }
+
+            switch array.dataType {
+            case .int32:
+                let pointer = array.dataPointer.bindMemory(to: Int32.self, capacity: elementCount)
+                pointer.initialize(repeating: 0, count: elementCount)
+            case .float32:
+                let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: elementCount)
+                vDSP_vclr(pointer, 1, vDSP_Length(elementCount))
+            case .double:
+                let pointer = array.dataPointer.bindMemory(to: Double.self, capacity: elementCount)
+                vDSP_vclrD(pointer, 1, vDSP_Length(elementCount))
+            case .float16:
+                let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: elementCount)
+                pointer.initialize(repeating: 0, count: elementCount)
+            case .int8:
+                array.dataPointer.initializeMemory(as: Int8.self, repeating: 0, count: elementCount)
+            default:
+                memset(array.dataPointer, 0, elementCount * MemoryLayout<Float>.stride)
+            }
+        }
+    }
+
     // Cached CoreML models per Kokoro variant
     // Legacy: Phoneme dictionary with frame counts (kept for backward compatibility)
     private actor LexiconCache {
@@ -160,6 +259,7 @@ public struct KokoroSynthesizer {
     }
 
     private static let lexiconCache = LexiconCache()
+    private static let multiArrayPool = MultiArrayPool()
 
     private struct VoiceEmbeddingPayload {
         let sourceURL: URL
@@ -686,8 +786,30 @@ public struct KokoroSynthesizer {
             trimmedIds.append(contentsOf: Array(repeating: Int32(0), count: targetTokens - trimmedIds.count))
         }
 
-        // Create model inputs
-        let inputArray = try MLMultiArray(shape: [1, NSNumber(value: targetTokens)] as [NSNumber], dataType: .int32)
+        let inputShape: [NSNumber] = [1, NSNumber(value: targetTokens)]
+        let phasesShape: [NSNumber] = [1, 9]
+        let inputArray = try await multiArrayPool.rent(
+            shape: inputShape,
+            dataType: .int32,
+            zeroFill: false
+        )
+        let attentionMask = try await multiArrayPool.rent(
+            shape: inputShape,
+            dataType: .int32,
+            zeroFill: false
+        )
+        let phasesArray = try await multiArrayPool.rent(
+            shape: phasesShape,
+            dataType: .float32,
+            zeroFill: true
+        )
+
+        func recycleModelArrays() async {
+            await multiArrayPool.recycle(phasesArray, zeroFill: true)
+            await multiArrayPool.recycle(attentionMask, zeroFill: false)
+            await multiArrayPool.recycle(inputArray, zeroFill: false)
+        }
+
         let inputPointer = inputArray.dataPointer.bindMemory(to: Int32.self, capacity: targetTokens)
         inputPointer.initialize(repeating: 0, count: targetTokens)
         trimmedIds.withUnsafeBufferPointer { buffer in
@@ -695,8 +817,6 @@ public struct KokoroSynthesizer {
             inputPointer.update(from: baseAddress, count: buffer.count)
         }
 
-        // Create attention mask (1 for real tokens up to original count, 0 for padding)
-        let attentionMask = try MLMultiArray(shape: [1, NSNumber(value: targetTokens)] as [NSNumber], dataType: .int32)
         let maskPointer = attentionMask.dataPointer.bindMemory(to: Int32.self, capacity: targetTokens)
         maskPointer.initialize(repeating: 0, count: targetTokens)
         let trueLen = min(inputIds.count, targetTokens)
@@ -706,8 +826,6 @@ public struct KokoroSynthesizer {
             }
         }
 
-        // Use zeros for phases for determinism (works well for 3s model)
-        let phasesArray = try MLMultiArray(shape: [1, 9] as [NSNumber], dataType: .float32)
         let phasesPointer = phasesArray.dataPointer.bindMemory(to: Float.self, capacity: 9)
         phasesPointer.initialize(repeating: 0, count: 9)
 
@@ -722,13 +840,20 @@ public struct KokoroSynthesizer {
         ])
 
         let predictionStart = Date()
-        let output = try await kokoro.compatPrediction(from: modelInput, options: MLPredictionOptions())
+        let output: MLFeatureProvider
+        do {
+            output = try await kokoro.compatPrediction(from: modelInput, options: MLPredictionOptions())
+        } catch {
+            await recycleModelArrays()
+            throw error
+        }
         let predictionTime = Date().timeIntervalSince(predictionStart)
         // Extract audio output explicitly by key used by model
         guard let audioArrayUnwrapped = output.featureValue(for: "audio")?.multiArrayValue,
             audioArrayUnwrapped.count > 0
         else {
             let names = Array(output.featureNames)
+            await recycleModelArrays()
             throw TTSError.processingFailed("Failed to extract 'audio' output. Features: \(names)")
         }
 
@@ -762,7 +887,8 @@ public struct KokoroSynthesizer {
         // Convert to float samples
         let samples: [Float]
         if audioArrayUnwrapped.dataType == .float32 {
-            let sourcePointer = audioArrayUnwrapped.dataPointer.bindMemory(to: Float.self, capacity: audioArrayUnwrapped.count)
+            let sourcePointer = audioArrayUnwrapped.dataPointer.bindMemory(
+                to: Float.self, capacity: audioArrayUnwrapped.count)
             samples = Array(UnsafeBufferPointer(start: sourcePointer, count: effectiveCount))
         } else {
             var fallback: [Float] = []
@@ -782,6 +908,7 @@ public struct KokoroSynthesizer {
             logger.info("Audio range: [\(String(format: "%.4f", minVal)), \(String(format: "%.4f", maxVal))]")
         }
 
+        await recycleModelArrays()
         return (samples, predictionTime)
     }
 
@@ -849,6 +976,23 @@ public struct KokoroSynthesizer {
         }
 
         let totalChunks = entries.count
+        let groupedByTargetTokens = Dictionary(grouping: entries, by: { $0.template.targetTokens })
+        let phasesShape: [NSNumber] = [1, 9]
+        try await multiArrayPool.preallocate(
+            shape: phasesShape,
+            dataType: .float32,
+            count: max(1, totalChunks),
+            zeroFill: true
+        )
+        for (targetTokens, group) in groupedByTargetTokens {
+            let shape: [NSNumber] = [1, NSNumber(value: targetTokens)]
+            try await multiArrayPool.preallocate(
+                shape: shape,
+                dataType: .int32,
+                count: max(1, group.count * 2),
+                zeroFill: false
+            )
+        }
         let chunkTemplates = entries.map { $0.template }
         var chunkSampleBuffers = Array(repeating: [Float](), count: totalChunks)
         var allSamples: [Float] = []
@@ -915,22 +1059,65 @@ public struct KokoroSynthesizer {
             let prevPause = entries[index - 1].chunk.pauseAfterMs
             if prevPause > 0 {
                 let silenceCount = Int(Double(prevPause) * 24.0)
+                let expectedAppend = chunkSamples.count + max(0, silenceCount)
+                if expectedAppend > 0 {
+                    allSamples.reserveCapacity(allSamples.count + expectedAppend)
+                }
                 if silenceCount > 0 {
-                    allSamples.append(contentsOf: Array(repeating: 0.0, count: silenceCount))
+                    allSamples.append(contentsOf: repeatElement(0.0, count: silenceCount))
                 }
                 allSamples.append(contentsOf: chunkSamples)
             } else {
                 let n = min(crossfadeN, allSamples.count, chunkSamples.count)
                 if n > 0 {
-                    for k in 0..<n {
-                        let aIdx = allSamples.count - n + k
-                        let t: Float = n == 1 ? 1.0 : Float(k) / Float(n - 1)
-                        allSamples[aIdx] = allSamples[aIdx] * (1.0 - t) + chunkSamples[k] * t
+                    let appendCount = max(0, chunkSamples.count - n)
+                    if appendCount > 0 {
+                        allSamples.reserveCapacity(allSamples.count + appendCount)
                     }
+                    let tailStartIndex = allSamples.count - n
+                    var fadeIn = [Float](repeating: 0, count: n)
+                    if n == 1 {
+                        fadeIn[0] = 1
+                    } else {
+                        var start: Float = 0
+                        var step: Float = 1.0 / Float(n - 1)
+                        fadeIn.withUnsafeMutableBufferPointer { buffer in
+                            guard let baseAddress = buffer.baseAddress else { return }
+                            vDSP_vramp(&start, &step, baseAddress, 1, vDSP_Length(n))
+                        }
+                    }
+
+                    var fadeOut = [Float](repeating: 1, count: n)
+                    fadeIn.withUnsafeBufferPointer { fadeInBuffer in
+                        fadeOut.withUnsafeMutableBufferPointer { fadeOutBuffer in
+                            guard let fadeInBase = fadeInBuffer.baseAddress,
+                                let fadeOutBase = fadeOutBuffer.baseAddress
+                            else { return }
+                            vDSP_vsub(fadeInBase, 1, fadeOutBase, 1, fadeOutBase, 1, vDSP_Length(n))
+                        }
+                    }
+
+                    allSamples.withUnsafeMutableBufferPointer { allBuffer in
+                        guard let allBase = allBuffer.baseAddress else { return }
+                        let tailPointer = allBase.advanced(by: tailStartIndex)
+                        fadeOut.withUnsafeBufferPointer { fadeOutBuffer in
+                            guard let fadeOutBase = fadeOutBuffer.baseAddress else { return }
+                            vDSP_vmul(tailPointer, 1, fadeOutBase, 1, tailPointer, 1, vDSP_Length(n))
+                        }
+                        chunkSamples.withUnsafeBufferPointer { chunkBuffer in
+                            guard let chunkBase = chunkBuffer.baseAddress else { return }
+                            fadeIn.withUnsafeBufferPointer { fadeInBuffer in
+                                guard let fadeInBase = fadeInBuffer.baseAddress else { return }
+                                vDSP_vma(chunkBase, 1, fadeInBase, 1, tailPointer, 1, tailPointer, 1, vDSP_Length(n))
+                            }
+                        }
+                    }
+
                     if chunkSamples.count > n {
                         allSamples.append(contentsOf: chunkSamples[n...])
                     }
                 } else {
+                    allSamples.reserveCapacity(allSamples.count + chunkSamples.count)
                     allSamples.append(contentsOf: chunkSamples)
                 }
             }

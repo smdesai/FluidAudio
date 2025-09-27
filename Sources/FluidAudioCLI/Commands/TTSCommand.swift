@@ -25,6 +25,56 @@ public struct TTS {
         }
         return artifactsRoot.appendingPathComponent(expanded, isDirectory: expectsDirectory)
     }
+    private static let longFormBenchmark: String = """
+        The purpose of this extended benchmark passage is to emulate a five minute narration that exercises every
+        stage of the Kokoro text to speech pipeline. It begins with a calm introduction that invites the listener
+        into a guided tour of the system, the models, and the engineering decisions that keep latency predictable
+        even as the generated waveform stretches across thousands of frames. As the narration unfolds, it layers
+        descriptive language with technical specifics so the synthesizer must juggle pacing, emphasis, and clarity
+        without collapsing into the robotic cadences that plagued the earliest speech engines.
+
+        Imagine a developer settling into a late evening testing session, perhaps with a mug of tea beside the
+        keyboard and a profiler ready to capture the next set of performance traces. The first minute of audio
+        should gently ramp up, describing how phoneme tokenization interacts with the lexicon cache, how chunking
+        decisions align with punctuation, and why the short variant guard prevents awkward truncations when a
+        sentence suddenly stops. That steady cadence establishes a baseline for the benchmark: realistic,
+        moderately complex, yet still conversational enough that users would recognize it as humanlike speech.
+
+        As the second minute begins, the script dives deeper into the architectural layers. It narrates the
+        journey of a sentence through normalization, phoneme lookup, grapheme-to-phoneme fallbacks, and the
+        careful assembly of input identifiers destined for the Core ML model. Details about vectorized
+        accelerations, the pooling of multi-arrays, and the reuse of attention masks appear naturally in the text.
+        Each clause varies in length, encouraging the synthesizer to adapt intonation while the benchmark captures
+        how throughput responds to these changes. The narration references practical debugging scenarios, such as
+        discovering a missing lexicon entry moments before a demo or tracing a subtle regression introduced by a
+        seemingly harmless refactor to the cache eviction policy.
+
+        By minute three the story widens to include the data center perspective. It talks about concurrency, about
+        dozens of simultaneous synthesis requests arriving from a busy voice-over session or an educational app
+        generating individualized practice passages for students. The benchmarked voice describes how the system
+        keeps queue depths in check, why crossfading between successive chunks matters for perceived continuity,
+        and how streaming playback can start before the final chunk is ready. It briefly digresses into the impact
+        of sample rate conversions, the challenges of maintaining numerical stability when normalizing amplitude,
+        and the way monitoring dashboards translate raw metrics into actionable insights during an incident.
+
+        Minute four shifts tone to something more reflective. The narrator recounts lessons learned from
+        accessibility advocates who rely on synthetic voices every day. It mentions the careful calibration
+        between articulation and warmth, the importance of keeping prosody lively for long form articles, and the
+        subtle adjustments required for multilingual audiences. Words like compassion, curiosity, and patience
+        mingle with terms such as signal to noise ratio, adaptive gain control, and neural vocoder harmonics. This
+        blend of human centered storytelling and technical vocabulary forces the model to modulate energy and to
+        maintain coherence across long, winding sentences that refuse to yield to easy breaths.
+
+        As the benchmark approaches the five minute mark, the script crescendos into a hopeful outlook. It talks
+        about future revisions of the Kokoro pipeline, the experiments queued up to test novel diffusion based
+        vocoders, and the exciting possibility of on device personalization that respects privacy while embracing
+        expressiveness. The narrator celebrates the contributors who crafted lexicons, optimized inference graphs,
+        and profiled memory pools until allocations aligned perfectly with the hardware cache lines. The final
+        sentences decelerate gracefully, thanking the listener for their patience, inviting them to imagine the
+        next generation of storytelling tools that will rely on resilient, natural, and trustworthy synthetic
+        voices, and finally allowing a gentle silence to settle as the benchmark concludes.
+        """
+
     private static let benchmarkSentences: [String] = [
         "Quick check to measure short output speed.",
         "The new release pipeline needs reliable voice synthesis benchmarks "
@@ -38,7 +88,8 @@ public struct TTS {
         "During real-world use, people may speak in long, meandering ways that stretch the models ability to sustain natural cadence and intonation over dozens of words, testing both quality and throughput.",
         "Short.",
         "In the midst of testing how synthetic speech systems perform under stress, we decided to craft an especially long passage that meanders through several interconnected themes—starting with the simple observation that voice interfaces have become part of everyday life, moving into a reflection on how early text-to-speech systems were criticized for sounding robotic and unnatural, drifting further into technical details about neural vocoders, attention mechanisms, and latency bottlenecks in hardware pipelines, and then circling back to the human element: the way people perceive rhythm, tone, and emotion in spoken language, which makes evaluation of generated audio far more complex than measuring raw throughput or accuracy, because speech is not only a vehicle for information but also an instrument of connection, persuasion, and empathy; so when a benchmark sentence grows this long, with commas and semicolons and digressions that twist and turn like winding mountain roads, it becomes an excellent test of whether the synthesizer can maintain not just intelligibility but also coherence, flow, and a sense of natural cadence across dozens and dozens of words without faltering, stuttering, or flattening into monotony.",
-        "After hours of careful preparation, countless revisions to the experiment setup, and no shortage of nervous anticipation, the team finally gathered around the workstation to watch the synthesizer process an unusually long passage of text that meandered across ideas—touching on the history of voice interfaces, the challenges of real-time inference on limited hardware, and the subtle artistry of making synthetic voices sound natural—before concluding with the hopeful reminder that progress, while sometimes slow and uneven, is always worth the patience it demands."
+        "After hours of careful preparation, countless revisions to the experiment setup, and no shortage of nervous anticipation, the team finally gathered around the workstation to watch the synthesizer process an unusually long passage of text that meandered across ideas—touching on the history of voice interfaces, the challenges of real-time inference on limited hardware, and the subtle artistry of making synthetic voices sound natural—before concluding with the hopeful reminder that progress, while sometimes slow and uneven, is always worth the patience it demands.",
+        longFormBenchmark,
     ]
 
     public static func run(arguments: [String]) async {
@@ -500,7 +551,7 @@ extension TTS {
 
         print("")
         let initString = String(format: "%.3fs", initializationDuration)
-        print("TTS benchmark for voice \(voice) (warm-up took an extra \(initString))")
+        print("FluidAudio TTS benchmark for voice \(voice) (warm-up took an extra \(initString))")
         if let variantPreference {
             print("Variant preference: \(variantPreferenceLabel(variantPreference))")
         }
