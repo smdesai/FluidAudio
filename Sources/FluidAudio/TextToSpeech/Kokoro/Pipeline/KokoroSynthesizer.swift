@@ -273,6 +273,12 @@ public struct KokoroSynthesizer {
         let phonemeCount: Int
     }
 
+    private struct VoiceEmbeddingData: Sendable {
+        let voiceID: String
+        let vector: [Float]
+        let l2Norm: Float
+    }
+
     private static var voiceEmbeddingPayloads: [String: VoiceEmbeddingPayload] = [:]
     private static var voiceEmbeddingVectors: [VoiceEmbeddingCacheKey: [Float]] = [:]
     private static let voiceEmbeddingLock = NSLock()
@@ -328,6 +334,79 @@ public struct KokoroSynthesizer {
         voiceEmbeddingLock.lock()
         voiceEmbeddingVectors[key] = vector
         voiceEmbeddingLock.unlock()
+    }
+
+    private static func fetchVoiceEmbeddingData(
+        voice: String,
+        phonemeCount: Int,
+        expectedDimension: Int
+    ) throws -> VoiceEmbeddingData {
+        let cacheDir = try TtsModels.cacheDirectoryURL()
+        let voicesDir = cacheDir.appendingPathComponent("Models/kokoro/voices")
+        try FileManager.default.createDirectory(at: voicesDir, withIntermediateDirectories: true)
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+        func resolveVector(for voiceID: String) throws -> ([Float]?, URL, Bool) {
+            let candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
+            do {
+                let payload = try cachedVoiceEmbeddingPayload(for: voiceID, candidates: candidates)
+                let key = VoiceEmbeddingCacheKey(voiceID: voiceID, phonemeCount: phonemeCount)
+                if let cached = Self.cachedVoiceEmbeddingVector(for: key) {
+                    return (cached, payload.sourceURL, true)
+                }
+                let vector = parseVoiceEmbeddingVector(payload.json, voiceID: voiceID, phonemeCount: phonemeCount)
+                if let vector {
+                    Self.storeVoiceEmbeddingVector(vector, for: key)
+                } else {
+                    Self.logger.warning(
+                        "Voice embedding payload lacked usable vector for \(voiceID) at \(payload.sourceURL.path)"
+                    )
+                }
+                return (vector, payload.sourceURL, false)
+            } catch {
+                Self.logger.warning("Failed to load voice embedding for \(voiceID): \(error.localizedDescription)")
+                return (nil, candidates.first ?? voicesDir, false)
+            }
+        }
+
+        var voiceUsed = voice
+        var attemptedVoices = [voice]
+        var (vector, sourceURL, wasCached) = try resolveVector(for: voiceUsed)
+
+        if vector == nil && voice != "af_heart" {
+            Self.logger.warning("Voice embedding for \(voice) not found; falling back to af_heart")
+            voiceUsed = "af_heart"
+            attemptedVoices.append("af_heart")
+            (vector, sourceURL, wasCached) = try resolveVector(for: voiceUsed)
+        }
+
+        guard let resolvedVector = vector else {
+            throw TTSError.modelNotFound(
+                "Voice embedding unavailable for \(attemptedVoices.joined(separator: ", ")); checked \(sourceURL.path)"
+            )
+        }
+
+        guard resolvedVector.count == expectedDimension else {
+            throw TTSError.modelNotFound(
+                "Voice embedding for \(voiceUsed) has unexpected length (expected \(expectedDimension), got \(resolvedVector.count))"
+            )
+        }
+
+        var sumSquares: Float = 0
+        resolvedVector.withUnsafeBufferPointer { sourcePointer in
+            guard let baseAddress = sourcePointer.baseAddress, !sourcePointer.isEmpty else { return }
+            vDSP_svesq(baseAddress, 1, &sumSquares, vDSP_Length(sourcePointer.count))
+        }
+        let norm = sqrt(Double(sumSquares))
+
+        let formattedNorm = String(format: "%.3f", norm)
+        if wasCached {
+            Self.logger.debug("Reusing cached voice embedding: \(voiceUsed), dim=\(expectedDimension), l2norm=\(formattedNorm)")
+        } else {
+            Self.logger.info("Loaded voice embedding: \(voiceUsed), dim=\(expectedDimension), l2norm=\(formattedNorm)")
+        }
+
+        return VoiceEmbeddingData(voiceID: voiceUsed, vector: resolvedVector, l2Norm: Float(norm))
     }
 
     private static func isVoiceEmbeddingPayloadCached(for voiceID: String) -> Bool {
@@ -674,68 +753,24 @@ public struct KokoroSynthesizer {
     }
 
     public static func loadVoiceEmbedding(voice: String = "af_heart", phonemeCount: Int) async throws -> MLMultiArray {
-        let cacheDir = try TtsModels.cacheDirectoryURL()
-        let voicesDir = cacheDir.appendingPathComponent("Models/kokoro/voices")
-        try FileManager.default.createDirectory(at: voicesDir, withIntermediateDirectories: true)
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-
-        func resolveVector(for voiceID: String) -> ([Float]?, URL) {
-            let candidates = candidateVoiceEmbeddingURLs(for: voiceID, cwd: cwd, voicesDir: voicesDir)
-            do {
-                let payload = try cachedVoiceEmbeddingPayload(for: voiceID, candidates: candidates)
-                let key = VoiceEmbeddingCacheKey(voiceID: voiceID, phonemeCount: phonemeCount)
-                if let cachedVector = Self.cachedVoiceEmbeddingVector(for: key) {
-                    return (cachedVector, payload.sourceURL)
-                }
-                let vector = parseVoiceEmbeddingVector(payload.json, voiceID: voiceID, phonemeCount: phonemeCount)
-                if let vector {
-                    Self.storeVoiceEmbeddingVector(vector, for: key)
-                } else {
-                    Self.logger.warning(
-                        "Voice embedding payload lacked usable vector for \(voiceID) at \(payload.sourceURL.path)")
-                }
-                return (vector, payload.sourceURL)
-            } catch {
-                Self.logger.warning("Failed to load voice embedding for \(voiceID): \(error.localizedDescription)")
-                return (nil, candidates.first ?? voicesDir)
-            }
-        }
-
-        var voiceUsed = voice
-        var attemptedVoices = [voice]
-        var (vector, sourceURL) = resolveVector(for: voice)
-
-        if vector == nil && voice != "af_heart" {
-            Self.logger.warning("Voice embedding for \(voice) not found; falling back to af_heart")
-            voiceUsed = "af_heart"
-            attemptedVoices.append("af_heart")
-            (vector, sourceURL) = resolveVector(for: voiceUsed)
-        }
-
-        guard let resolvedVector = vector else {
-            throw TTSError.modelNotFound(
-                "Voice embedding unavailable for \(attemptedVoices.joined(separator: ", ")); checked \(sourceURL.path)")
-        }
-
-        let dim = try await KokoroModelCache.shared.referenceEmbeddingDimension()
-        guard resolvedVector.count == dim else {
-            throw TTSError.modelNotFound(
-                "Voice embedding for \(voiceUsed) has unexpected length (expected \(dim), got \(resolvedVector.count))")
-        }
-
-        let embedding = try MLMultiArray(shape: [1, NSNumber(value: dim)] as [NSNumber], dataType: .float32)
-        var sumSquares: Float = 0
-        resolvedVector.withUnsafeBufferPointer { sourcePointer in
-            guard let sourceBase = sourcePointer.baseAddress, !sourcePointer.isEmpty else { return }
-            let elementCount = sourcePointer.count
-            let destinationPointer = embedding.dataPointer.assumingMemoryBound(to: Float.self)
-            destinationPointer.update(from: sourceBase, count: elementCount)
-            vDSP_svesq(sourceBase, 1, &sumSquares, vDSP_Length(elementCount))
-        }
-
-        Self.logger.info(
-            "Loaded voice embedding: \(voiceUsed), dim=\(dim), l2norm=\(String(format: "%.3f", sqrt(Double(sumSquares))))"
+        let expectedDimension = try await KokoroModelCache.shared.referenceEmbeddingDimension()
+        let data = try fetchVoiceEmbeddingData(
+            voice: voice,
+            phonemeCount: phonemeCount,
+            expectedDimension: expectedDimension
         )
+
+        let embedding = try MLMultiArray(
+            shape: [1, NSNumber(value: data.vector.count)] as [NSNumber],
+            dataType: .float32
+        )
+
+        data.vector.withUnsafeBufferPointer { sourcePointer in
+            guard let baseAddress = sourcePointer.baseAddress, !sourcePointer.isEmpty else { return }
+            let destinationPointer = embedding.dataPointer.assumingMemoryBound(to: Float.self)
+            destinationPointer.update(from: baseAddress, count: sourcePointer.count)
+        }
+
         return embedding
     }
 
@@ -751,14 +786,33 @@ public struct KokoroSynthesizer {
         return 256
     }
 
+    private static func prepareVoiceEmbeddingCache(
+        voice: String,
+        entries: [ChunkEntry],
+        embeddingDimension: Int
+    ) throws -> [Int: VoiceEmbeddingData] {
+        let uniqueCounts = Set(entries.map { $0.inputIds.count })
+        var cache: [Int: VoiceEmbeddingData] = [:]
+        cache.reserveCapacity(uniqueCounts.count)
+
+        for count in uniqueCounts {
+            cache[count] = try fetchVoiceEmbeddingData(
+                voice: voice,
+                phonemeCount: count,
+                expectedDimension: embeddingDimension
+            )
+        }
+
+        return cache
+    }
+
     /// Synthesize a single chunk of text using precomputed token IDs.
     private static func synthesizeChunk(
         _ chunk: TextChunk,
-        voice: String,
         inputIds: [Int32],
         variant: ModelNames.TTS.Variant,
         targetTokens: Int,
-        cachedRefStyle: MLMultiArray? = nil
+        referenceVector: [Float]
     ) async throws -> ([Float], TimeInterval) {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
@@ -766,12 +820,16 @@ public struct KokoroSynthesizer {
 
         let kokoro = try await model(for: variant)
 
-        // Get voice embedding
-        let refStyle: MLMultiArray
-        if let cachedRefStyle {
-            refStyle = cachedRefStyle
-        } else {
-            refStyle = try await loadVoiceEmbedding(voice: voice, phonemeCount: inputIds.count)
+        let refShape: [NSNumber] = [1, NSNumber(value: referenceVector.count)]
+        let refStyle = try await multiArrayPool.rent(
+            shape: refShape,
+            dataType: .float32,
+            zeroFill: false
+        )
+        let refPointer = refStyle.dataPointer.bindMemory(to: Float.self, capacity: referenceVector.count)
+        referenceVector.withUnsafeBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            refPointer.update(from: baseAddress, count: buffer.count)
         }
 
         // Pad or truncate to match model expectation
@@ -810,6 +868,7 @@ public struct KokoroSynthesizer {
             await multiArrayPool.recycle(phasesArray, zeroFill: true)
             await multiArrayPool.recycle(attentionMask, zeroFill: false)
             await multiArrayPool.recycle(inputArray, zeroFill: false)
+            await multiArrayPool.recycle(refStyle, zeroFill: false)
         }
 
         let inputPointer = inputArray.dataPointer.bindMemory(to: Int32.self, capacity: targetTokens)
@@ -977,6 +1036,13 @@ public struct KokoroSynthesizer {
             let predictionTime: TimeInterval
         }
 
+        let embeddingDimension = try await KokoroModelCache.shared.referenceEmbeddingDimension()
+        let embeddingCache = try prepareVoiceEmbeddingCache(
+            voice: voice,
+            entries: entries,
+            embeddingDimension: embeddingDimension
+        )
+
         let totalChunks = entries.count
         let groupedByTargetTokens = Dictionary(grouping: entries, by: { $0.template.targetTokens })
         let phasesShape: [NSNumber] = [1, 9]
@@ -995,6 +1061,13 @@ public struct KokoroSynthesizer {
                 zeroFill: false
             )
         }
+        let refShape: [NSNumber] = [1, NSNumber(value: embeddingDimension)]
+        try await multiArrayPool.preallocate(
+            shape: refShape,
+            dataType: .float32,
+            count: max(1, totalChunks),
+            zeroFill: false
+        )
         let chunkTemplates = entries.map { $0.template }
         var chunkSampleBuffers = Array(repeating: [Float](), count: totalChunks)
         var allSamples: [Float] = []
@@ -1009,7 +1082,12 @@ public struct KokoroSynthesizer {
                 let inputIds = entry.inputIds
                 let template = entry.template
                 let chunkIndex = index
-                let voiceID = voice
+                guard let embeddingData = embeddingCache[inputIds.count] else {
+                    throw TTSError.processingFailed(
+                        "Missing voice embedding for chunk \(index + 1) with \(inputIds.count) tokens"
+                    )
+                }
+                let referenceVector = embeddingData.vector
                 group.addTask(priority: .userInitiated) {
                     Self.logger.info(
                         "Processing chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.words.count) words")
@@ -1018,10 +1096,10 @@ public struct KokoroSynthesizer {
                         "Chunk \(chunkIndex + 1) using Kokoro \(variantDescription(template.variant)) model")
                     let (chunkSamples, predictionTime) = try await synthesizeChunk(
                         chunk,
-                        voice: voiceID,
                         inputIds: inputIds,
                         variant: template.variant,
-                        targetTokens: template.targetTokens)
+                        targetTokens: template.targetTokens,
+                        referenceVector: referenceVector)
                     return ChunkSynthesisResult(
                         index: chunkIndex,
                         samples: chunkSamples,

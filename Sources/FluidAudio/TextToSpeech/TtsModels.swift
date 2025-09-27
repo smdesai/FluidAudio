@@ -32,18 +32,38 @@ public struct TtsModels {
             computeUnits: .cpuAndGPU
         )
         var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
+        var warmUpDurations: [ModelNames.TTS.Variant: TimeInterval] = [:]
+
         for variant in ModelNames.TTS.Variant.allCases {
             let name = variant.fileName
             guard let model = dict[name] else {
                 throw TTSError.modelNotFound(name)
             }
-            let warmUpStart = Date()
-            await warmUpModel(model, variant: variant)
-            let warmUpDuration = Date().timeIntervalSince(warmUpStart)
-            logger.info(
-                "Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", warmUpDuration))s")
             loaded[variant] = model
         }
+
+        try await withThrowingTaskGroup(of: (ModelNames.TTS.Variant, TimeInterval).self) { group in
+            for (variant, model) in loaded {
+                group.addTask(priority: .userInitiated) {
+                    let warmUpStart = Date()
+                    await warmUpModel(model, variant: variant)
+                    let warmUpDuration = Date().timeIntervalSince(warmUpStart)
+                    return (variant, warmUpDuration)
+                }
+            }
+
+            for try await (variant, duration) in group {
+                warmUpDurations[variant] = duration
+            }
+        }
+
+        for variant in ModelNames.TTS.Variant.allCases {
+            if let duration = warmUpDurations[variant] {
+                logger.info(
+                    "Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", duration))s")
+            }
+        }
+
         return TtsModels(models: loaded)
     }
 
