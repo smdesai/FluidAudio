@@ -15,6 +15,8 @@ public enum Repo: String, CaseIterable {
             return "silero-vad-coreml"
         case .parakeet:
             return "parakeet-tdt-0.6b-v3-coreml"
+        case .parakeetV2:
+            return "parakeet-tdt-0.6b-v2-coreml"
         case .diarizer:
             return "speaker-diarization-coreml"
         case .kokoro:

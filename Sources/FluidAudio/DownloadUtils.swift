@@ -228,7 +228,7 @@ public class DownloadUtils {
         switch repo {
         case .vad:
             return ModelNames.VAD.requiredModels
-        case .parakeet:
+        case .parakeet, .parakeetV2:
             return ModelNames.ASR.requiredModels
         case .diarizer:
             return ModelNames.Diarizer.requiredModels
