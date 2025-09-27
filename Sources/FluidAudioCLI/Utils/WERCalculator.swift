@@ -4,7 +4,9 @@ import Foundation
 enum WERCalculator {
 
     /// Compute word-level edit distance statistics and WER for hypothesis/reference pairs.
-    static func calculateWERMetrics(hypothesis rawHypothesis: String, reference rawReference: String)
+    static func calculateWERMetrics(
+        hypothesis rawHypothesis: String, reference rawReference: String
+    )
         -> (wer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int)
     {
         let hypothesis = TextNormalizer.normalize(rawHypothesis)
@@ -20,9 +22,13 @@ enum WERCalculator {
     }
 
     /// Compute character-level CER alongside WER if needed.
-    static func calculateWERAndCER(hypothesis rawHypothesis: String, reference rawReference: String)
-        -> (wer: Double, cer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int,
-            totalCharacters: Int)
+    static func calculateWERAndCER(
+        hypothesis rawHypothesis: String, reference rawReference: String
+    )
+        -> (
+            wer: Double, cer: Double, insertions: Int, deletions: Int, substitutions: Int, totalWords: Int,
+            totalCharacters: Int
+        )
     {
         let hypothesis = TextNormalizer.normalize(rawHypothesis)
         let reference = TextNormalizer.normalize(rawReference)

@@ -77,7 +77,8 @@ actor KokoroModelCache {
             }
         }
         if referenceDimension == nil,
-            let defaultModel = models.model(for: ModelNames.TTS.defaultVariant) {
+            let defaultModel = models.model(for: ModelNames.TTS.defaultVariant)
+        {
             referenceDimension = KokoroSynthesizer.refDim(from: defaultModel)
         }
     }

@@ -40,7 +40,8 @@ public struct TtsModels {
             let warmUpStart = Date()
             await warmUpModel(model, variant: variant)
             let warmUpDuration = Date().timeIntervalSince(warmUpStart)
-            logger.info("Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", warmUpDuration))s")
+            logger.info(
+                "Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", warmUpDuration))s")
             loaded[variant] = model
         }
         return TtsModels(models: loaded)
@@ -112,7 +113,8 @@ public struct TtsModels {
                 refStyle[index] = NSNumber(value: Float(0))
             }
 
-            let phasesShape = model.modelDescription.inputDescriptionsByName["random_phases"]?.multiArrayConstraint?.shape
+            let phasesShape =
+                model.modelDescription.inputDescriptionsByName["random_phases"]?.multiArrayConstraint?.shape
                 ?? [NSNumber(value: 1), NSNumber(value: 9)]
             let randomPhases = try MLMultiArray(
                 shape: phasesShape,
