@@ -185,8 +185,10 @@ public struct KokoroSynthesizer {
             case .float16:
                 let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: elementCount)
                 pointer.initialize(repeating: 0, count: elementCount)
+            #if compiler(>=6.0)
             case .int8:
                 array.dataPointer.initializeMemory(as: Int8.self, repeating: 0, count: elementCount)
+            #endif
             default:
                 memset(array.dataPointer, 0, elementCount * MemoryLayout<Float>.stride)
             }
