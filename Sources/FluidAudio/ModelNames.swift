@@ -1,11 +1,12 @@
 import Foundation
 
 /// Model repositories on HuggingFace
-public enum Repo: CaseIterable {
-    case vad
-    case parakeet
-    case diarizer
-    case kokoro
+public enum Repo: String, CaseIterable {
+    case vad = "FluidInference/silero-vad-coreml"
+    case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
+    case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
+    case diarizer = "FluidInference/speaker-diarization-coreml"
+    case kokoro = "FluidInference/kokoro-82m-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -60,7 +61,9 @@ public enum ModelNames {
         public static let encoder = "Encoder"
         public static let decoder = "Decoder"
         public static let joint = "JointDecision"
-        public static let vocabulary = "parakeet_v3_vocab.json"
+
+        // Shared vocabulary file across all model versions
+        public static let vocabularyFile = "parakeet_vocab.json"
 
         public static let preprocessorFile = preprocessor + ".mlmodelc"
         public static let encoderFile = encoder + ".mlmodelc"
@@ -73,6 +76,11 @@ public enum ModelNames {
             decoderFile,
             jointFile,
         ]
+
+        /// Get vocabulary filename for specific model version
+        public static func vocabulary(for repo: Repo) -> String {
+            return vocabularyFile
+        }
     }
 
     /// VAD model names
@@ -139,7 +147,7 @@ public enum ModelNames {
         switch repo {
         case .vad:
             return ModelNames.VAD.requiredModels
-        case .parakeet:
+        case .parakeet, .parakeetV2:
             return ModelNames.ASR.requiredModels
         case .diarizer:
             return ModelNames.Diarizer.requiredModels
