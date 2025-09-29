@@ -19,6 +19,10 @@ enum KokoroChunker {
     private static let logger = AppLogger(subsystem: "com.fluidaudio.tts", category: "KokoroChunker")
     private static let decimalDigits = CharacterSet.decimalDigits
     private static let apostropheCharacters: Set<Character> = ["'", "’", "ʼ", "‛", "‵", "′"]
+    private struct ChunkSegment {
+        let text: String
+        let range: Range<String.Index>
+    }
     /// Public entry point used by `KokoroSynthesizer`
     static func chunk(
         text: String,
@@ -31,7 +35,9 @@ enum KokoroChunker {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
-        let normalized = collapseNewlines(trimmed)
+        let collapsed = collapseNewlines(trimmed)
+        let preprocessResult = KokoroTextPreprocessor().preprocess(collapsed)
+        let normalized = preprocessResult.text
 
         let (sentences, _) = splitIntoSentences(normalized)
         guard !sentences.isEmpty else { return [] }
@@ -45,33 +51,39 @@ enum KokoroChunker {
         let capacity = computeCapacity(targetTokens: targetTokens, hasLanguageToken: hasLanguageToken)
 
         for (index, segment) in segmentsByPeriods.enumerated() {
-            logger.info("segmentsByPeriods[\(index)]: \(segment)")
+            logger.info("segmentsByPeriods[\(index)]: \(segment.text)")
             let tokenCount = tokenCountForSegment(
-                for: segment,
+                segment,
                 lexicon: wordToPhonemes,
                 caseSensitiveLexicon: caseSensitiveLexicon,
                 allowed: allowedPhonemes,
-                capacity: capacity
+                capacity: capacity,
+                preprocessResult: preprocessResult,
+                fullText: normalized
             )
             logger.debug("segmentsByPeriods[\(index)] tokenCount=\(tokenCount) capacity=\(capacity)")
         }
 
-        var segmentsByPunctuations: [String] = []
+        var segmentsByPunctuations: [ChunkSegment] = []
         segmentsByPunctuations.reserveCapacity(segmentsByPeriods.count)
 
         for (periodIndex, segment) in segmentsByPeriods.enumerated() {
             let count = tokenCountForSegment(
-                for: segment,
+                segment,
                 lexicon: wordToPhonemes,
                 caseSensitiveLexicon: caseSensitiveLexicon,
                 allowed: allowedPhonemes,
-                capacity: capacity
+                capacity: capacity,
+                preprocessResult: preprocessResult,
+                fullText: normalized
             )
 
             if count > capacity {
-                let fragments = splitByPunctuation(segment)
+                let fragments = splitSegmentByPunctuation(segment, in: normalized)
                 let reassembled = reassembleFragments(
                     fragments,
+                    fullText: normalized,
+                    preprocessResult: preprocessResult,
                     lexicon: wordToPhonemes,
                     caseSensitiveLexicon: caseSensitiveLexicon,
                     allowed: allowedPhonemes,
@@ -82,11 +94,11 @@ enum KokoroChunker {
                         "Segment exceeded capacity; punctuation split yielded \(reassembled.count) subsegments"
                     )
                     logger.info(
-                        "segmentsByPeriodsSplit[\(periodIndex)]: original='\(segment)'"
+                        "segmentsByPeriodsSplit[\(periodIndex)]: original='\(segment.text)'"
                     )
                     for (fragmentIndex, part) in reassembled.enumerated() {
                         logger.info(
-                            "segmentsByPeriodsSplit[\(periodIndex)].part[\(fragmentIndex)]: \(part)"
+                            "segmentsByPeriodsSplit[\(periodIndex)].part[\(fragmentIndex)]: \(part.text)"
                         )
                     }
                     segmentsByPunctuations.append(contentsOf: reassembled)
@@ -101,12 +113,14 @@ enum KokoroChunker {
         }
 
         for (index, segment) in segmentsByPunctuations.enumerated() {
-            logger.info("segmentsByPunctuations[\(index)]: \(segment)")
+            logger.info("segmentsByPunctuations[\(index)]: \(segment.text)")
         }
 
-        let chunks = segmentsByPunctuations.flatMap { chunkText in
+        let chunks = segmentsByPunctuations.flatMap { segment in
             buildChunks(
-                from: chunkText,
+                from: segment,
+                fullText: normalized,
+                preprocessResult: preprocessResult,
                 lexicon: wordToPhonemes,
                 caseSensitiveLexicon: caseSensitiveLexicon,
                 allowed: allowedPhonemes,
@@ -125,7 +139,7 @@ enum KokoroChunker {
 
     // MARK: - Sentence Processing
 
-    private static func splitIntoSentences(_ text: String) -> ([String], NLLanguage?) {
+    private static func splitIntoSentences(_ text: String) -> ([ChunkSegment], NLLanguage?) {
         #if canImport(NaturalLanguage)
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(text)
@@ -135,60 +149,88 @@ enum KokoroChunker {
         tokenizer.string = text
         tokenizer.setLanguage(dominant)
 
-        var sentences: [String] = []
+        var sentences: [ChunkSegment] = []
         tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-            let candidate = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !candidate.isEmpty {
-                sentences.append(candidate)
+            if let trimmed = trimmedRange(range, in: text) {
+                let segmentText = String(text[trimmed])
+                sentences.append(ChunkSegment(text: segmentText, range: trimmed))
             }
             return true
         }
-        if sentences.isEmpty {
-            return ([text], dominant)
+
+        if sentences.isEmpty, let entireRange = trimmedRange(text.startIndex..<text.endIndex, in: text) {
+            return ([ChunkSegment(text: String(text[entireRange]), range: entireRange)], dominant)
         }
         return (sentences, dominant)
         #else
-        // Fallback: split on period/question/exclamation marks.
         let delimiters = CharacterSet(charactersIn: ".?!")
-        var current = ""
-        var sentences: [String] = []
-        for char in text {
-            current.append(char)
-            if let scalar = char.unicodeScalars.first, delimiters.contains(scalar) {
-                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    sentences.append(trimmed)
+        var sentences: [ChunkSegment] = []
+        var currentStart = text.startIndex
+        var index = currentStart
+
+        while index < text.endIndex {
+            let character = text[index]
+            index = text.index(after: index)
+            if let scalar = character.unicodeScalars.first, delimiters.contains(scalar) {
+                let sentenceRange = currentStart..<index
+                if let trimmed = trimmedRange(sentenceRange, in: text) {
+                    sentences.append(ChunkSegment(text: String(text[trimmed]), range: trimmed))
                 }
-                current.removeAll(keepingCapacity: true)
+                currentStart = index
             }
         }
-        if !current.isEmpty {
-            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                sentences.append(trimmed)
+
+        if currentStart < text.endIndex {
+            let tailRange = currentStart..<text.endIndex
+            if let trimmed = trimmedRange(tailRange, in: text) {
+                sentences.append(ChunkSegment(text: String(text[trimmed]), range: trimmed))
             }
         }
-        return (sentences.isEmpty ? [text] : sentences, nil)
+
+        if sentences.isEmpty, let entireRange = trimmedRange(text.startIndex..<text.endIndex, in: text) {
+            return ([ChunkSegment(text: String(text[entireRange]), range: entireRange)], nil)
+        }
+
+        return (sentences, nil)
         #endif
     }
 
-    private static func applyRefinements(_ sentences: [String]) -> [String] {
-        sentences.compactMap { sentence in
-            let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+    private static func applyRefinements(_ sentences: [ChunkSegment]) -> [ChunkSegment] {
+        sentences.filter { !$0.text.isEmpty }
+    }
+
+    private static func trimmedRange(_ range: Range<String.Index>, in text: String) -> Range<String.Index>? {
+        var lower = range.lowerBound
+        var upper = range.upperBound
+
+        while lower < upper, text[lower].isWhitespace {
+            lower = text.index(after: lower)
         }
+
+        while upper > lower {
+            let before = text.index(before: upper)
+            if text[before].isWhitespace {
+                upper = before
+            } else {
+                break
+            }
+        }
+
+        return lower < upper ? lower..<upper : nil
     }
 
     // MARK: - Chunk Construction
 
     private static func buildChunks(
-        from text: String,
+        from segment: ChunkSegment,
+        fullText: String,
+        preprocessResult: KokoroTextPreprocessor.Result,
         lexicon: [String: [String]],
         caseSensitiveLexicon: [String: [String]],
         allowed: Set<String>,
         capacity: Int
     ) -> [TextChunk] {
-        let atoms = tokenizeAtoms(text)
+        let atoms = tokenizeAtoms(in: segment, fullText: fullText, preprocessResult: preprocessResult)
         guard !atoms.isEmpty else { return [] }
 
         var chunks: [TextChunk] = []
@@ -226,15 +268,24 @@ enum KokoroChunker {
         }
 
         for atom in atoms {
+            if atom.suppress {
+                switch atom.kind {
+                case .word:
+                    chunkWords.append(atom.text)
+                    chunkAtoms.append(atom.text)
+                    needsWordSeparator = true
+                case .punctuation:
+                    chunkAtoms.append(atom.text)
+                    needsWordSeparator = false
+                }
+                continue
+            }
+
             switch atom.kind {
             case .word(let original):
-                let normalized = normalize(original)
-                guard !normalized.isEmpty else { continue }
-
                 guard
-                    let resolved = resolvePhonemes(
-                        for: original,
-                        normalized: normalized,
+                    let resolved = phonemesForAtom(
+                        atom,
                         lexicon: lexicon,
                         caseSensitiveLexicon: caseSensitiveLexicon,
                         allowed: allowed,
@@ -265,12 +316,24 @@ enum KokoroChunker {
                 needsWordSeparator = true
 
             case .punctuation(let symbol):
-                guard allowed.contains(symbol) else { continue }
-                if chunkTokenCount + 1 > capacity && !chunkPhonemes.isEmpty {
+                guard
+                    let resolved = phonemesForAtom(
+                        atom,
+                        lexicon: lexicon,
+                        caseSensitiveLexicon: caseSensitiveLexicon,
+                        allowed: allowed,
+                        missing: &missing
+                    )
+                else {
+                    continue
+                }
+
+                if chunkTokenCount + resolved.count > capacity && !chunkPhonemes.isEmpty {
                     flushChunk()
                 }
-                chunkPhonemes.append(symbol)
-                chunkTokenCount += 1
+
+                chunkPhonemes.append(contentsOf: resolved)
+                chunkTokenCount += resolved.count
                 chunkAtoms.append(symbol)
                 needsWordSeparator = false
             }
@@ -293,34 +356,73 @@ enum KokoroChunker {
     private struct AtomToken {
         let text: String
         let kind: AtomKind
+        let range: Range<String.Index>
+        let feature: KokoroTextPreprocessor.Result.FeatureRange.Feature?
+        let suppress: Bool
     }
 
-    private static func tokenizeAtoms(_ text: String) -> [AtomToken] {
+    private static func tokenizeAtoms(
+        in segment: ChunkSegment,
+        fullText: String,
+        preprocessResult: KokoroTextPreprocessor.Result
+    ) -> [AtomToken] {
         var atoms: [AtomToken] = []
         var currentWord = ""
+        var currentWordStart: String.Index?
 
-        func flushWord() {
-            guard !currentWord.isEmpty else { return }
-            let word = currentWord
-            atoms.append(AtomToken(text: word, kind: .word(word)))
+        func flushWord(upTo end: String.Index) {
+            guard let start = currentWordStart, !currentWord.isEmpty else { return }
+            let range = start..<end
+            let annotation = preprocessResult.annotation(for: range)
+            atoms.append(
+                AtomToken(
+                    text: currentWord,
+                    kind: .word(currentWord),
+                    range: range,
+                    feature: annotation.feature,
+                    suppress: annotation.suppress
+                )
+            )
             currentWord.removeAll(keepingCapacity: true)
+            currentWordStart = nil
         }
 
-        for ch in text {
-            if ch.isWhitespace {
-                flushWord()
+        var index = segment.range.lowerBound
+        while index < segment.range.upperBound {
+            let character = fullText[index]
+
+            if character.isWhitespace {
+                flushWord(upTo: index)
+                index = fullText.index(after: index)
                 continue
             }
 
-            if ch.isLetter || ch.isNumber || apostropheCharacters.contains(ch) {
-                currentWord.append(apostropheCharacters.contains(ch) ? "'" : ch)
-            } else {
-                flushWord()
-                atoms.append(AtomToken(text: String(ch), kind: .punctuation(String(ch))))
+            if character.isLetter || character.isNumber || apostropheCharacters.contains(character) {
+                if currentWordStart == nil {
+                    currentWordStart = index
+                }
+                currentWord.append(apostropheCharacters.contains(character) ? "'" : character)
+                index = fullText.index(after: index)
+                continue
             }
+
+            flushWord(upTo: index)
+            let nextIndex = fullText.index(after: index)
+            let range = index..<nextIndex
+            let annotation = preprocessResult.annotation(for: range)
+            atoms.append(
+                AtomToken(
+                    text: String(character),
+                    kind: .punctuation(String(character)),
+                    range: range,
+                    feature: annotation.feature,
+                    suppress: annotation.suppress
+                )
+            )
+            index = nextIndex
         }
 
-        flushWord()
+        flushWord(upTo: segment.range.upperBound)
         return atoms
     }
 
@@ -430,29 +532,29 @@ enum KokoroChunker {
     }
 
     private static func tokenCountForSegment(
-        for text: String,
+        _ segment: ChunkSegment,
         lexicon: [String: [String]],
         caseSensitiveLexicon: [String: [String]],
         allowed: Set<String>,
-        capacity: Int
+        capacity: Int,
+        preprocessResult: KokoroTextPreprocessor.Result,
+        fullText: String
     ) -> Int {
-        let atoms = tokenizeAtoms(text)
+        let atoms = tokenizeAtoms(in: segment, fullText: fullText, preprocessResult: preprocessResult)
         guard !atoms.isEmpty else { return 0 }
 
         var dummyMissing: Set<String> = []
-
         var tokenCount = 0
         var needsWordSeparator = false
 
         for atom in atoms {
+            if atom.suppress { continue }
+
             switch atom.kind {
-            case .word(let original):
-                let normalized = normalize(original)
-                guard !normalized.isEmpty else { continue }
+            case .word, .punctuation:
                 guard
-                    let phonemes = resolvePhonemes(
-                        for: original,
-                        normalized: normalized,
+                    let phonemes = phonemesForAtom(
+                        atom,
                         lexicon: lexicon,
                         caseSensitiveLexicon: caseSensitiveLexicon,
                         allowed: allowed,
@@ -462,14 +564,14 @@ enum KokoroChunker {
                     continue
                 }
                 tokenCount += phonemes.count
-                if needsWordSeparator {
-                    tokenCount += 1
+                if case .word = atom.kind {
+                    if needsWordSeparator {
+                        tokenCount += 1
+                    }
+                    needsWordSeparator = true
+                } else {
+                    needsWordSeparator = false
                 }
-                needsWordSeparator = true
-            case .punctuation(let symbol):
-                guard allowed.contains(symbol) else { continue }
-                tokenCount += 1
-                needsWordSeparator = false
             }
 
             if tokenCount > capacity {
@@ -481,149 +583,252 @@ enum KokoroChunker {
     }
 
     private static func reassembleFragments(
-        _ fragments: [String],
+        _ fragments: [ChunkSegment],
+        fullText: String,
+        preprocessResult: KokoroTextPreprocessor.Result,
         lexicon: [String: [String]],
         caseSensitiveLexicon: [String: [String]],
         allowed: Set<String>,
         capacity: Int
-    ) -> [String] {
+    ) -> [ChunkSegment] {
         guard !fragments.isEmpty else { return [] }
 
-        var assembled: [String] = []
-        var current = ""
+        var assembled: [ChunkSegment] = []
+        var currentRange = fragments[0].range
 
-        func flushCurrent() {
-            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                assembled.append(trimmed)
-            }
-            current.removeAll(keepingCapacity: false)
-        }
-
-        for fragment in fragments {
-            let trimmedFragment = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedFragment.isEmpty else { continue }
-
-            let candidate =
-                current.isEmpty
-                ? trimmedFragment
-                : appendSegment(current, with: trimmedFragment)
-            let candidateTokens = tokenCountForSegment(
-                for: candidate,
+        func flushCurrent() -> Bool {
+            guard let trimmed = trimmedRange(currentRange, in: fullText) else { return true }
+            let segment = ChunkSegment(text: String(fullText[trimmed]), range: trimmed)
+            let count = tokenCountForSegment(
+                segment,
                 lexicon: lexicon,
                 caseSensitiveLexicon: caseSensitiveLexicon,
                 allowed: allowed,
-                capacity: capacity
+                capacity: capacity,
+                preprocessResult: preprocessResult,
+                fullText: fullText
+            )
+            if count > capacity {
+                return false
+            }
+            assembled.append(segment)
+            return true
+        }
+
+        for fragment in fragments.dropFirst() {
+            let candidateRange = currentRange.lowerBound..<fragment.range.upperBound
+            let candidateSegment = ChunkSegment(text: String(fullText[candidateRange]), range: candidateRange)
+            let candidateTokens = tokenCountForSegment(
+                candidateSegment,
+                lexicon: lexicon,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowed,
+                capacity: capacity,
+                preprocessResult: preprocessResult,
+                fullText: fullText
             )
 
-            if candidateTokens <= capacity || current.isEmpty {
-                current = candidate
+            if candidateTokens <= capacity {
+                currentRange = candidateRange
             } else {
-                flushCurrent()
-                current = trimmedFragment
-                let fragmentTokens = tokenCountForSegment(
-                    for: current,
-                    lexicon: lexicon,
-                    caseSensitiveLexicon: caseSensitiveLexicon,
-                    allowed: allowed,
-                    capacity: capacity
-                )
-                if fragmentTokens > capacity {
-                    // Fall back to returning empty so caller can handle via chunk builder.
+                if !flushCurrent() {
                     return []
                 }
+                currentRange = fragment.range
             }
         }
 
-        flushCurrent()
+        if !flushCurrent() {
+            return []
+        }
+
         return assembled
     }
 
-    private static func splitByPunctuation(_ text: String) -> [String] {
-        guard !text.isEmpty else { return [] }
+    private static func phonemesForAtom(
+        _ atom: AtomToken,
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        missing: inout Set<String>
+    ) -> [String]? {
+        switch atom.kind {
+        case .word(let original):
+            let normalized = normalize(original)
+            guard !normalized.isEmpty else { return nil }
 
-        var segments: [String] = []
-        var currentStart = text.startIndex
+            var overridePhonemes: [String]? = nil
+            if let feature = atom.feature {
+                switch feature {
+                case .phoneme(let override):
+                    overridePhonemes = manualPhonemes(override, allowed: allowed)
+                case .alias(let aliasText):
+                    overridePhonemes = phonemesForAlias(
+                        aliasText,
+                        lexicon: lexicon,
+                        caseSensitiveLexicon: caseSensitiveLexicon,
+                        allowed: allowed,
+                        missing: &missing
+                    )
+                }
+            }
+
+            if let override = overridePhonemes, !override.isEmpty {
+                return override
+            }
+
+            return resolvePhonemes(
+                for: original,
+                normalized: normalized,
+                lexicon: lexicon,
+                caseSensitiveLexicon: caseSensitiveLexicon,
+                allowed: allowed,
+                missing: &missing
+            )
+
+        case .punctuation(let symbol):
+            guard allowed.contains(symbol) else { return nil }
+            return [symbol]
+        }
+    }
+
+    private static func manualPhonemes(
+        _ override: String,
+        allowed: Set<String>
+    ) -> [String]? {
+        let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let graphemeTokens = trimmed.compactMap { character -> String? in
+            character.isWhitespace ? nil : String(character)
+        }
+        let mapped = PhonemeMapper.mapIPA(graphemeTokens, allowed: allowed)
+        if !mapped.isEmpty {
+            return mapped
+        }
+
+        let parts = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if parts.isEmpty {
+            return allowed.contains(trimmed) ? [trimmed] : nil
+        }
+
+        let filtered = parts.filter { allowed.contains($0) }
+        return filtered.count == parts.count ? filtered : nil
+    }
+
+    private static func phonemesForAlias(
+        _ alias: String,
+        lexicon: [String: [String]],
+        caseSensitiveLexicon: [String: [String]],
+        allowed: Set<String>,
+        missing: inout Set<String>
+    ) -> [String]? {
+        let tokens = tokenizeAlias(alias)
+        guard !tokens.isEmpty else { return nil }
+
+        var aliasPhonemes: [String] = []
+        var needsSeparator = false
+
+        for token in tokens {
+            switch token {
+            case .word(let word):
+                let normalized = normalize(word)
+                guard !normalized.isEmpty else { continue }
+                guard
+                    let resolved = resolvePhonemes(
+                        for: word,
+                        normalized: normalized,
+                        lexicon: lexicon,
+                        caseSensitiveLexicon: caseSensitiveLexicon,
+                        allowed: allowed,
+                        missing: &missing
+                    )
+                else {
+                    return nil
+                }
+                if needsSeparator {
+                    aliasPhonemes.append(" ")
+                }
+                aliasPhonemes.append(contentsOf: resolved)
+                needsSeparator = true
+            case .punctuation(let symbol):
+                guard allowed.contains(symbol) else { continue }
+                aliasPhonemes.append(symbol)
+                needsSeparator = false
+            }
+        }
+
+        return aliasPhonemes.isEmpty ? nil : aliasPhonemes
+    }
+
+    private static func tokenizeAlias(_ text: String) -> [AtomKind] {
+        var tokens: [AtomKind] = []
+        var currentWord = ""
+
+        func flushWord() {
+            guard !currentWord.isEmpty else { return }
+            tokens.append(.word(currentWord))
+            currentWord.removeAll(keepingCapacity: true)
+        }
+
+        for character in text {
+            if character.isWhitespace {
+                flushWord()
+                continue
+            }
+
+            if character.isLetter || character.isNumber || apostropheCharacters.contains(character) {
+                currentWord.append(apostropheCharacters.contains(character) ? "'" : character)
+            } else {
+                flushWord()
+                tokens.append(.punctuation(String(character)))
+            }
+        }
+
+        flushWord()
+        return tokens
+    }
+
+    private static func splitSegmentByPunctuation(_ segment: ChunkSegment, in fullText: String) -> [ChunkSegment] {
+        guard !segment.text.isEmpty else { return [] }
+
+        var segments: [ChunkSegment] = []
+        var currentStart = segment.range.lowerBound
         let breakCharacters = CharacterSet(charactersIn: ",;:")
         let separatorTokens = [": ", "; ", ", "]
 
-        #if canImport(NaturalLanguage)
-        if #available(macOS 10.14, iOS 12.0, *) {
-            let tagger = NLTagger(tagSchemes: [.lexicalClass])
-            tagger.string = text
-            tagger.enumerateTags(
-                in: text.startIndex..<text.endIndex,
-                unit: .word,
-                scheme: .lexicalClass,
-                options: []
-            ) { tag, range in
-                guard tag == .punctuation else { return true }
-                let token = text[range]
-                if token.unicodeScalars.contains(where: { breakCharacters.contains($0) }) {
-                    var endIndex = range.upperBound
-                    for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
-                        endIndex = text.index(endIndex, offsetBy: separator.count)
-                        break
-                    }
-                    let segment = text[currentStart..<endIndex]
-                    let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        segments.append(trimmed)
-                    }
-                    currentStart = endIndex
-                }
-                return true
-            }
-        } else {
-            let tagger = NSLinguisticTagger(tagSchemes: [.lexicalClass], options: 0)
-            tagger.string = text
-            let nsRange = NSRange(location: 0, length: (text as NSString).length)
-            tagger.enumerateTags(in: nsRange, unit: .word, scheme: .lexicalClass, options: []) {
-                tag, range, _ in
-                guard tag == .punctuation, let tokenRange = Range(range, in: text) else { return }
-                let token = text[tokenRange]
-                if token.unicodeScalars.contains(where: { breakCharacters.contains($0) }) {
-                    var endIndex = tokenRange.upperBound
-                    for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
-                        endIndex = text.index(endIndex, offsetBy: separator.count)
-                        break
-                    }
-                    let segment = text[currentStart..<endIndex]
-                    let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        segments.append(trimmed)
-                    }
-                    currentStart = endIndex
-                }
-            }
-        }
-        #else
-        for (offset, character) in text.enumerated() {
+        var index = currentStart
+        while index < segment.range.upperBound {
+            let character = fullText[index]
             if let scalar = character.unicodeScalars.first, breakCharacters.contains(scalar) {
-                var endIndex = text.index(text.startIndex, offsetBy: offset + 1)
-                for separator in separatorTokens where text[endIndex...].hasPrefix(separator) {
-                    endIndex = text.index(endIndex, offsetBy: separator.count)
-                    break
+                var endIndex = fullText.index(after: index)
+                for separator in separatorTokens {
+                    if endIndex < segment.range.upperBound {
+                        let remaining = fullText[endIndex..<segment.range.upperBound]
+                        if remaining.hasPrefix(separator) {
+                            endIndex =
+                                fullText.index(endIndex, offsetBy: separator.count, limitedBy: segment.range.upperBound)
+                                ?? segment.range.upperBound
+                            break
+                        }
+                    }
                 }
-                let segment = text[currentStart..<endIndex]
-                let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    segments.append(trimmed)
+
+                if let trimmed = trimmedRange(currentStart..<endIndex, in: fullText) {
+                    segments.append(ChunkSegment(text: String(fullText[trimmed]), range: trimmed))
                 }
                 currentStart = endIndex
             }
+            index = fullText.index(after: index)
         }
-        #endif
 
-        if currentStart < text.endIndex {
-            let tail = text[currentStart..<text.endIndex]
-            let trimmedTail = tail.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedTail.isEmpty {
-                segments.append(trimmedTail)
+        if currentStart < segment.range.upperBound {
+            if let trimmedTail = trimmedRange(currentStart..<segment.range.upperBound, in: fullText) {
+                segments.append(ChunkSegment(text: String(fullText[trimmedTail]), range: trimmedTail))
             }
         }
 
-        return segments.isEmpty ? [text] : segments
+        return segments.isEmpty ? [segment] : segments
     }
 
     private static func normalize(_ word: String) -> String {

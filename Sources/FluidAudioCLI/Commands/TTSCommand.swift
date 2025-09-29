@@ -100,6 +100,8 @@ public struct TTS {
         var variantPreference: ModelNames.TTS.Variant? = nil
         var text: String? = nil
         var benchmarkMode = false
+        var preWarmOnly = false
+        var preWarmBeforeSynth = false
 
         var i = 0
         while i < arguments.count {
@@ -146,6 +148,10 @@ public struct TTS {
                 ()
             case "--benchmark":
                 benchmarkMode = true
+            case "--prewarm-only":
+                preWarmOnly = true
+            case "--prewarm":
+                preWarmBeforeSynth = true
             default:
                 if text == nil {
                     text = argument
@@ -154,6 +160,16 @@ public struct TTS {
                 }
             }
             i += 1
+        }
+
+        if preWarmOnly && benchmarkMode {
+            logger.error("--prewarm-only cannot be combined with --benchmark")
+            return
+        }
+
+        if preWarmOnly && text != nil {
+            logger.warning("Text argument ignored when --prewarm-only is specified")
+            text = nil
         }
 
         if benchmarkMode {
@@ -167,11 +183,6 @@ public struct TTS {
             return
         }
 
-        guard let text = text else {
-            printUsage()
-            return
-        }
-
         do {
             // Timing buckets
             let tStart = Date()
@@ -181,6 +192,27 @@ public struct TTS {
             let tLoad0 = Date()
             try await manager.initialize()
             let tLoad1 = Date()
+
+            if preWarmOnly {
+                try await manager.preWarm(variant: variantPreference)
+                let loadDuration = tLoad1.timeIntervalSince(tLoad0)
+                logger.info(
+                    "Initialization completed in \(String(format: "%.2f", loadDuration))s; manual pre-warm executed")
+                return
+            }
+
+            if preWarmBeforeSynth {
+                let warmStart = Date()
+                try await manager.preWarm(variant: variantPreference)
+                let warmDuration = Date().timeIntervalSince(warmStart)
+                logger.info(
+                    "Manual pre-warm completed before synthesis (\(String(format: "%.2f", warmDuration))s)")
+            }
+
+            guard let text = text else {
+                printUsage()
+                return
+            }
 
             let tSynth0 = Date()
             let requestedVoice = voice.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -379,6 +411,8 @@ public struct TTS {
               --variant            Force Kokoro 5s or 15s model (values: 5s,15s)
               --metrics            Write timing metrics to a JSON file (also runs ASR for evaluation)
               --chunk-dir          Directory where individual chunk WAVs will be written
+              --prewarm            Pre-warm the requested model variant before synthesis
+              --prewarm-only       Only pre-warm resources (no synthesis)
               (models/dictionary auto-download is always on in CLI)
               --help, -h           Show this help
             """

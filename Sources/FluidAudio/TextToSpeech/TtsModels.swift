@@ -32,7 +32,6 @@ public struct TtsModels {
             computeUnits: .cpuAndGPU
         )
         var loaded: [ModelNames.TTS.Variant: MLModel] = [:]
-        var warmUpDurations: [ModelNames.TTS.Variant: TimeInterval] = [:]
 
         for variant in ModelNames.TTS.Variant.allCases {
             let name = variant.fileName
@@ -40,28 +39,6 @@ public struct TtsModels {
                 throw TTSError.modelNotFound(name)
             }
             loaded[variant] = model
-        }
-
-        try await withThrowingTaskGroup(of: (ModelNames.TTS.Variant, TimeInterval).self) { group in
-            for (variant, model) in loaded {
-                group.addTask(priority: .userInitiated) {
-                    let warmUpStart = Date()
-                    await warmUpModel(model, variant: variant)
-                    let warmUpDuration = Date().timeIntervalSince(warmUpStart)
-                    return (variant, warmUpDuration)
-                }
-            }
-
-            for try await (variant, duration) in group {
-                warmUpDurations[variant] = duration
-            }
-        }
-
-        for variant in ModelNames.TTS.Variant.allCases {
-            if let duration = warmUpDurations[variant] {
-                logger.info(
-                    "Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", duration))s")
-            }
         }
 
         return TtsModels(models: loaded)
@@ -166,6 +143,32 @@ public struct TtsModels {
             return "5s"
         case .fifteenSecond:
             return "15s"
+        }
+    }
+
+    public static func preWarm(
+        _ models: TtsModels,
+        variants: [ModelNames.TTS.Variant]? = nil
+    ) async {
+        let targets = variants ?? [ModelNames.TTS.defaultVariant]
+        await withTaskGroup(of: (ModelNames.TTS.Variant, TimeInterval).self) { group in
+            for variant in targets {
+                guard let model = models.model(for: variant) else {
+                    logger.warning("No model loaded for variant \(variantDescription(variant)); skipping warm-up")
+                    continue
+                }
+                group.addTask(priority: .userInitiated) {
+                    let start = Date()
+                    await warmUpModel(model, variant: variant)
+                    return (variant, Date().timeIntervalSince(start))
+                }
+            }
+
+            for await result in group {
+                let (variant, duration) = result
+                logger.info(
+                    "Warm-up completed for \(variantDescription(variant)) in \(String(format: "%.2f", duration))s")
+            }
         }
     }
 }

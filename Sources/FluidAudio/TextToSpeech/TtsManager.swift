@@ -131,6 +131,25 @@ public final class TtSManager {
         return KokoroSynthesizer.SynthesisResult(audio: audioData, chunks: adjustedChunks)
     }
 
+    public func preWarm(variant: ModelNames.TTS.Variant? = nil) async throws {
+        guard isInitialized, let models = ttsModels else {
+            throw TTSError.modelNotFound("Kokoro model not initialized")
+        }
+        let targets = variant.map { [$0] } ?? ModelNames.TTS.Variant.allCases
+        await TtsModels.preWarm(models, variants: targets)
+        if targets.count == 1, let only = targets.first {
+            let label: String = {
+                switch only {
+                case .fiveSecond: return "5s"
+                case .fifteenSecond: return "15s"
+                }
+            }()
+            logger.info("Pre-warm completed for Kokoro \(label) model")
+        } else {
+            logger.info("Pre-warm completed for Kokoro models: \(targets.map { $0.fileName }.joined(separator: ", "))")
+        }
+    }
+
     private func sanitizeInput(_ text: String) throws -> String {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
