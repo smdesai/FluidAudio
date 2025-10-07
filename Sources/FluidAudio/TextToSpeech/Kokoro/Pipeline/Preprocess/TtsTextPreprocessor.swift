@@ -1,5 +1,31 @@
 import Foundation
 
+public struct TtsPreprocessingResult {
+    public let text: String
+    public let phoneticOverrides: [TtsPhoneticOverride]
+
+    public init(text: String, phoneticOverrides: [TtsPhoneticOverride]) {
+        self.text = text
+        self.phoneticOverrides = phoneticOverrides
+    }
+}
+
+public struct TtsPhoneticOverride: Sendable {
+    public let wordIndex: Int
+    public let tokens: [String]
+    public let scalarTokens: [String]
+    public let raw: String
+    public let word: String
+
+    public init(wordIndex: Int, tokens: [String], scalarTokens: [String], raw: String, word: String) {
+        self.wordIndex = wordIndex
+        self.tokens = tokens
+        self.scalarTokens = scalarTokens
+        self.raw = raw
+        self.word = word
+    }
+}
+
 /// Text preprocessing for TTS following mlx-audio's comprehensive approach
 /// Handles numbers, currencies, times, units, and other text normalization
 /// All preprocessing happens before tokenization to prevent splitting issues
@@ -8,6 +34,10 @@ enum TtsTextPreprocessor {
     /// Main preprocessing entry point that normalizes text for better TTS synthesis
     /// Following mlx-audio's order: commas → ranges → currencies → times → decimals → units → abbreviations
     static func preprocess(_ text: String) -> String {
+        preprocessDetailed(text).text
+    }
+
+    static func preprocessDetailed(_ text: String) -> TtsPreprocessingResult {
         var processed = text
 
         // 1. Remove commas from numbers (1,000 → 1000)
@@ -31,7 +61,14 @@ enum TtsTextPreprocessor {
         // 7. Handle common abbreviations and symbols
         processed = processCommonAbbreviations(processed)
 
-        return processed
+        // 8. Handle alias replacement
+        processed = processAliasReplacement(processed)
+
+        // 9. Handle phonetic replacement
+        let phoneticResult = processPhoneticReplacement(processed)
+        processed = phoneticResult.text
+
+        return TtsPreprocessingResult(text: processed, phoneticOverrides: phoneticResult.overrides)
     }
 
     // MARK: - Number Processing
@@ -327,7 +364,202 @@ enum TtsTextPreprocessor {
         return processed
     }
 
+    // MARK: - Alias Replacement
+
+    private static func processAliasReplacement(_ text: String) -> String {
+        guard text.contains("[") && text.contains("](") else {
+            return text
+        }
+
+        let searchRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = aliasRegex.matches(in: text, options: [], range: searchRange)
+
+        var result = text
+        for match in matches.reversed() {
+            guard
+                let fullRange = Range(match.range, in: result),
+                let replacementRange = Range(match.range(at: 1), in: result)
+            else {
+                continue
+            }
+
+            let replacement = result[replacementRange].trimmingCharacters(in: .whitespacesAndNewlines)
+            if isPhoneticReplacement(replacement) {
+                continue
+            }
+            result.replaceSubrange(fullRange, with: replacement)
+        }
+
+        return result
+    }
+
+    private static func processPhoneticReplacement(_ text: String) -> (text: String, overrides: [TtsPhoneticOverride]) {
+        guard text.contains("[") else {
+            return (text, [])
+        }
+
+        var overrides: [TtsPhoneticOverride] = []
+        overrides.reserveCapacity(4)
+
+        var output = String()
+        output.reserveCapacity(text.count)
+
+        let end = text.endIndex
+        var index = text.startIndex
+        var inWord = false
+        var completedWords = 0
+
+        func finalizeCurrentWord() {
+            if inWord {
+                completedWords += 1
+                inWord = false
+            }
+        }
+
+        func appendCharacter(_ character: Character) {
+            output.append(character)
+            if isWordCharacter(character) {
+                if !inWord {
+                    inWord = true
+                }
+            } else {
+                if inWord {
+                    completedWords += 1
+                    inWord = false
+                }
+            }
+        }
+
+        func appendString<S: Sequence>(_ sequence: S) where S.Element == Character {
+            for character in sequence {
+                appendCharacter(character)
+            }
+        }
+
+        while index < end {
+            let character = text[index]
+            if character == "[" {
+                if let parsed = parsePhoneticSpan(in: text, startingAt: index) {
+                    if inWord {
+                        finalizeCurrentWord()
+                    }
+
+                    let (word, raw, tokens, scalarTokens, nextIndex) = parsed
+                    let trimmedWord = word.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmedWord.isEmpty {
+                        let overrideIndex = completedWords
+                        appendString(trimmedWord)
+                        overrides.append(
+                            TtsPhoneticOverride(
+                                wordIndex: overrideIndex,
+                                tokens: tokens,
+                                scalarTokens: scalarTokens,
+                                raw: raw,
+                                word: trimmedWord
+                            )
+                        )
+                        index = nextIndex
+                        continue
+                    }
+                }
+
+                appendCharacter(character)
+                index = text.index(after: index)
+                continue
+            }
+
+            appendCharacter(character)
+            index = text.index(after: index)
+        }
+
+        finalizeCurrentWord()
+        return (output, overrides)
+    }
+
+    private static func parsePhoneticSpan(
+        in text: String,
+        startingAt start: String.Index
+    ) -> (word: String, raw: String, tokens: [String], scalarTokens: [String], nextIndex: String.Index)? {
+        let end = text.endIndex
+        var cursor = text.index(after: start)
+        guard cursor < end else { return nil }
+
+        var closingBracket: String.Index?
+        while cursor < end {
+            let character = text[cursor]
+            if character == "]" {
+                closingBracket = cursor
+                break
+            }
+            if character == "[" {
+                return nil
+            }
+            cursor = text.index(after: cursor)
+        }
+
+        guard let bracket = closingBracket else { return nil }
+        let wordRange = text.index(after: start)..<bracket
+        let afterBracket = text.index(after: bracket)
+        guard afterBracket < end, text[afterBracket] == "(" else { return nil }
+
+        var search = text.index(after: afterBracket)
+        var closingParen: String.Index?
+        while search < end {
+            if text[search] == ")" {
+                closingParen = search
+                break
+            }
+            search = text.index(after: search)
+        }
+
+        guard let paren = closingParen else { return nil }
+        let phonemeRange = text.index(after: afterBracket)..<paren
+        let outer = text[phonemeRange]
+        let trimmedOuter = outer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedOuter.first == "/", trimmedOuter.last == "/" else { return nil }
+
+        let inner = trimmedOuter.dropFirst().dropLast()
+        let raw = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+
+        let (tokens, scalarTokens) = tokenizePhonemeString(raw)
+        guard !tokens.isEmpty || !scalarTokens.isEmpty else { return nil }
+
+        let nextIndex = text.index(after: paren)
+        let word = String(text[wordRange])
+        return (word, raw, tokens, scalarTokens, nextIndex)
+    }
+
+    private static func tokenizePhonemeString(_ value: String) -> (tokens: [String], scalarTokens: [String]) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ([], []) }
+
+        let scalarTokens = trimmed.unicodeScalars.map { String($0) }
+        let components = trimmed.split(whereSeparator: { $0.isWhitespace })
+        if components.count > 1 {
+            let tokens = components.map { String($0) }
+            return (tokens, scalarTokens)
+        }
+
+        return ([trimmed], scalarTokens)
+    }
+
+    private static func isWordCharacter(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber || phoneticApostropheCharacters.contains(character)
+    }
+
+    private static func isPhoneticReplacement(_ value: String) -> Bool {
+        guard value.count >= 2 else { return false }
+        return value.first == "/" && value.last == "/"
+    }
+
     // MARK: - Constants
+
+    private static let aliasRegex: NSRegularExpression = {
+        try! NSRegularExpression(pattern: #"\[[^\[\]]+\]\(\s*([^\)]+?)\s*\)"#, options: [])
+    }()
+
+    private static let phoneticApostropheCharacters: Set<Character> = ["'", "’", "ʼ", "‛", "‵", "′"]
 
     private static let currencies: [Character: (bill: String, cent: String)] = [
         "$": ("dollar", "cent"),

@@ -28,7 +28,8 @@ enum KokoroChunker {
         caseSensitiveLexicon: [String: [String]],
         targetTokens: Int,
         hasLanguageToken: Bool,
-        allowedPhonemes: Set<String>
+        allowedPhonemes: Set<String>,
+        phoneticOverrides: [TtsPhoneticOverride]
     ) -> [TextChunk] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -92,14 +93,39 @@ enum KokoroChunker {
             segmentsByPunctuations.append(segment)
         }
 
-        let chunks = segmentsByPunctuations.flatMap { chunkText in
-            buildChunks(
+        var sortedOverrides = phoneticOverrides
+            .enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.wordIndex == rhs.element.wordIndex {
+                    return lhs.offset < rhs.offset
+                }
+                return lhs.element.wordIndex < rhs.element.wordIndex
+            }
+            .map { $0.element }
+        var overrideCursor = 0
+
+        var globalWordIndex = 0
+        var chunks: [TextChunk] = []
+        chunks.reserveCapacity(segmentsByPunctuations.count)
+
+        for chunkText in segmentsByPunctuations {
+            let built = buildChunks(
                 from: chunkText,
                 lexicon: wordToPhonemes,
                 caseSensitiveLexicon: caseSensitiveLexicon,
                 allowed: allowedPhonemes,
-                capacity: capacity
+                capacity: capacity,
+                wordIndex: &globalWordIndex,
+                overrides: sortedOverrides,
+                overrideCursor: &overrideCursor
             )
+            chunks.append(contentsOf: built)
+        }
+
+        if overrideCursor < sortedOverrides.count {
+            let remaining = sortedOverrides[overrideCursor...]
+            let sample = remaining.prefix(5).map { $0.word }
+            logger.warning("Unused phonetic overrides for words: \(sample.joined(separator: ", "))")
         }
 
         return chunks
@@ -229,7 +255,10 @@ enum KokoroChunker {
         lexicon: [String: [String]],
         caseSensitiveLexicon: [String: [String]],
         allowed: Set<String>,
-        capacity: Int
+        capacity: Int,
+        wordIndex: inout Int,
+        overrides: [TtsPhoneticOverride],
+        overrideCursor: inout Int
     ) -> [TextChunk] {
         let atoms = tokenizeAtoms(text)
         guard !atoms.isEmpty else { return [] }
@@ -272,22 +301,60 @@ enum KokoroChunker {
             switch atom.kind {
             case .word(let original):
                 let normalized = normalize(original)
-                guard !normalized.isEmpty else { continue }
-
-                guard
-                    let resolved = resolvePhonemes(
-                        for: original,
-                        normalized: normalized,
-                        lexicon: lexicon,
-                        caseSensitiveLexicon: caseSensitiveLexicon,
-                        allowed: allowed,
-                        missing: &missing
-                    )
-                else {
+                if normalized.isEmpty {
+                    wordIndex += 1
                     continue
                 }
 
-                var tokenCost = resolved.count
+                var resolved: [String]? = nil
+                if overrideCursor < overrides.count {
+                    while overrideCursor < overrides.count {
+                        let candidate = overrides[overrideCursor]
+                        if candidate.wordIndex < wordIndex {
+                            logger.warning(
+                                "Skipping stale phonetic override for word: \(candidate.word) (index \(candidate.wordIndex))"
+                            )
+                            overrideCursor += 1
+                            continue
+                        }
+                        if candidate.wordIndex == wordIndex {
+                            let overrideTokens = resolveOverride(candidate, allowed: allowed)
+                            if overrideTokens.isEmpty {
+                                logger.warning(
+                                    "Phonetic override for word index \(wordIndex) (word: \(candidate.word)) produced no valid tokens; falling back to lexicon"
+                                )
+                            } else {
+                                resolved = overrideTokens
+                            }
+                            overrideCursor += 1
+                        }
+                        break
+                    }
+                }
+
+                if resolved == nil {
+                    guard
+                        let fallback = resolvePhonemes(
+                            for: original,
+                            normalized: normalized,
+                            lexicon: lexicon,
+                            caseSensitiveLexicon: caseSensitiveLexicon,
+                            allowed: allowed,
+                            missing: &missing
+                        )
+                    else {
+                        wordIndex += 1
+                        continue
+                    }
+                    resolved = fallback
+                }
+
+                guard let resolvedPhonemes = resolved, !resolvedPhonemes.isEmpty else {
+                    wordIndex += 1
+                    continue
+                }
+
+                var tokenCost = resolvedPhonemes.count
                 if needsWordSeparator {
                     tokenCost += 1
                 }
@@ -301,11 +368,12 @@ enum KokoroChunker {
                     chunkTokenCount += 1
                 }
 
-                chunkPhonemes.append(contentsOf: resolved)
-                chunkTokenCount += resolved.count
+                chunkPhonemes.append(contentsOf: resolvedPhonemes)
+                chunkTokenCount += resolvedPhonemes.count
                 chunkWords.append(original)
                 chunkAtoms.append(original)
                 needsWordSeparator = true
+                wordIndex += 1
 
             case .punctuation(let symbol):
                 guard allowed.contains(symbol) else { continue }
@@ -365,6 +433,30 @@ enum KokoroChunker {
 
         flushWord()
         return atoms
+    }
+
+    private static func resolveOverride(
+        _ override: TtsPhoneticOverride,
+        allowed: Set<String>
+    ) -> [String] {
+        var tokens = override.tokens.filter { allowed.contains($0) }
+        if !tokens.isEmpty {
+            return tokens
+        }
+
+        let mappedFromTokens = PhonemeMapper.mapIPA(override.tokens, allowed: allowed)
+        if !mappedFromTokens.isEmpty {
+            return mappedFromTokens
+        }
+
+        if !override.scalarTokens.isEmpty {
+            let mappedScalars = PhonemeMapper.mapIPA(override.scalarTokens, allowed: allowed)
+            if !mappedScalars.isEmpty {
+                return mappedScalars
+            }
+        }
+
+        return []
     }
 
     private static func resolvePhonemes(
