@@ -14,6 +14,20 @@ extension PocketTtsSynthesizer {
         public let eosStep: Int?
     }
 
+    /// A single frame of streaming audio output.
+    public struct StreamingFrame: Sendable {
+        /// Audio samples for this frame (1920 samples = 80ms at 24kHz).
+        public let samples: [Float]
+        /// Zero-based frame index within the stream.
+        public let frameIndex: Int
+        /// Zero-based chunk index (for multi-chunk text).
+        public let chunkIndex: Int
+        /// Whether EOS was detected at this frame.
+        public let isEosDetected: Bool
+        /// Whether this is the final frame of the stream.
+        public let isFinal: Bool
+    }
+
     /// CoreML output key names for the conditioning step model.
     enum CondStepKeys {
         static let cacheKeys: [String] = [

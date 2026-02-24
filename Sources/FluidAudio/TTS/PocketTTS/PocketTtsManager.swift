@@ -169,6 +169,94 @@ public actor PocketTtsManager {
         isInitialized = false
     }
 
+    // MARK: - Streaming Synthesis
+
+    /// Synthesize text with streaming output, yielding audio frames as they are generated.
+    ///
+    /// Each frame contains 1920 samples (80ms at 24kHz). Frames are yielded
+    /// immediately after generation, enabling real-time playback with minimal latency.
+    ///
+    /// - Parameters:
+    ///   - text: The text to synthesize.
+    ///   - voice: Voice identifier (default: uses the manager's default voice).
+    ///   - temperature: Generation temperature (default: 0.7).
+    /// - Returns: An async stream of audio frames.
+    /// - Throws: PocketTTSError if the manager is not initialized.
+    public func synthesizeStreaming(
+        text: String,
+        voice: String? = nil,
+        temperature: Float = PocketTtsConstants.temperature
+    ) throws -> AsyncThrowingStream<PocketTtsSynthesizer.StreamingFrame, Error> {
+        guard isInitialized else {
+            throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
+        }
+
+        let selectedVoice = voice ?? defaultVoice
+        let store = modelStore
+
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await PocketTtsSynthesizer.withModelStore(store) {
+                        let stream = PocketTtsSynthesizer.synthesizeStreaming(
+                            text: text,
+                            voice: selectedVoice,
+                            temperature: temperature
+                        )
+                        for try await frame in stream {
+                            continuation.yield(frame)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Synthesize text with streaming output using custom voice data.
+    ///
+    /// Use this for cloned voices. Each frame contains 1920 samples (80ms at 24kHz).
+    ///
+    /// - Parameters:
+    ///   - text: The text to synthesize.
+    ///   - voiceData: Voice conditioning data (e.g., from cloneVoice).
+    ///   - temperature: Generation temperature (default: 0.7).
+    /// - Returns: An async stream of audio frames.
+    /// - Throws: PocketTTSError if the manager is not initialized.
+    public func synthesizeStreaming(
+        text: String,
+        voiceData: PocketTtsVoiceData,
+        temperature: Float = PocketTtsConstants.temperature
+    ) throws -> AsyncThrowingStream<PocketTtsSynthesizer.StreamingFrame, Error> {
+        guard isInitialized else {
+            throw PocketTTSError.modelNotFound("PocketTTS model not initialized")
+        }
+
+        let store = modelStore
+
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await PocketTtsSynthesizer.withModelStore(store) {
+                        let stream = PocketTtsSynthesizer.synthesizeStreaming(
+                            text: text,
+                            voiceData: voiceData,
+                            temperature: temperature
+                        )
+                        for try await frame in stream {
+                            continuation.yield(frame)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Voice Cloning
 
     /// Check if voice cloning is available (mimi_encoder model present).

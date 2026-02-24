@@ -2,6 +2,10 @@
 import Foundation
 import OSLog
 
+// AsrManager contains CoreML models which are not Sendable, but access is
+// confined to StreamingAsrManager's actor isolation so this is safe.
+extension AsrManager: @unchecked Sendable {}
+
 /// A high-level streaming ASR manager that provides a simple API for real-time transcription
 /// Similar to Apple's SpeechAnalyzer, it handles audio conversion and buffering automatically
 public actor StreamingAsrManager {
@@ -254,9 +258,7 @@ public actor StreamingAsrManager {
         nextWindowCenterStart = 0
 
         // Reset decoder state for the current audio source
-        if let asrManager = asrManager {
-            try await asrManager.resetDecoderState(for: audioSource)
-        }
+        try await asrManager?.resetDecoderState(for: audioSource)
 
         // Reset sliding window state
         segmentIndex = 0

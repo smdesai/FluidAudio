@@ -349,6 +349,228 @@ public struct PocketTtsSynthesizer {
         )
     }
 
+    // MARK: - Streaming Synthesis
+
+    /// Synthesize audio from text, yielding frames as they are generated.
+    ///
+    /// Each frame contains 1920 samples (80ms at 24kHz). Frames are yielded
+    /// immediately after generation, enabling real-time playback with minimal
+    /// latency.
+    ///
+    /// - Parameters:
+    ///   - text: The text to synthesize.
+    ///   - voice: Voice identifier (default: "alba").
+    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - seed: Random seed for reproducibility (nil for random).
+    /// - Returns: An async stream of audio frames.
+    public static func synthesizeStreaming(
+        text: String,
+        voice: String = PocketTtsConstants.defaultVoice,
+        temperature: Float = PocketTtsConstants.temperature,
+        seed: UInt64? = nil
+    ) -> AsyncThrowingStream<StreamingFrame, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await performStreamingSynthesis(
+                        text: text,
+                        voice: voice,
+                        temperature: temperature,
+                        seed: seed,
+                        continuation: continuation
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Synthesize audio from text using provided voice data, yielding frames as they are generated.
+    ///
+    /// Use this overload for cloned voices.
+    ///
+    /// - Parameters:
+    ///   - text: The text to synthesize.
+    ///   - voiceData: Voice conditioning data (e.g., from cloneVoice).
+    ///   - temperature: Generation temperature (default: 0.7).
+    ///   - seed: Random seed for reproducibility (nil for random).
+    /// - Returns: An async stream of audio frames.
+    public static func synthesizeStreaming(
+        text: String,
+        voiceData: PocketTtsVoiceData,
+        temperature: Float = PocketTtsConstants.temperature,
+        seed: UInt64? = nil
+    ) -> AsyncThrowingStream<StreamingFrame, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await performStreamingSynthesis(
+                        text: text,
+                        voiceData: voiceData,
+                        temperature: temperature,
+                        seed: seed,
+                        continuation: continuation
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Internal streaming synthesis implementation.
+    private static func performStreamingSynthesis(
+        text: String,
+        voice: String,
+        temperature: Float,
+        seed: UInt64?,
+        continuation: AsyncThrowingStream<StreamingFrame, Error>.Continuation
+    ) async throws {
+        let store = try currentModelStore()
+        let voiceData = try await store.voiceData(for: voice)
+        try await performStreamingSynthesis(
+            text: text,
+            voiceData: voiceData,
+            temperature: temperature,
+            seed: seed,
+            continuation: continuation
+        )
+    }
+
+    /// Internal streaming synthesis implementation using voice data directly.
+    private static func performStreamingSynthesis(
+        text: String,
+        voiceData: PocketTtsVoiceData,
+        temperature: Float,
+        seed: UInt64?,
+        continuation: AsyncThrowingStream<StreamingFrame, Error>.Continuation
+    ) async throws {
+        let store = try currentModelStore()
+
+        logger.info("PocketTTS streaming: '\(text)'")
+
+        // 1. Load constants (voice data provided directly)
+        let constants = try await store.constants()
+
+        // 2. Split text into chunks that fit within KV cache capacity
+        let chunks = chunkText(text, tokenizer: constants.tokenizer)
+        logger.info("Streaming \(chunks.count) chunk(s)")
+
+        // 3. Set up random number generator (seeded or system entropy)
+        var rng = SeededRNG(seed: seed ?? UInt64.random(in: 0...UInt64.max))
+
+        // 4. Load models
+        let condModel = try await store.condStep()
+        let stepModel = try await store.flowlmStep()
+        let flowModel = try await store.flowDecoder()
+        let mimiModel = try await store.mimiDecoder()
+
+        // 5. Load Mimi initial state (continuous across chunks)
+        let repoDir = try await store.repoDir()
+        var mimiState = try loadMimiInitialState(from: repoDir)
+
+        // 6. Create BOS embedding
+        let bosEmb = try createBosEmbedding(constants.bosEmbedding)
+
+        // 7. Generate and yield audio for each chunk
+        var globalFrameIndex = 0
+        let totalChunks = chunks.count
+
+        for (chunkIdx, chunkText) in chunks.enumerated() {
+            let isLastChunk = chunkIdx == totalChunks - 1
+            let (normalizedChunk, framesAfterEos) = normalizeText(chunkText)
+            logger.info("Streaming chunk \(chunkIdx + 1)/\(totalChunks): '\(normalizedChunk)'")
+
+            // Tokenize and embed this chunk
+            let tokenIds = constants.tokenizer.encode(normalizedChunk)
+            let textEmbeddings = embedTokens(tokenIds, constants: constants)
+
+            // Fresh KV cache per chunk
+            var kvState = try await prefillKVCache(
+                voiceData: voiceData,
+                textEmbeddings: textEmbeddings,
+                model: condModel
+            )
+
+            // Generation loop for this chunk
+            let maxGenLen = estimateMaxFrames(text: chunkText)
+            var eosStep: Int?
+            var sequence = try createNaNSequence()
+            let totalFramesAfterEos =
+                framesAfterEos + PocketTtsConstants.extraFramesAfterDetection
+
+            for step in 0..<maxGenLen {
+                // Check for cancellation
+                if Task.isCancelled {
+                    logger.info("Streaming cancelled")
+                    return
+                }
+
+                let (transformerOut, eosLogit) = try await runFlowLMStep(
+                    sequence: sequence,
+                    bosEmb: bosEmb,
+                    state: &kvState,
+                    model: stepModel
+                )
+
+                let isEosDetected = eosLogit > PocketTtsConstants.eosThreshold && eosStep == nil
+                if isEosDetected {
+                    eosStep = step
+                    logger.info("Streaming chunk \(chunkIdx + 1) EOS at step \(step)")
+                }
+                let isFinalFrame: Bool
+                if let eos = eosStep, step >= eos + totalFramesAfterEos {
+                    isFinalFrame = isLastChunk
+                } else {
+                    isFinalFrame = false
+                }
+
+                let latent = try await flowDecode(
+                    transformerOut: transformerOut,
+                    numSteps: PocketTtsConstants.numLsdSteps,
+                    temperature: temperature,
+                    model: flowModel,
+                    rng: &rng
+                )
+
+                // Mimi state is continuous across chunks
+                var frameSamples = try await runMimiDecoder(
+                    latent: latent,
+                    state: &mimiState,
+                    model: mimiModel
+                )
+
+                // Apply per-frame clipping (leave headroom since we can't peak-normalize in streaming)
+                for i in 0..<frameSamples.count {
+                    frameSamples[i] = max(-0.95, min(0.95, frameSamples[i]))
+                }
+
+                // Yield the frame
+                let frame = StreamingFrame(
+                    samples: frameSamples,
+                    frameIndex: globalFrameIndex,
+                    chunkIndex: chunkIdx,
+                    isEosDetected: isEosDetected,
+                    isFinal: isFinalFrame
+                )
+                continuation.yield(frame)
+                globalFrameIndex += 1
+
+                // Check if we should stop this chunk
+                if let eos = eosStep, step >= eos + totalFramesAfterEos {
+                    break
+                }
+
+                sequence = try createSequenceFromLatent(latent)
+            }
+        }
+
+        logger.info("Streaming complete: \(globalFrameIndex) frames")
+    }
+
     // MARK: - Text Processing
 
     /// Normalize a text chunk for PocketTTS (matching Python `prepare_text_prompt`).
