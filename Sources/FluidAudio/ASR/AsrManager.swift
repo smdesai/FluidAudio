@@ -47,6 +47,9 @@ public final class AsrManager {
     internal var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
     internal var vocabBoostingEnabled: Bool { customVocabulary != nil && vocabularyRescorer != nil }
 
+    // Decode-time keyword boosting state (configured via configureKeywordBoosting)
+    internal var keywordBoostingContext: KeywordBoostingContext?
+
     // Cached prediction options for reuse
     internal lazy var predictionOptions: MLPredictionOptions = {
         AsrModels.optimizedPredictionOptions()
@@ -162,6 +165,78 @@ public final class AsrManager {
         vocabularyRescorer = nil
         vocabSizeConfig = nil
         logger.info("Vocabulary boosting disabled")
+    }
+
+    /// Configure decode-time keyword boosting using the TDT prefix trie.
+    ///
+    /// This requires `JointDecisionv2.mlmodelc` to be loaded (provides top-k logits).
+    /// Terms must have `tokenIds` populated — use `TdtGreedyTokenizer` to tokenize them.
+    ///
+    /// - Parameters:
+    ///   - vocabulary: Custom vocabulary context with terms that have `tokenIds`
+    ///   - boostWeight: Additive logit boost for keyword tokens (default: 3.0)
+    ///   - onPhraseDetected: Optional real-time callback fired when a phrase is detected
+    public func configureKeywordBoosting(
+        vocabulary: CustomVocabularyContext,
+        boostWeight: Float = 3.0,
+        onPhraseDetected: (@Sendable (DetectedPhrase) -> Void)? = nil
+    ) {
+        guard asrModels?.jointHasTopK == true else {
+            logger.warning(
+                "Keyword boosting requires JointDecisionv2 model with top-k outputs. "
+                    + "Download JointDecisionv2.mlmodelc to enable.")
+            return
+        }
+
+        // Tokenize terms that don't have tokenIds using the loaded vocabulary
+        let tokenizer = TdtGreedyTokenizer(vocabulary: self.vocabulary)
+        var tokenizedTerms: [CustomVocabularyTerm] = []
+        for term in vocabulary.terms {
+            if term.tokenIds != nil && !(term.tokenIds?.isEmpty ?? true) {
+                tokenizedTerms.append(term)
+            } else {
+                let paths = tokenizer.encodeAllPaths(term.text)
+                guard let firstPath = paths.first, !firstPath.isEmpty else {
+                    logger.warning("Could not tokenize term '\(term.text)' for keyword boosting, skipping")
+                    continue
+                }
+                // Insert all valid paths as separate terms so the trie matches any decomposition
+                for path in paths {
+                    tokenizedTerms.append(
+                        CustomVocabularyTerm(
+                            text: term.text,
+                            weight: term.weight,
+                            aliases: term.aliases,
+                            tokenIds: path,
+                            ctcTokenIds: term.ctcTokenIds
+                        ))
+                }
+            }
+        }
+
+        let trie = KeywordPrefixTrie(terms: tokenizedTerms)
+        guard !trie.isEmpty else {
+            logger.warning("No valid tokenized terms for keyword boosting")
+            return
+        }
+
+        keywordBoostingContext = KeywordBoostingContext(
+            prefixTrie: trie,
+            boostWeight: boostWeight,
+            onPhraseDetected: onPhraseDetected
+        )
+
+        let uniqueTerms = Set(tokenizedTerms.map(\.text)).count
+        logger.info(
+            "Keyword boosting configured: \(uniqueTerms) terms, "
+                + "\(tokenizedTerms.count) trie paths, boost=\(boostWeight)")
+
+    }
+
+    /// Disable decode-time keyword boosting.
+    public func disableKeywordBoosting() {
+        keywordBoostingContext = nil
+        logger.info("Keyword boosting disabled")
     }
 
     private func createFeatureProvider(
@@ -292,6 +367,7 @@ public final class AsrManager {
         systemDecoderState = TdtDecoderState.make()
         // Release vocabulary boosting resources
         disableVocabularyBoosting()
+        disableKeywordBoosting()
         Task { await sharedMLArrayCache.clear() }
         logger.info("AsrManager resources cleaned up")
     }
@@ -335,7 +411,8 @@ public final class AsrManager {
                 decoderState: &decoderState,
                 contextFrameAdjustment: contextFrameAdjustment,
                 isLastChunk: isLastChunk,
-                globalFrameOffset: globalFrameOffset
+                globalFrameOffset: globalFrameOffset,
+                keywordBoosting: keywordBoostingContext
             )
         }
     }

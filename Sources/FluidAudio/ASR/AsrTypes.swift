@@ -42,13 +42,16 @@ public struct ASRResult: Codable, Sendable {
     public let performanceMetrics: ASRPerformanceMetrics?
     public let ctcDetectedTerms: [String]?
     public let ctcAppliedTerms: [String]?
+    /// Keyword phrases detected during decode-time biasing (requires JointDecisionv2 model).
+    public let detectedPhrases: [DetectedPhrase]?
 
     public init(
         text: String, confidence: Float, duration: TimeInterval, processingTime: TimeInterval,
         tokenTimings: [TokenTiming]? = nil,
         performanceMetrics: ASRPerformanceMetrics? = nil,
         ctcDetectedTerms: [String]? = nil,
-        ctcAppliedTerms: [String]? = nil
+        ctcAppliedTerms: [String]? = nil,
+        detectedPhrases: [DetectedPhrase]? = nil
     ) {
         self.text = text
         self.confidence = confidence
@@ -58,6 +61,7 @@ public struct ASRResult: Codable, Sendable {
         self.performanceMetrics = performanceMetrics
         self.ctcDetectedTerms = ctcDetectedTerms
         self.ctcAppliedTerms = ctcAppliedTerms
+        self.detectedPhrases = detectedPhrases
     }
 
     /// Real-time factor (RTFx) - how many times faster than real-time
@@ -81,7 +85,8 @@ public struct ASRResult: Codable, Sendable {
             tokenTimings: tokenTimings,
             performanceMetrics: performanceMetrics,
             ctcDetectedTerms: detected,
-            ctcAppliedTerms: applied
+            ctcAppliedTerms: applied,
+            detectedPhrases: detectedPhrases
         )
     }
 }

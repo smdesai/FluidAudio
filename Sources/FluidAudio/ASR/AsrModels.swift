@@ -28,6 +28,10 @@ public struct AsrModels: Sendable {
     public let vocabulary: [Int: String]
     public let version: AsrModelVersion
 
+    /// Whether the loaded joint model provides top-k token IDs and logits
+    /// (JointDecisionv2 or any joint model with `top_k_ids`/`top_k_logits` outputs).
+    public let jointHasTopK: Bool
+
     private static let logger = AppLogger(category: "AsrModels")
 
     public init(
@@ -37,7 +41,8 @@ public struct AsrModels: Sendable {
         joint: MLModel,
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
-        version: AsrModelVersion
+        version: AsrModelVersion,
+        jointHasTopK: Bool = false
     ) {
         self.encoder = encoder
         self.preprocessor = preprocessor
@@ -46,6 +51,7 @@ public struct AsrModels: Sendable {
         self.configuration = configuration
         self.vocabulary = vocabulary
         self.version = version
+        self.jointHasTopK = jointHasTopK
     }
 
     public var usesSplitFrontend: Bool {
@@ -159,16 +165,43 @@ extension AsrModels {
             throw AsrModelsError.loadingFailed("Failed to load decoder or joint model")
         }
 
+        // Try to download and load JointDecisionv2 (top-k outputs) if available on HuggingFace.
+        // Falls back to v1 if v2 is not available or fails to load.
+        var effectiveJointModel = jointModel
+        var hasTopK = false
+        do {
+            let v2Models = try await DownloadUtils.loadModels(
+                version.repo,
+                modelNames: [Names.jointV2File],
+                directory: parentDirectory,
+                computeUnits: config.computeUnits,
+                progressHandler: progressHandler
+            )
+            if let v2Joint = v2Models[Names.jointV2File] {
+                let outputs = v2Joint.modelDescription.outputDescriptionsByName
+                if outputs["top_k_ids"] != nil && outputs["top_k_logits"] != nil {
+                    effectiveJointModel = v2Joint
+                    hasTopK = true
+                    logger.info("Loaded JointDecisionv2 with top-k outputs")
+                } else {
+                    logger.warning("JointDecisionv2 loaded but missing top-k outputs, using v1")
+                }
+            }
+        } catch {
+            logger.info("JointDecisionv2 not available, using v1 joint model")
+        }
+
         let asrModels = AsrModels(
             encoder: encoderModel,
             preprocessor: preprocessorModel,
             decoder: decoderModel,
-            joint: jointModel,
+            joint: effectiveJointModel,
             configuration: config,
             vocabulary: try loadVocabulary(from: directory, version: version),
-            version: version
+            version: version,
+            jointHasTopK: hasTopK
         )
-        logger.info("Successfully loaded all ASR models with optimized compute units")
+        logger.info("Successfully loaded all ASR models with optimized compute units (topK: \(hasTopK))")
         return asrModels
     }
 

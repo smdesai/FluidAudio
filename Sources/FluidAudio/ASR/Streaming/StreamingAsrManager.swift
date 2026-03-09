@@ -56,6 +56,11 @@ public actor StreamingAsrManager {
     private var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
     private var vocabBoostingEnabled: Bool { customVocabulary != nil && vocabularyRescorer != nil }
 
+    // Decode-time keyword boosting (deferred until asrManager is created in start())
+    private var pendingKeywordBoostingVocab: CustomVocabularyContext?
+    private var pendingKeywordBoostWeight: Float = 3.0
+    private var pendingKeywordBoostCallback: (@Sendable (DetectedPhrase) -> Void)?
+
     /// Initialize the streaming ASR manager
     /// - Parameter config: Configuration for streaming behavior
     public init(config: StreamingAsrConfig = .default) {
@@ -113,6 +118,32 @@ public actor StreamingAsrManager {
         )
     }
 
+    /// Configure decode-time keyword boosting for streaming transcription.
+    ///
+    /// Uses the TDT prefix trie to bias token selection toward keyword phrases during decoding.
+    /// Requires JointDecisionv2 model with top-k outputs.
+    ///
+    /// - Parameters:
+    ///   - vocabulary: Custom vocabulary context with terms to boost
+    ///   - boostWeight: Additive logit boost for keyword tokens (default: 3.0)
+    ///   - onPhraseDetected: Optional real-time callback fired when a phrase is detected
+    public func configureKeywordBoosting(
+        vocabulary: CustomVocabularyContext,
+        boostWeight: Float = 3.0,
+        onPhraseDetected: (@Sendable (DetectedPhrase) -> Void)? = nil
+    ) {
+        if let manager = asrManager {
+            manager.configureKeywordBoosting(
+                vocabulary: vocabulary, boostWeight: boostWeight, onPhraseDetected: onPhraseDetected)
+        } else {
+            // Defer until start() creates the asrManager
+            pendingKeywordBoostingVocab = vocabulary
+            pendingKeywordBoostWeight = boostWeight
+            pendingKeywordBoostCallback = onPhraseDetected
+        }
+        logger.info("Keyword boosting configured with \(vocabulary.terms.count) terms, boost=\(boostWeight)")
+    }
+
     /// Start the streaming ASR engine
     /// This will download models if needed and begin processing
     /// - Parameter source: The audio source to use (default: microphone)
@@ -138,6 +169,15 @@ public actor StreamingAsrManager {
         // Initialize ASR manager with provided models
         asrManager = AsrManager(config: config.asrConfig)
         try await asrManager?.initialize(models: models)
+
+        // Apply deferred keyword boosting if configured before start()
+        if let vocab = pendingKeywordBoostingVocab {
+            asrManager?.configureKeywordBoosting(
+                vocabulary: vocab, boostWeight: pendingKeywordBoostWeight,
+                onPhraseDetected: pendingKeywordBoostCallback)
+            pendingKeywordBoostingVocab = nil
+            pendingKeywordBoostCallback = nil
+        }
 
         // Reset decoder state for the specific source
         try await asrManager?.resetDecoderState(for: source)
@@ -376,12 +416,13 @@ public actor StreamingAsrManager {
             // Start frame offset is now handled by decoder's timeJump mechanism
 
             // Call AsrManager directly with deduplication
-            let (tokens, timestamps, confidences, _) = try await asrManager.transcribeStreamingChunk(
-                windowSamples,
-                source: audioSource,
-                previousTokens: accumulatedTokens,
-                isLastChunk: isLastChunk
-            )
+            let (tokens, timestamps, confidences, _, chunkDetectedPhrases) =
+                try await asrManager.transcribeStreamingChunk(
+                    windowSamples,
+                    source: audioSource,
+                    previousTokens: accumulatedTokens,
+                    isLastChunk: isLastChunk
+                )
 
             let adjustedTimestamps = Self.applyGlobalFrameOffset(
                 to: timestamps,
@@ -404,7 +445,8 @@ public actor StreamingAsrManager {
                 confidences: confidences,
                 encoderSequenceLength: 0,
                 audioSamples: windowSamples,
-                processingTime: processingTime
+                processingTime: processingTime,
+                detectedPhrases: chunkDetectedPhrases
             )
 
             logger.debug(
@@ -454,7 +496,8 @@ public actor StreamingAsrManager {
                 confidence: interim.confidence,
                 timestamp: Date(),
                 tokenIds: tokens,
-                tokenTimings: displayResult.tokenTimings ?? []
+                tokenTimings: displayResult.tokenTimings ?? [],
+                detectedPhrases: displayResult.detectedPhrases ?? []
             )
 
             updateContinuation?.yield(update)
@@ -763,6 +806,9 @@ public struct StreamingTranscriptionUpdate: Sendable {
     /// Token-level timing information aligned with the decoded text
     public let tokenTimings: [TokenTiming]
 
+    /// Keyword phrases detected during this chunk's decoding
+    public let detectedPhrases: [DetectedPhrase]
+
     /// Human-readable tokens (normalized) for this update
     public var tokens: [String] {
         tokenTimings.map(\.token)
@@ -774,7 +820,8 @@ public struct StreamingTranscriptionUpdate: Sendable {
         confidence: Float,
         timestamp: Date,
         tokenIds: [Int] = [],
-        tokenTimings: [TokenTiming] = []
+        tokenTimings: [TokenTiming] = [],
+        detectedPhrases: [DetectedPhrase] = []
     ) {
         self.text = text
         self.isConfirmed = isConfirmed
@@ -782,5 +829,6 @@ public struct StreamingTranscriptionUpdate: Sendable {
         self.timestamp = timestamp
         self.tokenIds = tokenIds
         self.tokenTimings = tokenTimings
+        self.detectedPhrases = detectedPhrases
     }
 }

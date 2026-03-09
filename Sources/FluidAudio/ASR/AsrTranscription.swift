@@ -42,7 +42,8 @@ extension AsrManager {
                 tokenDurations: hypothesis.tokenDurations,
                 encoderSequenceLength: encoderSequenceLength,
                 audioSamples: audioSamples,
-                processingTime: Date().timeIntervalSince(startTime)
+                processingTime: Date().timeIntervalSince(startTime),
+                detectedPhrases: hypothesis.detectedPhrases
             )
 
             // Auto-apply vocabulary rescoring when configured
@@ -192,7 +193,10 @@ extension AsrManager {
         source: AudioSource,
         previousTokens: [Int] = [],
         isLastChunk: Bool = false
-    ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int) {
+    ) async throws -> (
+        tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int,
+        detectedPhrases: [DetectedPhrase]
+    ) {
         // Select and copy decoder state for the source
         var state = (source == .microphone) ? microphoneDecoderState : systemDecoderState
 
@@ -239,10 +243,12 @@ extension AsrManager {
                 removedCount > 0
                 ? Array(hypothesis.tokenConfidences.dropFirst(removedCount)) : hypothesis.tokenConfidences
 
-            return (deduped, adjustedTimestamps, adjustedConfidences, encLen)
+            return (deduped, adjustedTimestamps, adjustedConfidences, encLen, hypothesis.detectedPhrases)
         }
 
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, encLen)
+        return (
+            hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, encLen, hypothesis.detectedPhrases
+        )
     }
 
     internal func processTranscriptionResult(
@@ -253,7 +259,8 @@ extension AsrManager {
         encoderSequenceLength: Int,
         audioSamples: [Float],
         processingTime: TimeInterval,
-        tokenTimings: [TokenTiming] = []
+        tokenTimings: [TokenTiming] = [],
+        detectedPhrases: [DetectedPhrase] = []
     ) -> ASRResult {
 
         let (text, finalTimings) = convertTokensWithExistingTimings(tokenIds, timings: tokenTimings)
@@ -279,7 +286,8 @@ extension AsrManager {
             confidence: confidence,
             duration: duration,
             processingTime: processingTime,
-            tokenTimings: resultTimings
+            tokenTimings: resultTimings,
+            detectedPhrases: detectedPhrases.isEmpty ? nil : detectedPhrases
         )
     }
 

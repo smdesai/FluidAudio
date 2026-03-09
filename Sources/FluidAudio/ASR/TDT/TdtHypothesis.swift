@@ -10,6 +10,8 @@ struct TdtHypothesis {
     /// Last non-blank token decoded in this hypothesis.
     /// Used to initialize the decoder for the next chunk, maintaining context across chunk boundaries.
     var lastToken: Int?
+    /// Keyword phrases detected during decode-time biasing.
+    var detectedPhrases: [DetectedPhrase] = []
 
     /// Initialize with a decoder state
     init(decState: TdtDecoderState) {

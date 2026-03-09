@@ -212,6 +212,8 @@ enum TranscribeCommand {
         var outputJsonPath: String?
         var modelVersion: AsrModelVersion = .v3  // Default to v3
         var customVocabPath: String?
+        var inlinePhrases: [String] = []
+        var boostWeight: Float = 3.0
 
         // Parse options
         var i = 1
@@ -220,7 +222,7 @@ enum TranscribeCommand {
             case "--help", "-h":
                 printUsage()
                 exit(0)
-            case "--streaming":
+            case "--streaming", "--stream":
                 streamingMode = true
             case "--metadata":
                 showMetadata = true
@@ -249,6 +251,20 @@ enum TranscribeCommand {
                     customVocabPath = arguments[i + 1]
                     i += 1
                 }
+            case "--phrases":
+                if i + 1 < arguments.count {
+                    // Split by comma for multiple phrases, or accept a single phrase
+                    inlinePhrases = arguments[i + 1]
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    i += 1
+                }
+            case "--boost-weight":
+                if i + 1 < arguments.count, let w = Float(arguments[i + 1]) {
+                    boostWeight = w
+                    i += 1
+                }
             default:
                 logger.warning("Warning: Unknown option: \(arguments[i])")
             }
@@ -261,19 +277,22 @@ enum TranscribeCommand {
             )
             await testStreamingTranscription(
                 audioFile: audioFile, showMetadata: showMetadata, wordTimestamps: wordTimestamps,
-                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath)
+                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath,
+                inlinePhrases: inlinePhrases, boostWeight: boostWeight)
         } else {
             logger.info("Using batch mode with direct processing\n")
             await testBatchTranscription(
                 audioFile: audioFile, showMetadata: showMetadata, wordTimestamps: wordTimestamps,
-                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath)
+                outputJsonPath: outputJsonPath, modelVersion: modelVersion, customVocabPath: customVocabPath,
+                inlinePhrases: inlinePhrases, boostWeight: boostWeight)
         }
     }
 
     /// Test batch transcription using AsrManager directly
     private static func testBatchTranscription(
         audioFile: String, showMetadata: Bool, wordTimestamps: Bool, outputJsonPath: String?,
-        modelVersion: AsrModelVersion, customVocabPath: String?
+        modelVersion: AsrModelVersion, customVocabPath: String?,
+        inlinePhrases: [String] = [], boostWeight: Float = 3.0
     ) async {
         do {
             // Initialize ASR models
@@ -282,6 +301,21 @@ enum TranscribeCommand {
             try await asrManager.initialize(models: models)
 
             logger.info("ASR Manager initialized successfully")
+
+            // Configure decode-time keyword boosting if phrases provided
+            if !inlinePhrases.isEmpty {
+                let terms = inlinePhrases.map { CustomVocabularyTerm(text: $0, weight: 10.0) }
+                let vocab = CustomVocabularyContext(terms: terms)
+                asrManager.configureKeywordBoosting(
+                    vocabulary: vocab,
+                    boostWeight: boostWeight,
+                    onPhraseDetected: { phrase in
+                        print(
+                            "DETECTED: '\(phrase.term.text)' at \(String(format: "%.2f", phrase.startTime))s"
+                                + (phrase.wasBoosted ? " (boosted)" : ""))
+                    }
+                )
+            }
 
             // Load audio file
             let audioFileURL = URL(fileURLWithPath: audioFile)
@@ -383,6 +417,17 @@ enum TranscribeCommand {
             logger.info("Final transcription:")
             print(result.text)
 
+            // Show detected phrases from keyword boosting
+            if let detected = result.detectedPhrases, !detected.isEmpty {
+                logger.info("\nDetected phrases (\(detected.count)):")
+                for phrase in detected {
+                    let boosted = phrase.wasBoosted ? " [boosted]" : ""
+                    logger.info(
+                        "  '\(phrase.term.text)' \(String(format: "%.2f", phrase.startTime))s-\(String(format: "%.2f", phrase.endTime))s"
+                            + " (conf: \(String(format: "%.3f", phrase.confidence)))\(boosted)")
+                }
+            }
+
             if let outputJsonPath = outputJsonPath {
                 let wordTimings = WordTimingMerger.mergeTokensIntoWords(result.tokenTimings ?? [])
                 let modelVersionLabel = modelVersion == .v2 ? "v2" : "v3"
@@ -471,7 +516,8 @@ enum TranscribeCommand {
     /// Test streaming transcription
     private static func testStreamingTranscription(
         audioFile: String, showMetadata: Bool, wordTimestamps: Bool, outputJsonPath: String?,
-        modelVersion: AsrModelVersion, customVocabPath: String?
+        modelVersion: AsrModelVersion, customVocabPath: String?,
+        inlinePhrases: [String] = [], boostWeight: Float = 3.0
     ) async {
         // Use optimized streaming configuration
         let config = StreamingAsrConfig.streaming
@@ -482,6 +528,21 @@ enum TranscribeCommand {
         do {
             // Initialize ASR models
             let models = try await AsrModels.downloadAndLoad(version: modelVersion)
+
+            // Configure decode-time keyword boosting if inline phrases provided
+            if !inlinePhrases.isEmpty {
+                let terms = inlinePhrases.map { CustomVocabularyTerm(text: $0, weight: 10.0) }
+                let vocab = CustomVocabularyContext(terms: terms)
+                await streamingAsr.configureKeywordBoosting(
+                    vocabulary: vocab,
+                    boostWeight: boostWeight,
+                    onPhraseDetected: { phrase in
+                        print(
+                            "DETECTED: '\(phrase.term.text)' at \(String(format: "%.2f", phrase.startTime))s"
+                                + (phrase.wasBoosted ? " (boosted)" : ""))
+                    }
+                )
+            }
 
             // Configure vocabulary boosting if custom vocab is provided (Option 3: Hybrid Rescoring)
             if let vocabPath = customVocabPath {
@@ -729,12 +790,14 @@ enum TranscribeCommand {
 
             Options:
                 --help, -h         Show this help message
-                --streaming        Use streaming mode with chunk simulation
+                --streaming, --stream  Use streaming mode with chunk simulation
                 --metadata         Show confidence, start time, and end time in results
                 --word-timestamps  Show word-level timestamps for each word in the transcription
                 --output-json <file>  Save full transcription result to JSON (includes word timings)
-                --model-version <version>  ASR model version to use: v2 or v3 (default: v2)
-                --custom-vocab <file>  Apply vocabulary boosting using terms from file (batch mode only)
+                --model-version <version>  ASR model version to use: v2 or v3 (default: v3)
+                --custom-vocab <file>  Apply CTC vocabulary rescoring using terms from file
+                --phrases <phrases>  Decode-time keyword boosting (comma-separated, requires JointDecisionv2)
+                --boost-weight <float>  Logit boost for keyword tokens (default: 3.0, used with --phrases)
 
             Examples:
                 fluidaudio transcribe audio.wav                    # Batch mode (default)
@@ -743,7 +806,9 @@ enum TranscribeCommand {
                 fluidaudio transcribe audio.wav --word-timestamps  # Batch mode with word timestamps
                 fluidaudio transcribe audio.wav --streaming --metadata # Streaming mode with metadata
                 fluidaudio transcribe audio.wav --output-json results.json
-                fluidaudio transcribe audio.wav --custom-vocab vocab.txt  # With vocabulary boosting
+                fluidaudio transcribe audio.wav --custom-vocab vocab.txt  # With CTC vocabulary rescoring
+                fluidaudio transcribe audio.wav --phrases "NVIDIA,PyTorch"  # Decode-time keyword boosting
+                fluidaudio transcribe audio.wav --phrases "cab driver" --stream  # Streaming with keywords
 
             Batch mode (default):
             - Direct processing using AsrManager for fastest results

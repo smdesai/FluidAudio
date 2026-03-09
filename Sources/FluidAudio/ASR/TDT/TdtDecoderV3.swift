@@ -34,9 +34,13 @@ internal struct TdtDecoderV3 {
 
     /// Joint model decision for a single encoder/decoder step.
     private struct JointDecision {
-        let token: Int
-        let probability: Float
+        var token: Int
+        var probability: Float
         let durationBin: Int
+        /// Top-k token IDs from JointDecisionv2 (nil when using v1 model).
+        let topKIds: [Int]?
+        /// Top-k logits from JointDecisionv2 (nil when using v1 model).
+        let topKLogits: [Float]?
     }
 
     private let logger = AppLogger(category: "TDT")
@@ -104,7 +108,8 @@ internal struct TdtDecoderV3 {
         decoderState: inout TdtDecoderState,
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
-        globalFrameOffset: Int = 0
+        globalFrameOffset: Int = 0,
+        keywordBoosting: KeywordBoostingContext? = nil
     ) async throws -> TdtHypothesis {
         // Early exit for very short audio (< 160ms)
         guard encoderSequenceLength > 1 else {
@@ -188,6 +193,35 @@ internal struct TdtDecoderV3 {
         let tokenProbBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .float32)
         let durationBacking = try MLMultiArray(shape: [1, 1, 1] as [NSNumber], dataType: .int32)
 
+        // Detect top-k capability from joint model and preallocate backing arrays
+        let jointOutputs = jointModel.modelDescription.outputDescriptionsByName
+        let hasTopK = jointOutputs["top_k_ids"] != nil && jointOutputs["top_k_logits"] != nil
+        let topKSize: Int
+        let topKIdsBacking: MLMultiArray?
+        let topKLogitsBacking: MLMultiArray?
+        if hasTopK {
+            // Read top-k size from model description (typically 64)
+            let topKDesc = jointOutputs["top_k_ids"]!
+            let shapeNS: [NSNumber]
+            if let constraint = topKDesc.multiArrayConstraint {
+                shapeNS = constraint.shape
+            } else {
+                shapeNS = [1, 64, 1]
+            }
+            let topKShape = shapeNS.map { $0.intValue }
+            topKSize = topKShape.first(where: { $0 > 1 }) ?? 64
+            topKIdsBacking = try MLMultiArray(shape: shapeNS, dataType: .int32)
+            topKLogitsBacking = try MLMultiArray(shape: shapeNS, dataType: .float32)
+        } else {
+            topKSize = 0
+            topKIdsBacking = nil
+            topKLogitsBacking = nil
+        }
+
+        // Initialize keyword boosting trie cursor
+        var trieCursor: TrieCursor? = keywordBoosting?.prefixTrie.makeCursor()
+        var phraseStartFrame: Int?
+
         // Initialize decoder LSTM state for a fresh utterance
         // This ensures clean state when starting transcription
         if decoderState.lastToken == nil && decoderState.predictorOutput == nil {
@@ -257,7 +291,7 @@ internal struct TdtDecoderV3 {
             try populatePreparedDecoderProjection(decoderProjection, into: reusableDecoderStep)
 
             // Run joint network with preallocated inputs
-            let decision = try runJointPrepared(
+            var decision = try runJointPrepared(
                 encoderFrames: encoderFrames,
                 timeIndex: safeTimeIndices,
                 preparedDecoderStep: reusableDecoderStep,
@@ -268,8 +302,25 @@ internal struct TdtDecoderV3 {
                 inputProvider: jointInput,
                 tokenIdBacking: tokenIdBacking,
                 tokenProbBacking: tokenProbBacking,
-                durationBacking: durationBacking
+                durationBacking: durationBacking,
+                topKIdsBacking: topKIdsBacking,
+                topKLogitsBacking: topKLogitsBacking,
+                topKSize: topKSize
             )
+
+            // Apply keyword biasing if configured and top-k available
+            if let boosting = keywordBoosting {
+                applyKeywordBiasing(
+                    decision: &decision,
+                    cursor: &trieCursor,
+                    phraseStartFrame: &phraseStartFrame,
+                    boosting: boosting,
+                    blankId: config.tdtConfig.blankId,
+                    timeIndex: timeIndices,
+                    globalFrameOffset: globalFrameOffset,
+                    hypothesis: &hypothesis
+                )
+            }
 
             // Predict token (what to emit) and duration (how many frames to skip)
             label = decision.token
@@ -329,7 +380,7 @@ internal struct TdtDecoderV3 {
                 timeIndicesCurrentLabels = timeIndices
 
                 // INTENTIONAL: Reusing prepared decoder step from outside loop
-                let innerDecision = try runJointPrepared(
+                var innerDecision = try runJointPrepared(
                     encoderFrames: encoderFrames,
                     timeIndex: safeTimeIndices,
                     preparedDecoderStep: reusableDecoderStep,
@@ -340,8 +391,25 @@ internal struct TdtDecoderV3 {
                     inputProvider: jointInput,
                     tokenIdBacking: tokenIdBacking,
                     tokenProbBacking: tokenProbBacking,
-                    durationBacking: durationBacking
+                    durationBacking: durationBacking,
+                    topKIdsBacking: topKIdsBacking,
+                    topKLogitsBacking: topKLogitsBacking,
+                    topKSize: topKSize
                 )
+
+                // Apply keyword biasing in inner loop (may promote blank → non-blank)
+                if let boosting = keywordBoosting {
+                    applyKeywordBiasing(
+                        decision: &innerDecision,
+                        cursor: &trieCursor,
+                        phraseStartFrame: &phraseStartFrame,
+                        boosting: boosting,
+                        blankId: config.tdtConfig.blankId,
+                        timeIndex: timeIndices,
+                        globalFrameOffset: globalFrameOffset,
+                        hypothesis: &hypothesis
+                    )
+                }
 
                 label = innerDecision.token
                 score = clampProbability(innerDecision.probability)
@@ -603,7 +671,10 @@ internal struct TdtDecoderV3 {
         inputProvider: MLFeatureProvider,
         tokenIdBacking: MLMultiArray,
         tokenProbBacking: MLMultiArray,
-        durationBacking: MLMultiArray
+        durationBacking: MLMultiArray,
+        topKIdsBacking: MLMultiArray? = nil,
+        topKLogitsBacking: MLMultiArray? = nil,
+        topKSize: Int = 0
     ) throws -> JointDecision {
 
         // Fill encoder step with the requested frame
@@ -614,11 +685,16 @@ internal struct TdtDecoderV3 {
         ANEOptimizer.prefetchToNeuralEngine(preparedDecoderStep)
 
         // Reuse tiny output tensors for joint prediction (provide raw MLMultiArray backings)
-        predictionOptions.outputBackings = [
+        var backings: [String: MLMultiArray] = [
             "token_id": tokenIdBacking,
             "token_prob": tokenProbBacking,
             "duration": durationBacking,
         ]
+        if let topKIds = topKIdsBacking, let topKLogits = topKLogitsBacking {
+            backings["top_k_ids"] = topKIds
+            backings["top_k_logits"] = topKLogits
+        }
+        predictionOptions.outputBackings = backings
 
         // Execute joint network using the reusable provider
         let output = try model.prediction(
@@ -647,7 +723,19 @@ internal struct TdtDecoderV3 {
         let durationPointer = durationArray.dataPointer.bindMemory(to: Int32.self, capacity: durationArray.count)
         let durationBin = Int(durationPointer[0])
 
-        return JointDecision(token: token, probability: probability, durationBin: durationBin)
+        // Extract top-k data if available
+        var topKIds: [Int]?
+        var topKLogits: [Float]?
+        if let topKIdsArray = topKIdsBacking, let topKLogitsArray = topKLogitsBacking, topKSize > 0 {
+            let idsPtr = topKIdsArray.dataPointer.bindMemory(to: Int32.self, capacity: topKSize)
+            let logitsPtr = topKLogitsArray.dataPointer.bindMemory(to: Float.self, capacity: topKSize)
+            topKIds = (0..<topKSize).map { Int(idsPtr[$0]) }
+            topKLogits = (0..<topKSize).map { logitsPtr[$0] }
+        }
+
+        return JointDecision(
+            token: token, probability: probability, durationBin: durationBin,
+            topKIds: topKIds, topKLogits: topKLogits)
     }
 
     private func prepareDecoderProjection(_ projection: MLMultiArray) throws -> MLMultiArray {
@@ -813,6 +901,112 @@ internal struct TdtDecoderV3 {
 
         if config.tdtConfig.includeTokenDuration {
             hypothesis.tokenDurations.append(duration)
+        }
+    }
+
+    // MARK: - Keyword Biasing
+
+    /// Apply decode-time keyword biasing to a joint decision using the prefix trie.
+    ///
+    /// Checks if any top-k token advances the trie cursor along a keyword path.
+    /// If a keyword-matching token has a boosted logit exceeding the greedy choice,
+    /// the decision is overridden. Completed phrases are recorded in the hypothesis.
+    private func applyKeywordBiasing(
+        decision: inout JointDecision,
+        cursor: inout TrieCursor?,
+        phraseStartFrame: inout Int?,
+        boosting: KeywordBoostingContext,
+        blankId: Int,
+        timeIndex: Int,
+        globalFrameOffset: Int,
+        hypothesis: inout TdtHypothesis
+    ) {
+        guard let topKIds = decision.topKIds,
+            let topKLogits = decision.topKLogits,
+            let currentCursor = cursor
+        else { return }
+
+        let validNextTokens = currentCursor.validNextTokens
+
+        guard !validNextTokens.isEmpty else {
+            // No trie continuation possible — reset if current token is not blank
+            if decision.token != blankId {
+                cursor = boosting.prefixTrie.makeCursor()
+                phraseStartFrame = nil
+            }
+            return
+        }
+
+        // Find the best keyword-matching token in top-k
+        var bestBoostedIdx: Int?
+        var bestBoostedLogit: Float = -.infinity
+
+        for (idx, tokenId) in topKIds.enumerated() {
+            guard validNextTokens.contains(tokenId) else { continue }
+            let boostedLogit = topKLogits[idx] + boosting.boostWeight
+            if boostedLogit > bestBoostedLogit {
+                bestBoostedLogit = boostedLogit
+                bestBoostedIdx = idx
+            }
+        }
+
+        // Override greedy decision if boosted token wins
+        let wasBoosted: Bool
+        if let idx = bestBoostedIdx, bestBoostedLogit > topKLogits[0] {
+            decision.token = topKIds[idx]
+            // Convert logit to approximate probability via sigmoid
+            decision.probability = 1.0 / (1.0 + exp(-bestBoostedLogit))
+            wasBoosted = true
+        } else if let idx = bestBoostedIdx, topKIds[0] == topKIds[idx] {
+            // Greedy already matches a keyword token — no override needed
+            wasBoosted = false
+        } else {
+            wasBoosted = false
+        }
+
+        // Advance trie cursor with the chosen token
+        if decision.token == blankId {
+            // Blank tokens don't advance the trie — keep current position
+            return
+        }
+
+        if phraseStartFrame == nil {
+            phraseStartFrame = timeIndex + globalFrameOffset
+        }
+
+        if let advanced = currentCursor.advance(token: decision.token) {
+            cursor = advanced
+
+            // Check if we completed a phrase
+            if let termIndex = advanced.matchedTermIndex {
+                let term = boosting.prefixTrie.terms[termIndex]
+                let startTime = TimeInterval(phraseStartFrame ?? (timeIndex + globalFrameOffset)) * 0.08
+                let endTime = TimeInterval(timeIndex + globalFrameOffset) * 0.08 + 0.08
+
+                let detected = DetectedPhrase(
+                    term: term,
+                    startTime: startTime,
+                    endTime: endTime,
+                    confidence: decision.probability,
+                    wasBoosted: wasBoosted
+                )
+                hypothesis.detectedPhrases.append(detected)
+                boosting.onPhraseDetected?(detected)
+
+                // Reset cursor after completing a phrase (ready for next match)
+                cursor = boosting.prefixTrie.makeCursor()
+                phraseStartFrame = nil
+            }
+        } else {
+            // Token doesn't continue any phrase — reset cursor and try from root
+            cursor = boosting.prefixTrie.makeCursor()
+            phraseStartFrame = nil
+
+            // Try advancing from root with the current token (start of new phrase)
+            if let fromRoot = cursor?.advance(token: decision.token) {
+                cursor = fromRoot
+                phraseStartFrame = timeIndex + globalFrameOffset
+            }
         }
     }
 

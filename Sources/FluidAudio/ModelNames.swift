@@ -149,6 +149,7 @@ public enum ModelNames {
         public static let encoder = "Encoder"
         public static let decoder = "Decoder"
         public static let joint = "JointDecision"
+        public static let jointV2 = "JointDecisionv2"
 
         // Shared vocabulary file across all model versions
         public static let vocabularyFile = "parakeet_vocab.json"
@@ -157,6 +158,7 @@ public enum ModelNames {
         public static let encoderFile = encoder + ".mlmodelc"
         public static let decoderFile = decoder + ".mlmodelc"
         public static let jointFile = joint + ".mlmodelc"
+        public static let jointV2File = jointV2 + ".mlmodelc"
 
         public static let requiredModels: Set<String> = [
             preprocessorFile,
