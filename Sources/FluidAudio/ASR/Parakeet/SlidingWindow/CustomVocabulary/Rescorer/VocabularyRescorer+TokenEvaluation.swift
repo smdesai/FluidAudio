@@ -266,6 +266,25 @@ extension VocabularyRescorer {
             }
             return adjusted
         }
+
+        // Long words with near-equal length to the vocab term: the
+        // configured floor (e.g. 0.60 for extra-large vocabs) is too
+        // permissive for content words that happen to share characters
+        // with a real drug name (`pharmacist` → `pharmalgen`, `negative`
+        // → `megatope`, `patient` → `praluent`). Tighten to 0.70.
+        if normalizedWord.count >= ContextBiasingConstants.longWordMinLength
+            && lengthRatio >= ContextBiasingConstants.lengthRatioThreshold
+        {
+            let adjusted = max(minSimilarity, ContextBiasingConstants.longWordSimilarity)
+            if adjusted > minSimilarity && currentSimilarity >= minSimilarity {
+                debugLog(
+                    "    [LENGTH] '\(normalizedWord)' long with high length-ratio "
+                        + "(ratio=\(String(format: "%.2f", lengthRatio))), raising threshold to "
+                        + "\(String(format: "%.2f", adjusted))"
+                )
+            }
+            return adjusted
+        }
         return minSimilarity
     }
 }

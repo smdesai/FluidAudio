@@ -128,6 +128,37 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer+ConstrainedCTC.swift` short word guard
     public static let shortWordSimilarity: Float = 0.80
 
+    /// Minimum word length for the long-word similarity rule to apply.
+    ///
+    /// Pairs with `longWordSimilarity` to gate single-word substitutions
+    /// where the original word is long enough to be a real English content
+    /// word (e.g. `pharmacist`, `negative`, `morning`). Below this length
+    /// the short-word path or vocab-size floor is the binding constraint.
+    ///
+    /// - Value: `6` characters
+    /// - Used in: `VocabularyRescorer+TokenEvaluation.checkLengthRatioRules`
+    public static let longWordMinLength: Int = 6
+
+    /// Similarity threshold for long words with high length ratio.
+    ///
+    /// Long words (≥`longWordMinLength`) that are nearly the same length as
+    /// a vocabulary term (length ratio ≥ `lengthRatioThreshold`) need
+    /// stricter similarity than the configured floor. The vocab-size-aware
+    /// floor (e.g. 0.60 for extra-large vocabs) lets through borderline
+    /// substitutions like `pharmacist` → `pharmalgen` (sim 0.60),
+    /// `negative` → `megatope` (0.625), `patient` → `praluent` (0.625),
+    /// `morning` → `mononine` (0.625) where the vocabulary term is a real
+    /// drug name that happens to share several characters with a common
+    /// English word. Requiring 0.70 for this fingerprint blocks those FPs
+    /// without affecting genuinely-misrecognized words (which sit further
+    /// from any vocab term in edit distance).
+    ///
+    /// - Value: `0.70` (70% similarity for long, same-length words)
+    /// - Applies when: `word.count >= longWordMinLength` AND
+    ///   `lengthRatio >= lengthRatioThreshold` AND `spanLength == 1`
+    /// - Used in: `VocabularyRescorer+TokenEvaluation.checkLengthRatioRules`
+    public static let longWordSimilarity: Float = 0.70
+
     /// Similarity threshold for spans containing stopwords.
     ///
     /// When a multi-word span contains common stopwords (articles, prepositions,
