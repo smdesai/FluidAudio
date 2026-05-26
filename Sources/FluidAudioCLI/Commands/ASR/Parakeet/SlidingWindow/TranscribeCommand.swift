@@ -271,6 +271,27 @@ enum TranscribeCommand {
         /// uncertain in both hypotheses. Default −∞ (disabled); set to a
         /// finite value (e.g. −30.0) to require some absolute confidence.
         var tdtPrimaryMinCandScore: Float = -.infinity
+
+        /// TDT beam search width. `0` = use the existing greedy pipeline
+        /// (default). `1` = beam loop with one hypothesis (sanity-check
+        /// path: should match greedy). `>1` = real beam search.
+        ///
+        /// Beam mode requires `JointDecisionLogits.mlmodelc` (loaded
+        /// automatically by AsrModels for v2). When beam mode is active and
+        /// `--custom-vocab` is also set, vocabulary biasing is performed
+        /// inline via shallow fusion instead of the post-hoc CTC rescorer
+        /// path; the parakeet-ctc-110m model is not loaded.
+        var beamSize: Int = 0
+        /// Per-hypothesis top-K expansion factor. Lower = faster, less
+        /// diverse exploration. Default = beamSize.
+        var beamTopK: Int? = nil
+        /// Length-normalization exponent for ranking final hypotheses.
+        var beamLengthPenalty: Float = 1.0
+        /// Absolute log-prob pruning threshold below the best.
+        var beamPruning: Float = 5.0
+        /// Shallow-fusion bonus (log-prob units) added to vocab-keyword
+        /// next-token logits during beam scoring.
+        var beamBiasBonus: Float = 4.5
     }
 
     private static func parseArguments(_ args: [String]) -> ParsedArgs? {
@@ -437,6 +458,31 @@ enum TranscribeCommand {
                     parsed.tdtPrimaryMinCandScore = Float(args[i + 1]) ?? -.infinity
                     i += 1
                 }
+            case "--beam-size":
+                if i + 1 < args.count {
+                    parsed.beamSize = Int(args[i + 1]) ?? 0
+                    i += 1
+                }
+            case "--beam-top-k":
+                if i + 1 < args.count {
+                    parsed.beamTopK = Int(args[i + 1])
+                    i += 1
+                }
+            case "--beam-length-penalty":
+                if i + 1 < args.count {
+                    parsed.beamLengthPenalty = Float(args[i + 1]) ?? 1.0
+                    i += 1
+                }
+            case "--beam-pruning":
+                if i + 1 < args.count {
+                    parsed.beamPruning = Float(args[i + 1]) ?? 5.0
+                    i += 1
+                }
+            case "--beam-bias-bonus":
+                if i + 1 < args.count {
+                    parsed.beamBiasBonus = Float(args[i + 1]) ?? 4.5
+                    i += 1
+                }
 
             default:
                 fputs("WARNING: Unknown option: \(args[i])\n", stderr)
@@ -527,12 +573,108 @@ enum TranscribeCommand {
             logger.info("Transcribing file: \(audioFileURL) ...")
             var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
             let startTime = Date()
-            var result = try await asrManager.transcribe(
-                audioFileURL, decoderState: &decoderState, language: args.language)
-            let processingTime = Date().timeIntervalSince(startTime)
 
-            // Apply vocabulary rescoring if custom vocab is provided
-            if let vocabPath = args.customVocabPath {
+            // Beam mode short-circuits the standard pipeline. It uses the
+            // TDT JointDecisionLogits model + an internal beam loop, with
+            // optional shallow-fusion biasing from --custom-vocab. Falls
+            // back to greedy on unsupported configurations.
+            var beamResultOpt: BeamTranscribeResult? = nil
+            if args.beamSize > 0 {
+                do {
+                    var vocabForBias: CustomVocabularyContext? = nil
+                    var biasKeywords: [[Int]] = []
+                    if let vocabPath = args.customVocabPath,
+                        let asrModels = await asrManager.loadedModels
+                    {
+                        let (vocab, _) = try await CustomVocabularyContext.loadWithCtcTokens(
+                            from: vocabPath)
+                        vocabForBias = vocab
+                        biasKeywords = try tokenizeVocabularyForBeamBias(
+                            asrModels: asrModels, vocabulary: vocab)
+                        logger.info(
+                            "Beam: loaded \(vocab.terms.count) vocab terms, "
+                                + "\(biasKeywords.count) tokenized for bias")
+                    }
+
+                    let bias: TdtBeamBiasConfig? =
+                        biasKeywords.isEmpty
+                        ? nil
+                        : TdtBeamBiasConfig(
+                            keywordTokenSequences: biasKeywords,
+                            bonus: args.beamBiasBonus
+                        )
+                    let beamConfig = TdtBeamConfig(
+                        beamSize: args.beamSize,
+                        topKPerHypothesis: args.beamTopK ?? args.beamSize,
+                        lengthPenalty: args.beamLengthPenalty,
+                        pruningThreshold: args.beamPruning,
+                        bias: bias
+                    )
+                    beamResultOpt = try await runTdtBeamTranscribe(
+                        asrModels: await asrManager.loadedModels,
+                        audioSamples: samples,
+                        vocabulary: vocabForBias,
+                        beamConfig: beamConfig,
+                        logger: logger
+                    )
+                } catch {
+                    logger.warning(
+                        "Beam mode failed; falling back to greedy: \(error.localizedDescription)"
+                    )
+                }
+            }
+
+            var result: ASRResult
+            let processingTime: TimeInterval
+            if let beamResult = beamResultOpt {
+                // Build an ASRResult from the beam output. Confidence is
+                // mean token confidence; word timings will be derived in
+                // the same paths as the greedy result.
+                let confidence: Float =
+                    beamResult.confidences.isEmpty
+                    ? 0.0
+                    : beamResult.confidences.reduce(0, +) / Float(beamResult.confidences.count)
+                processingTime = beamResult.processingTime
+                let beamVocab = await asrManager.loadedModels?.vocabulary ?? [:]
+                var tokenTimings: [TokenTiming] = []
+                tokenTimings.reserveCapacity(beamResult.tokens.count)
+                for (idx, pair) in zip(beamResult.tokens, beamResult.timestamps).enumerated() {
+                    let (tokenId, frame) = pair
+                    let token = beamVocab[tokenId] ?? ""
+                    let conf =
+                        idx < beamResult.confidences.count ? beamResult.confidences[idx] : 0.0
+                    let frameSec = Double(frame) * ASRConstants.secondsPerEncoderFrame
+                    tokenTimings.append(
+                        TokenTiming(
+                            token: token,
+                            tokenId: tokenId,
+                            startTime: frameSec,
+                            endTime: frameSec + ASRConstants.secondsPerEncoderFrame,
+                            confidence: conf
+                        ))
+                }
+                result = ASRResult(
+                    text: beamResult.text,
+                    confidence: confidence,
+                    duration: duration,
+                    processingTime: processingTime,
+                    tokenTimings: tokenTimings
+                )
+                // Beam mode owns its own vocabulary path; skip the post-
+                // hoc CTC rescore by clearing the customVocabPath flag for
+                // the rest of the function.
+                // (We don't actually mutate args; the next branch checks
+                // beamResultOpt to decide whether to skip rescoring.)
+            } else {
+                result = try await asrManager.transcribe(
+                    audioFileURL, decoderState: &decoderState, language: args.language)
+                processingTime = Date().timeIntervalSince(startTime)
+            }
+
+            // Apply vocabulary rescoring if custom vocab is provided.
+            // Skipped when beam mode handled the vocab path inline via
+            // shallow-fusion biasing.
+            if let vocabPath = args.customVocabPath, beamResultOpt == nil {
                 logger.info("Applying vocabulary boosting from: \(vocabPath)")
 
                 let ctcProfileEnabled =

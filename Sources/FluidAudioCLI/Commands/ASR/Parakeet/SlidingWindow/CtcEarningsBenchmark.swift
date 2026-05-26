@@ -59,6 +59,15 @@ public enum CtcEarningsBenchmark {
         var ctcVariant: CtcModelVariant = .ctc110m
         // Constrained CTC rescoring is enabled by default
         var useConstrainedCTC = true
+        // Beam-search mode (experimental). When > 0, replaces the
+        // TDT-then-CTC pipeline with a single TDT beam decode that uses
+        // shallow-fusion biasing for vocabulary terms. Requires
+        // JointDecisionLogits.mlmodelc on the loaded TDT bundle.
+        var beamSize: Int = 0
+        var beamTopK: Int? = nil
+        var beamLengthPenalty: Float = 1.0
+        var beamPruning: Float = 5.0
+        var beamBiasBonus: Float = 4.5
 
         var i = 0
         while i < arguments.count {
@@ -127,6 +136,31 @@ public enum CtcEarningsBenchmark {
                 }
             case "--no-constrained-ctc":
                 useConstrainedCTC = false
+            case "--beam-size":
+                if i + 1 < arguments.count {
+                    beamSize = Int(arguments[i + 1]) ?? 0
+                    i += 1
+                }
+            case "--beam-top-k":
+                if i + 1 < arguments.count {
+                    beamTopK = Int(arguments[i + 1])
+                    i += 1
+                }
+            case "--beam-length-penalty":
+                if i + 1 < arguments.count {
+                    beamLengthPenalty = Float(arguments[i + 1]) ?? 1.0
+                    i += 1
+                }
+            case "--beam-pruning":
+                if i + 1 < arguments.count {
+                    beamPruning = Float(arguments[i + 1]) ?? 5.0
+                    i += 1
+                }
+            case "--beam-bias-bonus":
+                if i + 1 < arguments.count {
+                    beamBiasBonus = Float(arguments[i + 1]) ?? 4.5
+                    i += 1
+                }
             default:
                 break
             }
@@ -242,6 +276,21 @@ public enum CtcEarningsBenchmark {
             var totalFalsePositives = 0  // In hypothesis but NOT in reference
             var totalFalseNegatives = 0  // In reference but NOT in hypothesis
 
+            // Pre-compute beam config + tokenizer URL once so each per-file
+            // invocation doesn't re-load tokenizer.model.
+            let beamConfigOuter: TdtBeamConfig?
+            if beamSize > 0 {
+                beamConfigOuter = TdtBeamConfig(
+                    beamSize: beamSize,
+                    topKPerHypothesis: beamTopK ?? beamSize,
+                    lengthPenalty: beamLengthPenalty,
+                    pruningThreshold: beamPruning,
+                    bias: nil  // Bias keyword tokens are file-specific; built per-file.
+                )
+            } else {
+                beamConfigOuter = nil
+            }
+
             for (index, fileId) in fileIds.enumerated() {
                 if let result = try await processFile(
                     fileId: fileId,
@@ -250,7 +299,9 @@ public enum CtcEarningsBenchmark {
                     ctcModels: ctcModels,
                     spotter: spotter,
                     keywordsMode: keywordsMode,
-                    useConstrainedCTC: useConstrainedCTC
+                    useConstrainedCTC: useConstrainedCTC,
+                    beamConfigBase: beamConfigOuter,
+                    beamBiasBonus: beamBiasBonus
                 ) {
                     results.append(result)
                     totalWer += result["wer"] as? Double ?? 0
@@ -374,7 +425,9 @@ public enum CtcEarningsBenchmark {
         ctcModels: CtcModels,
         spotter: CtcKeywordSpotter,
         keywordsMode: KeywordsMode,
-        useConstrainedCTC: Bool
+        useConstrainedCTC: Bool,
+        beamConfigBase: TdtBeamConfig? = nil,
+        beamBiasBonus: Float = 4.5
     ) async throws -> [String: Any]? {
         let wavFile = dataDir.appendingPathComponent("\(fileId).wav")
         let dictionaryFile = dataDir.appendingPathComponent("\(fileId).dictionary.txt")
@@ -452,6 +505,146 @@ public enum CtcEarningsBenchmark {
         let samples = try converter.resampleBuffer(buffer)
 
         let startTime = Date()
+
+        // BEAM-MODE FAST PATH
+        // When --beam-size > 0, skip the standard TDT-then-CTC pipeline and
+        // run a single TDT beam decode with shallow-fusion biasing. We still
+        // build the vocabulary file path the same way the CTC path does
+        // (chunk vs file mode) so scoring against `dictionaryWords` is
+        // unchanged.
+        if let beamConfigBase {
+            let vocabFileURL: URL
+            if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path) {
+                vocabFileURL = keywordsFile
+            } else {
+                vocabFileURL = dictionaryFile
+            }
+            let loadedVocab = try CustomVocabularyContext.loadFromSimpleFormat(from: vocabFileURL)
+
+            // Build the bias config: tokenize each vocab term against the
+            // TDT vocab. Skip terms that produce no tokens (defensive — the
+            // tokenizer is well-defined for normal English/brand names).
+            var biasConfig: TdtBeamBiasConfig? = nil
+            if let asrModels = await asrManager.loadedModels {
+                let tokenized = try tokenizeVocabularyForBeamBias(
+                    asrModels: asrModels, vocabulary: loadedVocab)
+                if !tokenized.isEmpty {
+                    biasConfig = TdtBeamBiasConfig(
+                        keywordTokenSequences: tokenized, bonus: beamBiasBonus)
+                }
+            }
+
+            let beamConfig = TdtBeamConfig(
+                beamSize: beamConfigBase.beamSize,
+                topKPerHypothesis: beamConfigBase.topKPerHypothesis,
+                lengthPenalty: beamConfigBase.lengthPenalty,
+                pruningThreshold: beamConfigBase.pruningThreshold,
+                bias: biasConfig
+            )
+
+            let beamResult: BeamTranscribeResult
+            do {
+                beamResult = try await runTdtBeamTranscribe(
+                    asrModels: await asrManager.loadedModels,
+                    audioSamples: samples,
+                    vocabulary: loadedVocab,
+                    beamConfig: beamConfig,
+                    logger: AppLogger(category: "ctc-earnings-benchmark.beam")
+                )
+            } catch {
+                print("  SKIPPED: beam decode failed: \(error.localizedDescription)")
+                return nil
+            }
+            let processingTime = Date().timeIntervalSince(startTime)
+
+            // Score the beam hypothesis with the same WER + dict-pass +
+            // precision/recall measurements as the CTC path. Detection
+            // metadata is empty (beam doesn't run CTC keyword spotting).
+            let hypothesis = beamResult.text
+            let referenceNormalized = TextNormalizer.normalize(referenceRaw)
+            let hypothesisNormalized = TextNormalizer.normalize(hypothesis)
+            let referenceWords =
+                referenceNormalized
+                .components(separatedBy: CharacterSet.whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+            let hypothesisWords =
+                hypothesisNormalized
+                .components(separatedBy: CharacterSet.whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+            let wer: Double =
+                referenceWords.isEmpty
+                ? (hypothesisWords.isEmpty ? 0.0 : 1.0)
+                : calculateWER(reference: referenceWords, hypothesis: hypothesisWords)
+
+            let hypothesisLower = hypothesisNormalized.lowercased()
+            let referenceLower = referenceNormalized.lowercased()
+
+            // Dict-pass: check if each check word appears as a whole word
+            // in the hypothesis. Beam has no CTC detections so this is
+            // hypothesis-only.
+            var dictFound = 0
+            for word in checkWords {
+                let wordLower = word.lowercased()
+                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: wordLower))\\b"
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+                    regex.firstMatch(
+                        in: hypothesisLower, options: [],
+                        range: NSRange(hypothesisLower.startIndex..., in: hypothesisLower)) != nil
+                {
+                    dictFound += 1
+                }
+            }
+
+            // Precision/recall: TP/FP/FN per check word.
+            var truePositives = 0
+            var falsePositives = 0
+            var falseNegatives = 0
+            for word in checkWords {
+                let wordLower = word.lowercased()
+                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: wordLower))\\b"
+                let inRef: Bool
+                let inHyp: Bool
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                    inRef =
+                        regex.firstMatch(
+                            in: referenceLower, options: [],
+                            range: NSRange(referenceLower.startIndex..., in: referenceLower))
+                        != nil
+                    inHyp =
+                        regex.firstMatch(
+                            in: hypothesisLower, options: [],
+                            range: NSRange(hypothesisLower.startIndex..., in: hypothesisLower))
+                        != nil
+                } else {
+                    inRef = referenceLower.contains(wordLower)
+                    inHyp = hypothesisLower.contains(wordLower)
+                }
+                if inRef && inHyp {
+                    truePositives += 1
+                } else if inHyp && !inRef {
+                    falsePositives += 1
+                } else if inRef && !inHyp {
+                    falseNegatives += 1
+                }
+            }
+
+            return [
+                "fileId": fileId,
+                "reference": referenceRaw,
+                "hypothesis": hypothesis,
+                "referenceNormalized": referenceNormalized,
+                "hypothesisNormalized": hypothesisNormalized,
+                "wer": round(wer * 10000) / 100,
+                "dictFound": dictFound,
+                "dictTotal": checkWords.count,
+                "truePositives": truePositives,
+                "falsePositives": falsePositives,
+                "falseNegatives": falseNegatives,
+                "audioLength": round(audioLength * 100) / 100,
+                "processingTime": round(processingTime * 1000) / 1000,
+                "ctcDetections": [] as [[String: Any]],
+            ]
+        }
 
         // 1. TDT transcription for low WER
         var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
