@@ -103,6 +103,17 @@ extension MLMultiArray {
     }
 
     func copyData(from source: MLMultiArray) {
+        // Fast path: identical fp32 layouts can be memcpy'd from raw
+        // pointers, sidestepping the per-element NSNumber boxing that the
+        // generic MLMultiArray subscript performs. Decoder state is the
+        // hottest case in beam search where this is called O(B) times per
+        // step. Falls back to the slow path on layout/dtype mismatch.
+        if dataType == .float32 && source.dataType == .float32 && count == source.count {
+            let srcPtr = source.dataPointer.bindMemory(to: Float.self, capacity: source.count)
+            let dstPtr = self.dataPointer.bindMemory(to: Float.self, capacity: self.count)
+            memcpy(dstPtr, srcPtr, count * MemoryLayout<Float>.stride)
+            return
+        }
         for i in 0..<count {
             self[i] = source[i]
         }
