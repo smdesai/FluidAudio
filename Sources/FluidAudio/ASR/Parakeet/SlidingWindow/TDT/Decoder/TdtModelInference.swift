@@ -173,6 +173,81 @@ internal struct TdtModelInference: Sendable {
         )
     }
 
+    /// Execute the logits-only joint variant for a single (encoder_step,
+    /// decoder_step) pair and return the per-step `token_logits` and
+    /// `duration_logits` as flat `[Float]` rows.
+    ///
+    /// The model exposes the full TDT posterior (1025 token slots = 1024 vocab
+    /// + 1 blank, plus 5 duration buckets), allowing rescoring against the
+    /// real TDT joint without indirection through the parakeet-ctc-110m
+    /// model.
+    ///
+    /// - Parameters:
+    ///   - model: Loaded `JointDecisionLogits` MLModel
+    ///   - encoderStep: `[1, 1024, 1]` Float32 — same buffer shape as the
+    ///     standard joint takes; pass the buffer that the caller already
+    ///     populates for the regular joint call to share frame copies.
+    ///   - decoderStep: `[1, 640, 1]` Float32 — normalized decoder projection
+    ///     from `normalizeDecoderProjection`.
+    ///   - tokenLogitsBacking: Optional `[1,1,1,1025]` Float32 buffer to reuse
+    ///     for `token_logits`. If `nil`, CoreML allocates per call.
+    ///   - durationLogitsBacking: Optional `[1,1,1,5]` Float32 buffer to
+    ///     reuse for `duration_logits`.
+    ///
+    /// - Returns: `(tokenLogits, durationLogits)`. `tokenLogits.count` is
+    ///   `1025` (vocab + blank); `durationLogits.count` is `5`.
+    func runJointLogits(
+        encoderStep: MLMultiArray,
+        decoderStep: MLMultiArray,
+        model: MLModel,
+        tokenLogitsBacking: MLMultiArray? = nil,
+        durationLogitsBacking: MLMultiArray? = nil
+    ) throws -> (tokenLogits: [Float], durationLogits: [Float]) {
+        encoderStep.prefetchToNeuralEngine()
+        decoderStep.prefetchToNeuralEngine()
+
+        if let tokenLogitsBacking, let durationLogitsBacking {
+            predictionOptions.outputBackings = [
+                "token_logits": tokenLogitsBacking,
+                "duration_logits": durationLogitsBacking,
+            ]
+        } else {
+            predictionOptions.outputBackings = [:]
+        }
+
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "encoder_step": MLFeatureValue(multiArray: encoderStep),
+            "decoder_step": MLFeatureValue(multiArray: decoderStep),
+        ])
+
+        let output = try model.prediction(from: input, options: predictionOptions)
+
+        let tokenLogitsArray = try extractFeatureValue(
+            from: output, key: "token_logits",
+            errorMessage: "JointDecisionLogits output missing token_logits"
+        )
+        let durationLogitsArray = try extractFeatureValue(
+            from: output, key: "duration_logits",
+            errorMessage: "JointDecisionLogits output missing duration_logits"
+        )
+
+        guard tokenLogitsArray.dataType == .float32, durationLogitsArray.dataType == .float32 else {
+            throw ASRError.processingFailed(
+                "JointDecisionLogits output dtype mismatch — expected Float32"
+            )
+        }
+
+        let tokenCount = tokenLogitsArray.count
+        let durationCount = durationLogitsArray.count
+        let tokenPtr = tokenLogitsArray.dataPointer.bindMemory(to: Float.self, capacity: tokenCount)
+        let durationPtr = durationLogitsArray.dataPointer.bindMemory(
+            to: Float.self, capacity: durationCount)
+
+        let tokenLogits = Array(UnsafeBufferPointer(start: tokenPtr, count: tokenCount))
+        let durationLogits = Array(UnsafeBufferPointer(start: durationPtr, count: durationCount))
+        return (tokenLogits, durationLogits)
+    }
+
     /// Normalize decoder projection into [1, hiddenSize, 1] layout via BLAS copy.
     ///
     /// CoreML decoder outputs can have varying layouts ([1, 1, 640] or [1, 640, 1]).

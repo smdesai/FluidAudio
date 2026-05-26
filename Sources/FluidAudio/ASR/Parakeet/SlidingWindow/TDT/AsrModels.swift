@@ -78,6 +78,12 @@ public struct AsrModels: Sendable {
     public let joint: MLModel
     /// Optional CTC decoder head for custom vocabulary (encoder features → CTC logits)
     public let ctcHead: MLModel?
+    /// Optional logits-only joint variant. Same `(encoder_step, decoder_step)`
+    /// inputs as `joint`, but returns raw `token_logits` / `duration_logits`
+    /// instead of argmaxed scalars. Used by vocabulary rescoring to score
+    /// candidate token sequences against the TDT posterior without depending
+    /// on the separate parakeet-ctc-110m model.
+    public let jointLogits: MLModel?
     public let configuration: MLModelConfiguration
     public let vocabulary: [Int: String]
     public let version: AsrModelVersion
@@ -90,6 +96,7 @@ public struct AsrModels: Sendable {
         decoder: MLModel,
         joint: MLModel,
         ctcHead: MLModel? = nil,
+        jointLogits: MLModel? = nil,
         configuration: MLModelConfiguration,
         vocabulary: [Int: String],
         version: AsrModelVersion
@@ -99,6 +106,7 @@ public struct AsrModels: Sendable {
         self.decoder = decoder
         self.joint = joint
         self.ctcHead = ctcHead
+        self.jointLogits = jointLogits
         self.configuration = configuration
         self.vocabulary = vocabulary
         self.version = version
@@ -352,12 +360,35 @@ extension AsrModels {
             }
         }
 
+        // Optionally load the logits-only joint variant. Only attempted for
+        // versions whose `parakeet_joint_decision_logits_single_step` export
+        // matches the runtime joint signature (single-step `[1,1024,1]` x
+        // `[1,640,1]`) — currently v2 only. Missing files are not fatal:
+        // standard transcription only needs the existing `joint` model.
+        var jointLogitsModel: MLModel?
+        if version == .v2 {
+            let repoDir = repoPath(from: directory, version: version)
+            let jointLogitsPath = repoDir.appendingPathComponent(Names.jointLogitsFile)
+            if FileManager.default.fileExists(atPath: jointLogitsPath.path) {
+                let jlConfig = MLModelConfiguration()
+                jlConfig.computeUnits = config.computeUnits
+                jointLogitsModel = try? MLModel(contentsOf: jointLogitsPath, configuration: jlConfig)
+                if jointLogitsModel != nil {
+                    logger.info("Loaded \(Names.jointLogitsFile) from local directory")
+                } else {
+                    logger.warning(
+                        "Joint logits model found but failed to load: \(jointLogitsPath.path)")
+                }
+            }
+        }
+
         let asrModels = AsrModels(
             encoder: encoderModel,
             preprocessor: preprocessorModel,
             decoder: decoderModel,
             joint: jointModel,
             ctcHead: ctcHeadModel,
+            jointLogits: jointLogitsModel,
             configuration: config,
             vocabulary: try loadVocabulary(from: directory, version: version),
             version: version

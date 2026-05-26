@@ -17,6 +17,11 @@ public actor AsrManager {
     /// The AsrModels instance if initialized with models
     internal var asrModels: AsrModels?
 
+    /// Public read-only accessor for the loaded `AsrModels`. Useful for
+    /// callers that want to drive auxiliary models (e.g. `TdtRescorer`,
+    /// which uses the optional `jointLogits` model and the encoder).
+    public var loadedModels: AsrModels? { asrModels }
+
     internal let progressEmitter = ProgressEmitter()
 
     /// Number of decoder layers for the current model.

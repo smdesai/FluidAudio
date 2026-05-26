@@ -328,6 +328,12 @@ public enum ModelNames {
         /// Joint decoder variant for v3 that exposes top-K outputs
         /// (`top_k_ids`, `top_k_logits`) used for language-aware script filtering.
         public static let jointV3File = "JointDecisionv3.mlmodelc"
+        /// Optional joint decoder variant that returns raw token / duration
+        /// logits instead of pre-collapsed (token_id, token_prob, duration).
+        /// Intended for vocabulary biasing and rescoring against the TDT
+        /// posterior; absent from the default-required set so missing local
+        /// files don't break standard transcription flows.
+        public static let jointLogitsFile = "JointDecisionLogits.mlmodelc"
         public static let encoderInt4File = "EncoderInt4.mlmodelc"
         public static let ctcHeadFile = ctcHead + ".mlmodelc"
 

@@ -228,6 +228,31 @@ enum TranscribeCommand {
         var vocabMinSimilarity: Float?
         var vocabCbw: Float?
         var vocabMargin: Double?
+
+        /// Enable TDT-based confirmation of CTC rescorer replacements.
+        /// When true, each accepted CTC replacement is also scored against the
+        /// TDT posterior via JointDecisionLogits. Disagreements are logged and
+        /// (when `tdtRescoreVeto` is on) cause the replacement to be skipped.
+        var tdtRescore: Bool = false
+        /// When `tdtRescore` is true, also reject replacements where the TDT
+        /// rescorer disagrees with the CTC decision and the disagreement
+        /// exceeds `tdtRescoreVetoMargin` log-prob points.
+        var tdtRescoreVeto: Bool = false
+        /// Margin (log-prob units) by which the original must outscore the
+        /// candidate to trigger a veto. 0 = veto on any disagreement; higher
+        /// values demand stronger evidence before vetoing. Default 10.0
+        /// based on the single-case observation where the FP fingerprint
+        /// (`prior→PRIORIX`) had a 19-point margin while borderline
+        /// disagreements were ≤5 points.
+        var tdtRescoreVetoMargin: Float = 10.0
+        /// Minimum log-prob score TDT must assign to the original token
+        /// sequence before its margin counts as evidence. When TDT itself is
+        /// uncertain (very negative orig score), the margin is unreliable —
+        /// TDT may prefer its own gibberish over a correct brand name. Default
+        /// −20.0 chosen from per-case analysis on FDA non-extended where the
+        /// failure mode had `orig ≈ -35` while the FDA-extended TP fingerprint
+        /// had `orig ≈ -14`.
+        var tdtRescoreVetoMinOrigScore: Float = -20.0
     }
 
     private static func parseArguments(_ args: [String]) -> ParsedArgs? {
@@ -365,6 +390,21 @@ enum TranscribeCommand {
             case "--vocab-margin":
                 if i + 1 < args.count {
                     parsed.vocabMargin = Double(args[i + 1])
+                    i += 1
+                }
+            case "--tdt-rescore":
+                parsed.tdtRescore = true
+            case "--tdt-rescore-veto":
+                parsed.tdtRescore = true
+                parsed.tdtRescoreVeto = true
+            case "--tdt-rescore-veto-margin":
+                if i + 1 < args.count {
+                    parsed.tdtRescoreVetoMargin = Float(args[i + 1]) ?? 10.0
+                    i += 1
+                }
+            case "--tdt-rescore-veto-min-orig-score":
+                if i + 1 < args.count {
+                    parsed.tdtRescoreVetoMinOrigScore = Float(args[i + 1]) ?? -20.0
                     i += 1
                 }
 
@@ -507,14 +547,50 @@ enum TranscribeCommand {
                     )
 
                     if rescoreOutput.wasModified {
-                        logger.info("Vocabulary boosting applied \(rescoreOutput.replacements.count) replacement(s)")
-                        for replacement in rescoreOutput.replacements where replacement.shouldReplace {
+                        // Optional TDT-side confirmation: score each accepted CTC
+                        // replacement against the JointDecisionLogits posterior
+                        // and (when --tdt-rescore-veto is set) drop the ones the
+                        // TDT rescorer disagrees with.
+                        var finalText = rescoreOutput.text
+                        var keptReplacements = rescoreOutput.replacements
+                        if args.tdtRescore {
+                            do {
+                                let (kept, vetoed, rebuilt) = try await applyTdtRescoreReview(
+                                    asrModels: asrManager.loadedModels,
+                                    audioSamples: samples,
+                                    originalText: result.text,
+                                    rescoredText: rescoreOutput.text,
+                                    tokenTimings: tokenTimings,
+                                    replacements: rescoreOutput.replacements,
+                                    veto: args.tdtRescoreVeto,
+                                    vetoMargin: args.tdtRescoreVetoMargin,
+                                    vetoMinOrigScore: args.tdtRescoreVetoMinOrigScore,
+                                    logger: logger
+                                )
+                                keptReplacements = kept
+                                if args.tdtRescoreVeto {
+                                    finalText = rebuilt
+                                    if !vetoed.isEmpty {
+                                        logger.info(
+                                            "TDT rescore vetoed \(vetoed.count) of \(rescoreOutput.replacements.count) replacement(s)"
+                                        )
+                                    }
+                                }
+                            } catch {
+                                logger.warning(
+                                    "TDT rescore review failed; keeping CTC decisions: \(error.localizedDescription)"
+                                )
+                            }
+                        }
+
+                        logger.info("Vocabulary boosting applied \(keptReplacements.count) replacement(s)")
+                        for replacement in keptReplacements where replacement.shouldReplace {
                             logger.info(
                                 "  '\(replacement.originalWord)' → '\(replacement.replacementWord ?? "")' (score: \(String(format: "%.2f", replacement.replacementScore ?? 0)))"
                             )
                         }
                         result = ASRResult(
-                            text: rescoreOutput.text,
+                            text: finalText,
                             confidence: result.confidence,
                             duration: result.duration,
                             processingTime: result.processingTime,
