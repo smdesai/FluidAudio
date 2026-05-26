@@ -200,7 +200,8 @@ extension VocabularyRescorer {
         frameDuration: Double,
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
-        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        tdtContext: TdtScorerContext? = nil
     ) -> RescoreOutput {
         // Build word-level timings once at the entrypoint and pass into both
         // dispatch paths. Computing this once instead of twice avoids
@@ -218,7 +219,8 @@ extension VocabularyRescorer {
                 frameDuration: frameDuration,
                 cbw: cbw,
                 marginSeconds: marginSeconds,
-                minSimilarity: minSimilarity
+                minSimilarity: minSimilarity,
+                tdtContext: tdtContext
             )
         } else {
             return rescoreWithConstrainedCTCTermCentric(
@@ -228,7 +230,8 @@ extension VocabularyRescorer {
                 frameDuration: frameDuration,
                 cbw: cbw,
                 marginSeconds: marginSeconds,
-                minSimilarity: minSimilarity
+                minSimilarity: minSimilarity,
+                tdtContext: tdtContext
             )
         }
     }
@@ -250,7 +253,8 @@ extension VocabularyRescorer {
         frameDuration: Double,
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
-        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        tdtContext: TdtScorerContext? = nil
     ) -> RescoreOutput {
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
             return RescoreOutput(text: transcript, replacements: [], wasModified: false)
@@ -406,12 +410,14 @@ extension VocabularyRescorer {
                     spanEndTime: spanEndTime
                 )
 
-                let result = evaluateCTCMatch(
+                let result = evaluateMatch(
                     candidate: matchCandidate,
+                    wordTimings: wordTimings,
                     logProbs: logProbs,
                     frameDuration: frameDuration,
                     cbw: cbw,
-                    marginSeconds: marginSeconds
+                    marginSeconds: marginSeconds,
+                    tdtContext: tdtContext
                 )
 
                 if result.shouldReplace {
@@ -452,7 +458,8 @@ extension VocabularyRescorer {
         frameDuration: Double,
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
-        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        tdtContext: TdtScorerContext? = nil
     ) -> RescoreOutput {
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
             return RescoreOutput(text: transcript, replacements: [], wasModified: false)
@@ -568,12 +575,14 @@ extension VocabularyRescorer {
                             spanEndTime: spanEndTime
                         )
 
-                        let result = evaluateCTCMatch(
+                        let result = evaluateMatch(
                             candidate: matchCandidate,
+                            wordTimings: wordTimings,
                             logProbs: logProbs,
                             frameDuration: frameDuration,
                             cbw: cbw,
-                            marginSeconds: marginSeconds
+                            marginSeconds: marginSeconds,
+                            tdtContext: tdtContext
                         )
 
                         if result.shouldReplace {
@@ -734,12 +743,14 @@ extension VocabularyRescorer {
                         spanEndTime: spanEndTime
                     )
 
-                    let result = evaluateCTCMatch(
+                    let result = evaluateMatch(
                         candidate: matchCandidate,
+                        wordTimings: wordTimings,
                         logProbs: logProbs,
                         frameDuration: frameDuration,
                         cbw: cbw,
-                        marginSeconds: marginSeconds
+                        marginSeconds: marginSeconds,
+                        tdtContext: tdtContext
                     )
 
                     if result.shouldReplace {
@@ -782,7 +793,8 @@ extension VocabularyRescorer {
                 cbw: cbw,
                 marginSeconds: marginSeconds,
                 vocabularyNormalizedSet: vocabularyNormalizedSet,
-                pendingReplacements: &pendingReplacements
+                pendingReplacements: &pendingReplacements,
+                tdtContext: tdtContext
             )
         }
 
@@ -818,7 +830,8 @@ extension VocabularyRescorer {
         cbw: Float,
         marginSeconds: Double,
         vocabularyNormalizedSet: Set<String>,
-        pendingReplacements: inout [PendingReplacement]
+        pendingReplacements: inout [PendingReplacement],
+        tdtContext: TdtScorerContext? = nil
     ) {
         let result = spotter.spotKeywordsFromLogProbs(
             logProbs: logProbs,
@@ -919,12 +932,14 @@ extension VocabularyRescorer {
                 spanEndTime: wordTimings[lastIdx].endTime
             )
 
-            let evalResult = evaluateCTCMatch(
+            let evalResult = evaluateMatch(
                 candidate: candidate,
+                wordTimings: wordTimings,
                 logProbs: logProbs,
                 frameDuration: frameDuration,
                 cbw: cbw,
-                marginSeconds: marginSeconds
+                marginSeconds: marginSeconds,
+                tdtContext: tdtContext
             )
             guard evalResult.shouldReplace else { continue }
 

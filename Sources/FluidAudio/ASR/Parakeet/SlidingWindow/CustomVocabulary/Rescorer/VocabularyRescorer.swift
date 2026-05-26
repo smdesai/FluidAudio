@@ -155,11 +155,32 @@ public struct VocabularyRescorer: Sendable {
 
     // MARK: - Word Timing Utilities
 
-    /// Word timing information built from TDT token timings
+    /// Word timing information built from TDT token timings.
+    ///
+    /// `tokenStartIndex` / `tokenCount` index into the original
+    /// `[TokenTiming]` array passed to `ctcTokenRescore`. They let the
+    /// TDT-side scorer locate exact token spans for prefix replay and
+    /// teacher-forced scoring without re-running the word-boundary logic.
     public struct WordTiming: Sendable {
         public let word: String
         public let startTime: Double
         public let endTime: Double
+        public let tokenStartIndex: Int
+        public let tokenCount: Int
+
+        public init(
+            word: String,
+            startTime: Double,
+            endTime: Double,
+            tokenStartIndex: Int = 0,
+            tokenCount: Int = 0
+        ) {
+            self.word = word
+            self.startTime = startTime
+            self.endTime = endTime
+            self.tokenStartIndex = tokenStartIndex
+            self.tokenCount = tokenCount
+        }
     }
 
     /// Build word-level timings from token timings.
@@ -169,8 +190,10 @@ public struct VocabularyRescorer: Sendable {
         var currentWord = ""
         var wordStart: Double = 0
         var wordEnd: Double = 0
+        var currentTokenStart: Int = 0
+        var currentTokenCount: Int = 0
 
-        for timing in tokenTimings {
+        for (idx, timing) in tokenTimings.enumerated() {
             let token = timing.token
 
             // Skip special tokens
@@ -189,17 +212,23 @@ public struct VocabularyRescorer: Sendable {
                         WordTiming(
                             word: trimmedWord,
                             startTime: wordStart,
-                            endTime: wordEnd
+                            endTime: wordEnd,
+                            tokenStartIndex: currentTokenStart,
+                            tokenCount: currentTokenCount
                         ))
                 }
                 currentWord = ""
+                currentTokenCount = 0
             }
 
             if startsNewWord {
                 currentWord = stripWordBoundaryPrefix(token)
                 wordStart = timing.startTime
+                currentTokenStart = idx
+                currentTokenCount = 1
             } else {
                 currentWord += token
+                currentTokenCount += 1
             }
             wordEnd = timing.endTime
         }
@@ -211,7 +240,9 @@ public struct VocabularyRescorer: Sendable {
                 WordTiming(
                     word: trimmedWord,
                     startTime: wordStart,
-                    endTime: wordEnd
+                    endTime: wordEnd,
+                    tokenStartIndex: currentTokenStart,
+                    tokenCount: currentTokenCount
                 ))
         }
 

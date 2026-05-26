@@ -253,6 +253,24 @@ enum TranscribeCommand {
         /// failure mode had `orig ≈ -35` while the FDA-extended TP fingerprint
         /// had `orig ≈ -14`.
         var tdtRescoreVetoMinOrigScore: Float = -20.0
+
+        /// When `true`, scoring inside the CTC rescorer's `evaluateMatch`
+        /// path is performed by the TDT scorer (JointDecisionLogits) instead
+        /// of the CTC DP. Candidate selection (string similarity, stopword
+        /// rules, length-ratio guards, sort logic) is unchanged; only the
+        /// score-vs-score decision is swapped. Mutually exclusive with the
+        /// veto-on-top-of-CTC path; takes precedence when both are set.
+        var tdtPrimary: Bool = false
+        /// Margin (log-prob units) by which the candidate must outscore the
+        /// original under TDT scoring before it replaces the original.
+        /// Default 0.0 (any positive margin counts). Useful for evaluating
+        /// stricter primary-scorer behaviour without rebuilding.
+        var tdtPrimaryAcceptMargin: Float = 0.0
+        /// Minimum log-prob score TDT must assign to the candidate before
+        /// any positive decision is trusted. Filters cases where TDT is
+        /// uncertain in both hypotheses. Default −∞ (disabled); set to a
+        /// finite value (e.g. −30.0) to require some absolute confidence.
+        var tdtPrimaryMinCandScore: Float = -.infinity
     }
 
     private static func parseArguments(_ args: [String]) -> ParsedArgs? {
@@ -407,6 +425,18 @@ enum TranscribeCommand {
                     parsed.tdtRescoreVetoMinOrigScore = Float(args[i + 1]) ?? -20.0
                     i += 1
                 }
+            case "--tdt-primary":
+                parsed.tdtPrimary = true
+            case "--tdt-primary-accept-margin":
+                if i + 1 < args.count {
+                    parsed.tdtPrimaryAcceptMargin = Float(args[i + 1]) ?? 0.0
+                    i += 1
+                }
+            case "--tdt-primary-min-cand-score":
+                if i + 1 < args.count {
+                    parsed.tdtPrimaryMinCandScore = Float(args[i + 1]) ?? -.infinity
+                    i += 1
+                }
 
             default:
                 fputs("WARNING: Unknown option: \(args[i])\n", stderr)
@@ -536,6 +566,28 @@ enum TranscribeCommand {
                     let cbw: Float = args.vocabCbw ?? vocabConfig.cbw
                     let marginSeconds: Double = args.vocabMargin ?? ContextBiasingConstants.defaultMarginSeconds
 
+                    // When --tdt-primary is set, build a TdtScorerContext that
+                    // routes the rescorer's score-vs-score decisions through
+                    // the TDT scorer instead of CTC. Builds the context once
+                    // (one encoder run) and reuses it across every candidate.
+                    var tdtContext: VocabularyRescorer.TdtScorerContext? = nil
+                    if args.tdtPrimary {
+                        do {
+                            tdtContext = try await buildTdtScorerContext(
+                                asrModels: asrManager.loadedModels,
+                                audioSamples: samples,
+                                tokenTimings: tokenTimings,
+                                acceptMargin: args.tdtPrimaryAcceptMargin,
+                                minCandidateScore: args.tdtPrimaryMinCandScore,
+                                logger: logger
+                            )
+                        } catch {
+                            logger.warning(
+                                "TDT primary scorer init failed; falling back to CTC scoring: \(error.localizedDescription)"
+                            )
+                        }
+                    }
+
                     let rescoreOutput = rescorer.ctcTokenRescore(
                         transcript: result.text,
                         tokenTimings: tokenTimings,
@@ -543,7 +595,8 @@ enum TranscribeCommand {
                         frameDuration: spotResult.frameDuration,
                         cbw: cbw,
                         marginSeconds: marginSeconds,
-                        minSimilarity: minSimilarity
+                        minSimilarity: minSimilarity,
+                        tdtContext: tdtContext
                     )
 
                     if rescoreOutput.wasModified {
