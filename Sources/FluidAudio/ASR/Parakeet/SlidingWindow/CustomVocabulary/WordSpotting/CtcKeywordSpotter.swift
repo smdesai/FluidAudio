@@ -112,7 +112,12 @@ public struct CtcKeywordSpotter: Sendable {
         customVocabulary: CustomVocabularyContext,
         minScore: Float? = nil
     ) async throws -> SpotKeywordsResult {
+        let ctcProfileEnabled =
+            ProcessInfo.processInfo.environment["FA_CTC_PROFILE"] != nil
+
+        let inferT0 = Date()
         let ctcResult = try await computeLogProbs(for: audioSamples)
+        let inferDt = Date().timeIntervalSince(inferT0)
         let logProbs = ctcResult.logProbs
         guard !logProbs.isEmpty else {
             return SpotKeywordsResult(detections: [], logProbs: [], frameDuration: 0, totalFrames: 0)
@@ -122,6 +127,8 @@ public struct CtcKeywordSpotter: Sendable {
         let totalFrames = ctcResult.totalFrames
 
         var results: [KeywordDetection] = []
+        let dpT0 = Date()
+        var consideredTerms = 0
 
         for term in customVocabulary.terms {
             // Skip short terms to reduce false positives (per NeMo CTC-WS paper)
@@ -136,6 +143,7 @@ public struct CtcKeywordSpotter: Sendable {
 
             let ids = term.ctcTokenIds ?? term.tokenIds
             guard let ids, !ids.isEmpty else { continue }
+            consideredTerms += 1
 
             // Adjust threshold for multi-token phrases
             let tokenCount = ids.count
@@ -168,6 +176,17 @@ public struct CtcKeywordSpotter: Sendable {
                 )
                 results.append(detection)
             }
+        }
+
+        if ctcProfileEnabled {
+            let dpDt = Date().timeIntervalSince(dpT0)
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format:
+                            "CTC-PROFILE inference=%.3fs (%d frames) DP=%.3fs (%d terms scored, %d detections)\n",
+                        inferDt, totalFrames, dpDt, consideredTerms, results.count
+                    ).utf8))
         }
 
         return SpotKeywordsResult(

@@ -58,6 +58,14 @@ func applyTdtRescoreReview(
     // cost once.
     var encoderCache: [Int: (encoder: MLMultiArray, validLength: Int, sampleStart: Int)] = [:]
 
+    // Profiling counters. Surfaced when FA_TDT_PROFILE is set in the env.
+    let profileEnabled = ProcessInfo.processInfo.environment["FA_TDT_PROFILE"] != nil
+    var encoderRunCount = 0
+    var scoreCallCount = 0
+    var encoderRunSeconds: Double = 0
+    var scoreSeconds: Double = 0
+    let reviewStartTime = Date()
+
     for replacement in replacements where replacement.shouldReplace {
         guard let candidate = replacement.replacementWord, !candidate.isEmpty else {
             kept.append(replacement)
@@ -99,7 +107,10 @@ func applyTdtRescoreReview(
             let slice = Array(audioSamples[windowStart..<windowEnd])
             let padded = padIfNeeded(slice, target: maxSamples)
             do {
+                let t0 = Date()
                 let (enc, len) = try await rescorer.runEncoder(audioSamples: padded)
+                encoderRunSeconds += Date().timeIntervalSince(t0)
+                encoderRunCount += 1
                 encoderRun = (enc, len, windowStart)
                 encoderCache[cacheKey] = encoderRun
             } catch {
@@ -116,6 +127,7 @@ func applyTdtRescoreReview(
         )
 
         do {
+            let scoreT0 = Date()
             let decision = try rescorer.score(
                 originalPhrase: originalPhrase,
                 candidate: candidate,
@@ -125,6 +137,8 @@ func applyTdtRescoreReview(
                 encoderOutput: encoderRun.encoder,
                 encoderSequenceLength: encoderRun.validLength
             )
+            scoreSeconds += Date().timeIntervalSince(scoreT0)
+            scoreCallCount += 1
 
             // The replacement is "high-confidence rejected" only when:
             //   1. The original token sequence scores meaningfully better
@@ -188,6 +202,37 @@ func applyTdtRescoreReview(
             originalText: originalText, replacements: kept)
     } else {
         rebuiltText = rescoredText
+    }
+
+    if profileEnabled {
+        let total = Date().timeIntervalSince(reviewStartTime)
+        let perEnc = encoderRunCount > 0 ? encoderRunSeconds / Double(encoderRunCount) : 0
+        let perScore = scoreCallCount > 0 ? scoreSeconds / Double(scoreCallCount) : 0
+        let other = max(0, total - encoderRunSeconds - scoreSeconds)
+        let perDec =
+            rescorer.decoderCallCount > 0
+            ? rescorer.decoderSeconds / Double(rescorer.decoderCallCount) : 0
+        let perJoint =
+            rescorer.jointCallCount > 0
+            ? rescorer.jointSeconds / Double(rescorer.jointCallCount) : 0
+        // Print directly to stderr so the profile lines surface in release
+        // builds where AppLogger.info is osLog-only.
+        FileHandle.standardError.write(
+            Data(
+                String(
+                    format:
+                        "TDT-PROFILE total=%.3fs encoder=%.3fs (%d runs, %.3fs/run) score=%.3fs (%d calls, %.3fs/call) other=%.3fs\n",
+                    total, encoderRunSeconds, encoderRunCount, perEnc,
+                    scoreSeconds, scoreCallCount, perScore, other
+                ).utf8))
+        FileHandle.standardError.write(
+            Data(
+                String(
+                    format:
+                        "TDT-PROFILE inner decoder=%.3fs (%d calls, %.4fs/call) joint=%.3fs (%d calls, %.4fs/call)\n",
+                    rescorer.decoderSeconds, rescorer.decoderCallCount, perDec,
+                    rescorer.jointSeconds, rescorer.jointCallCount, perJoint
+                ).utf8))
     }
 
     return (kept: kept, vetoed: vetoed, rebuiltText: rebuiltText)

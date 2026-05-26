@@ -535,17 +535,33 @@ enum TranscribeCommand {
             if let vocabPath = args.customVocabPath {
                 logger.info("Applying vocabulary boosting from: \(vocabPath)")
 
+                let ctcProfileEnabled =
+                    ProcessInfo.processInfo.environment["FA_CTC_PROFILE"] != nil
+
+                let loadT0 = Date()
                 let (customVocab, ctcModels) = try await CustomVocabularyContext.loadWithCtcTokens(from: vocabPath)
+                let loadDt = Date().timeIntervalSince(loadT0)
                 logger.info("Loaded \(customVocab.terms.count) vocabulary terms")
 
                 let blankId = ctcModels.vocabulary.count
                 let spotter = CtcKeywordSpotter(models: ctcModels, blankId: blankId)
 
+                let spotT0 = Date()
                 let spotResult = try await spotter.spotKeywordsWithLogProbs(
                     audioSamples: samples,
                     customVocabulary: customVocab,
                     minScore: nil
                 )
+                let spotDt = Date().timeIntervalSince(spotT0)
+                if ctcProfileEnabled {
+                    FileHandle.standardError.write(
+                        Data(
+                            String(
+                                format:
+                                    "CTC-PROFILE load+models=%.3fs spotKeywordsWithLogProbs=%.3fs (%d frames, %d detections)\n",
+                                loadDt, spotDt, spotResult.totalFrames, spotResult.detections.count
+                            ).utf8))
+                }
 
                 let logProbs = spotResult.logProbs
                 if let tokenTimings = result.tokenTimings, !tokenTimings.isEmpty, !logProbs.isEmpty {

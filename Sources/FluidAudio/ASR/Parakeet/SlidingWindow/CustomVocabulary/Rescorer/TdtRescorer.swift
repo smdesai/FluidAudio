@@ -23,6 +23,32 @@ public final class TdtRescorer {
     private let modelInference: TdtModelInference
     private let blankId: Int
 
+    // MARK: - Profiling
+
+    /// Total decoder.predict calls observed since this rescorer was
+    /// created. Visible to callers for coarse profiling. Not thread-safe.
+    public private(set) var decoderCallCount: Int = 0
+    /// Wall time accumulated inside decoder.predict.
+    public private(set) var decoderSeconds: Double = 0
+    /// Total jointLogits.predict calls.
+    public private(set) var jointCallCount: Int = 0
+    /// Wall time accumulated inside jointLogits.predict.
+    public private(set) var jointSeconds: Double = 0
+    /// Wall time accumulated inside encoder/preprocessor runs.
+    public private(set) var encoderSeconds: Double = 0
+    /// Number of encoder.runEncoder() calls.
+    public private(set) var encoderCallCount: Int = 0
+
+    /// Reset profiling counters.
+    public func resetProfile() {
+        decoderCallCount = 0
+        decoderSeconds = 0
+        jointCallCount = 0
+        jointSeconds = 0
+        encoderSeconds = 0
+        encoderCallCount = 0
+    }
+
     /// SentencePiece word-boundary marker (`▁`). Kept here for cheap repeated
     /// access; mirrors `ASRConstants.sentencePieceWordBoundary`.
     private let wordBoundary: String = ASRConstants.sentencePieceWordBoundary
@@ -209,6 +235,11 @@ public final class TdtRescorer {
     public func runEncoder(
         audioSamples: [Float]
     ) async throws -> (encoder: MLMultiArray, sequenceLength: Int) {
+        let runStart = Date()
+        defer {
+            encoderSeconds += Date().timeIntervalSince(runStart)
+            encoderCallCount += 1
+        }
         let preprocessor = asrModels.preprocessor
         guard let encoder = asrModels.encoder else {
             throw ASRError.processingFailed(
@@ -315,11 +346,14 @@ public final class TdtRescorer {
 
         try modelInference.normalizeDecoderProjection(decoderProjection, into: decoderStep)
 
+        let t0 = Date()
         let (tokenLogits, _) = try modelInference.runJointLogits(
             encoderStep: encoderStep,
             decoderStep: decoderStep,
             model: jointLogits
         )
+        jointSeconds += Date().timeIntervalSince(t0)
+        jointCallCount += 1
         guard token >= 0, token < tokenLogits.count else {
             throw ASRError.processingFailed(
                 "TdtRescorer: token id \(token) out of range for logits of size \(tokenLogits.count)"
@@ -408,6 +442,7 @@ public final class TdtRescorer {
         targetLengthArray: MLMultiArray,
         decoderModel: MLModel
     ) throws -> MLMultiArray {
+        let t0 = Date()
         let (output, newState) = try modelInference.runDecoder(
             token: token,
             state: state,
@@ -415,6 +450,8 @@ public final class TdtRescorer {
             targetArray: targetArray,
             targetLengthArray: targetLengthArray
         )
+        decoderSeconds += Date().timeIntervalSince(t0)
+        decoderCallCount += 1
         state = newState
         guard let projection = output.featureValue(for: "decoder")?.multiArrayValue else {
             throw ASRError.processingFailed(
