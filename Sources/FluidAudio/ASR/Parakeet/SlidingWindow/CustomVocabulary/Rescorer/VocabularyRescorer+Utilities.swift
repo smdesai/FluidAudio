@@ -70,6 +70,22 @@ extension VocabularyRescorer {
         return forms
     }
 
+    /// Build normalized component words from every multi-word vocabulary form.
+    ///
+    /// Used to prevent broad keyword lists from replacing a component of a
+    /// known multi-word term with an unrelated single-word distractor, e.g.
+    /// `Aaron` → `Atryn` when `Dr. Aaron Petrov` is also present.
+    func buildMultiWordVocabularyComponentSet() -> Set<String> {
+        var components = Set<String>()
+        for term in vocabulary.terms {
+            for form in buildNormalizedForms(for: term) where form.wordCount > 1 {
+                let words = form.normalized.split(separator: " ").map(String.init)
+                components.formUnion(words)
+            }
+        }
+        return components
+    }
+
     // MARK: - Similarity Thresholds
 
     /// Determine required similarity threshold based on span length and word length
@@ -99,6 +115,40 @@ extension VocabularyRescorer {
                 continue
             }
             if first == formFirst || last == formLast { return true }
+        }
+        return false
+    }
+
+    /// True when a shortened source span is only missing a vocab edge word
+    /// that is already present immediately next to the span in the transcript.
+    ///
+    /// Example: source span `Aaron Petrov` should not replace with
+    /// `Dr. Aaron Petrov` if the previous source word is already `Dr`, or the
+    /// output becomes `Dr. Dr. Aaron Petrov`.
+    func spanHasAdjacentOmittedVocabEdge(
+        spanWords: [String],
+        previousWord: String?,
+        nextWord: String?,
+        forms: [NormalizedForm]
+    ) -> Bool {
+        guard !spanWords.isEmpty else { return false }
+        for form in forms {
+            let words = form.normalized.split(separator: " ").map(String.init)
+            guard words.count > spanWords.count else { continue }
+
+            if words.suffix(spanWords.count).elementsEqual(spanWords),
+                let previousWord,
+                previousWord == words[words.count - spanWords.count - 1]
+            {
+                return true
+            }
+
+            if words.prefix(spanWords.count).elementsEqual(spanWords),
+                let nextWord,
+                nextWord == words[spanWords.count]
+            {
+                return true
+            }
         }
         return false
     }

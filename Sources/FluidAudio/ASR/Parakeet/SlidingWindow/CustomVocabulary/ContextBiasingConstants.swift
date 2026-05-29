@@ -128,6 +128,22 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer+ConstrainedCTC.swift` short word guard
     public static let shortWordSimilarity: Float = 0.80
 
+    /// Similarity required for short single-word replacements in large vocabularies.
+    ///
+    /// Broad keyword files contain many distractors, so short source words are
+    /// high-risk even when their length ratio is not low (e.g. `team` →
+    /// `Atgam`). Dictionary mode remains unaffected because this applies only
+    /// above `largeVocabThreshold`.
+    public static let largeVocabShortWordSimilarity: Float = 0.80
+
+    /// Similarity required when a multi-word source span is replaced by a
+    /// single-word vocabulary term in a broad keyword list.
+    ///
+    /// This keeps legitimate high-similarity compounds (`new red` → `Newrez`)
+    /// while rejecting broad-list false accepts such as `wallet card` →
+    /// `Allocord`.
+    public static let largeVocabMultiWordToSingleWordSimilarity: Float = 0.80
+
     /// Minimum word length for the long-word similarity rule to apply.
     ///
     /// Pairs with `longWordSimilarity` to gate single-word substitutions
@@ -158,6 +174,11 @@ public enum ContextBiasingConstants {
     ///   `lengthRatio >= lengthRatioThreshold` AND `spanLength == 1`
     /// - Used in: `VocabularyRescorer+TokenEvaluation.checkLengthRatioRules`
     public static let longWordSimilarity: Float = 0.70
+
+    /// Small dictionaries can safely let CTC arbitrate borderline phonetic
+    /// drug-name confusions (`irwines` → `erwinaze`). Kept below the normal
+    /// floor to avoid float-rounding around exact 0.50 similarities.
+    public static let smallVocabLongWordPhoneticSimilarity: Float = 0.40
 
     /// Similarity threshold for spans containing stopwords.
     ///

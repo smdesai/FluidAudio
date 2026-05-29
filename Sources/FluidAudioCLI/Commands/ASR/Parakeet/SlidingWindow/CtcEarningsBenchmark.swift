@@ -547,7 +547,6 @@ public enum CtcEarningsBenchmark {
                 beamResult = try await runTdtBeamTranscribe(
                     asrModels: await asrManager.loadedModels,
                     audioSamples: samples,
-                    vocabulary: loadedVocab,
                     beamConfig: beamConfig,
                     logger: AppLogger(category: "ctc-earnings-benchmark.beam")
                 )

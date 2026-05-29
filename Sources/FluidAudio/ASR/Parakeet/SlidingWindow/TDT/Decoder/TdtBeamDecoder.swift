@@ -151,6 +151,7 @@ public struct TdtBeamDecoder: Sendable {
                 state: seedState,
                 lastDecoderProjection: seedProjection,
                 biasMatches: [],
+                consumedBiasWindows: [],
                 symbolsAtCurrentFrame: 0
             )
         ]
@@ -389,7 +390,7 @@ public struct TdtBeamDecoder: Sendable {
                 // Update bias state with the just-emitted token.
                 if let bias = beamConfig.bias {
                     advanceBiasMatches(
-                        on: &copy, lastToken: token, bias: bias)
+                        on: &copy, lastToken: token, emittedFrame: hypothesis.timeIndex, bias: bias)
                 }
             }
 
@@ -427,28 +428,46 @@ public struct TdtBeamDecoder: Sendable {
         hypothesis: TdtBeamHypothesis,
         bias: TdtBeamBiasConfig
     ) {
+        var boostedTokens = Set<Int>()
         // Existing matches: bonus the next expected token.
         for match in hypothesis.biasMatches {
             let seq = bias.keywordTokenSequences[match.keywordIndex]
             guard match.position < seq.count else { continue }
             let target = seq[match.position]
             if target >= 0 && target < logits.count {
-                logits[target] += bias.bonus
+                boostedTokens.insert(target)
             }
         }
-        // First-token matches: any keyword whose first token is on the
-        // top-K candidate list will get a small head start. We seed by
-        // adding the bonus to all keyword first-tokens; concrete
-        // activation happens in `advanceBiasMatches` after emission.
-        for (idx, seq) in bias.keywordTokenSequences.enumerated() {
-            // Skip keywords already being matched.
-            if hypothesis.biasMatches.contains(where: { $0.keywordIndex == idx }) {
-                continue
+        if bias.windows.isEmpty {
+            // Global fallback: seed all first tokens. This is useful for tiny
+            // dictionaries but risky for broad keyword lists.
+            for (idx, seq) in bias.keywordTokenSequences.enumerated() {
+                if hypothesis.biasMatches.contains(where: { $0.keywordIndex == idx }) {
+                    continue
+                }
+                let first = seq[0]
+                if first >= 0 && first < logits.count {
+                    boostedTokens.insert(first)
+                }
             }
-            let first = seq[0]
-            if first >= 0 && first < logits.count {
-                logits[first] += bias.bonus
+        } else {
+            let frame = hypothesis.timeIndex
+            for (windowIndex, window) in bias.windows.enumerated() {
+                guard !hypothesis.consumedBiasWindows.contains(windowIndex) else { continue }
+                guard frame >= window.startFrame, frame <= window.endFrame else { continue }
+                let idx = window.keywordIndex
+                guard idx >= 0, idx < bias.keywordTokenSequences.count else { continue }
+                if hypothesis.biasMatches.contains(where: { $0.keywordIndex == idx }) {
+                    continue
+                }
+                let first = bias.keywordTokenSequences[idx][0]
+                if first >= 0 && first < logits.count {
+                    boostedTokens.insert(first)
+                }
             }
+        }
+        for token in boostedTokens {
+            logits[token] += bias.bonus
         }
     }
 
@@ -458,6 +477,7 @@ public struct TdtBeamDecoder: Sendable {
     private func advanceBiasMatches(
         on hypothesis: inout TdtBeamHypothesis,
         lastToken: Int,
+        emittedFrame: Int,
         bias: TdtBeamBiasConfig
     ) {
         var updated: [TdtBeamBiasMatch] = []
@@ -475,18 +495,52 @@ public struct TdtBeamDecoder: Sendable {
             }
             // Else: hypothesis diverged from this keyword; drop.
         }
-        // Seed new matches.
-        for (idx, seq) in bias.keywordTokenSequences.enumerated() {
-            guard seq[0] == lastToken else { continue }
-            // Avoid duplicate active matches for the same keyword.
-            if updated.contains(where: { $0.keywordIndex == idx && $0.position == 1 }) {
-                continue
+        // Seed new matches. When CTC windows exist, only seed the keyword
+        // whose detection window fired. Without this guard, broad vocabularies
+        // let common first tokens activate hundreds of unrelated continuations.
+        if bias.windows.isEmpty {
+            for (idx, seq) in bias.keywordTokenSequences.enumerated() {
+                seedBiasMatch(keywordIndex: idx, tokenSequence: seq, lastToken: lastToken, into: &updated)
             }
-            if seq.count > 1 {
-                updated.append(TdtBeamBiasMatch(keywordIndex: idx, position: 1))
+        } else {
+            for (windowIndex, window) in bias.windows.enumerated() {
+                guard !hypothesis.consumedBiasWindows.contains(windowIndex) else { continue }
+                guard emittedFrame >= window.startFrame, emittedFrame <= window.endFrame else { continue }
+                let idx = window.keywordIndex
+                guard idx >= 0, idx < bias.keywordTokenSequences.count else { continue }
+                seedBiasMatch(
+                    keywordIndex: idx,
+                    tokenSequence: bias.keywordTokenSequences[idx],
+                    lastToken: lastToken,
+                    into: &updated
+                )
             }
         }
         hypothesis.biasMatches = updated
+
+        if !bias.windows.isEmpty {
+            for (windowIndex, window) in bias.windows.enumerated() {
+                guard !hypothesis.consumedBiasWindows.contains(windowIndex) else { continue }
+                guard emittedFrame >= window.startFrame, emittedFrame <= window.endFrame else { continue }
+                let idx = window.keywordIndex
+                guard idx >= 0, idx < bias.keywordTokenSequences.count else { continue }
+                if bias.keywordTokenSequences[idx][0] == lastToken {
+                    hypothesis.consumedBiasWindows.insert(windowIndex)
+                }
+            }
+        }
+    }
+
+    private func seedBiasMatch(
+        keywordIndex: Int,
+        tokenSequence: [Int],
+        lastToken: Int,
+        into matches: inout [TdtBeamBiasMatch]
+    ) {
+        guard tokenSequence[0] == lastToken else { return }
+        guard tokenSequence.count > 1 else { return }
+        guard !matches.contains(where: { $0.keywordIndex == keywordIndex && $0.position == 1 }) else { return }
+        matches.append(TdtBeamBiasMatch(keywordIndex: keywordIndex, position: 1))
     }
 
     // MARK: - Helpers

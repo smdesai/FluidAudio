@@ -20,7 +20,6 @@ struct BeamTranscribeResult {
 func runTdtBeamTranscribe(
     asrModels: AsrModels?,
     audioSamples: [Float],
-    vocabulary: CustomVocabularyContext?,
     beamConfig: TdtBeamConfig,
     logger: AppLogger
 ) async throws -> BeamTranscribeResult {

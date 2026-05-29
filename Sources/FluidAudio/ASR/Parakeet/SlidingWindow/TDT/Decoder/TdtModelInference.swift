@@ -231,21 +231,10 @@ internal struct TdtModelInference: Sendable {
             errorMessage: "JointDecisionLogits output missing duration_logits"
         )
 
-        guard tokenLogitsArray.dataType == .float32, durationLogitsArray.dataType == .float32 else {
-            throw ASRError.processingFailed(
-                "JointDecisionLogits output dtype mismatch — expected Float32"
-            )
-        }
-
-        let tokenCount = tokenLogitsArray.count
-        let durationCount = durationLogitsArray.count
-        let tokenPtr = tokenLogitsArray.dataPointer.bindMemory(to: Float.self, capacity: tokenCount)
-        let durationPtr = durationLogitsArray.dataPointer.bindMemory(
-            to: Float.self, capacity: durationCount)
-
-        let tokenLogits = Array(UnsafeBufferPointer(start: tokenPtr, count: tokenCount))
-        let durationLogits = Array(UnsafeBufferPointer(start: durationPtr, count: durationCount))
-        return (tokenLogits, durationLogits)
+        return (
+            try extractFloats(from: tokenLogitsArray, label: "token_logits"),
+            try extractFloats(from: durationLogitsArray, label: "duration_logits")
+        )
     }
 
     /// Normalize decoder projection into [1, hiddenSize, 1] layout via BLAS copy.
@@ -381,6 +370,42 @@ internal struct TdtModelInference: Sendable {
             throw ASRError.processingFailed(errorMessage)
         }
         return value
+    }
+
+    /// Read a multi-array as Float32 values. Joint/decoder models may return
+    /// fp16 tensors even when output backings are requested, especially on ANE.
+    private func extractFloats(from array: MLMultiArray, label: String) throws -> [Float] {
+        let count = array.count
+        switch array.dataType {
+        case .float32:
+            let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
+
+        case .float16:
+            var values = [Float](repeating: 0, count: count)
+            let source = array.dataPointer.bindMemory(to: UInt16.self, capacity: count)
+            values.withUnsafeMutableBufferPointer { buffer in
+                var src = vImage_Buffer(
+                    data: source,
+                    height: 1,
+                    width: vImagePixelCount(count),
+                    rowBytes: count * MemoryLayout<UInt16>.stride
+                )
+                var dst = vImage_Buffer(
+                    data: buffer.baseAddress!,
+                    height: 1,
+                    width: vImagePixelCount(count),
+                    rowBytes: count * MemoryLayout<Float>.stride
+                )
+                vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+            }
+            return values
+
+        default:
+            throw ASRError.processingFailed(
+                "Unsupported \(label) dtype: \(array.dataType.rawValue)"
+            )
+        }
     }
 
     /// Read a 1D Int32 feature into an `[Int]`, or `nil` if the feature is absent.

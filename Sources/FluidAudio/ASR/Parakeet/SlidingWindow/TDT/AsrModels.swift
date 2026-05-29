@@ -423,13 +423,10 @@ extension AsrModels {
             }
         }
 
-        // Optionally load the logits-only joint variant. Only attempted for
-        // versions whose `parakeet_joint_decision_logits_single_step` export
-        // matches the runtime joint signature (single-step `[1,1024,1]` x
-        // `[1,640,1]`) — currently v2 only. Missing files are not fatal:
-        // standard transcription only needs the existing `joint` model.
+        // Optionally load the logits-only joint variant. Missing files are not
+        // fatal: standard transcription only needs the existing `joint` model.
         var jointLogitsModel: MLModel?
-        if version == .v2 {
+        if version == .v2 || version == .v3 {
             let repoDir = repoPath(from: directory, version: version)
             let jointLogitsPath = repoDir.appendingPathComponent(Names.jointLogitsFile)
             if FileManager.default.fileExists(atPath: jointLogitsPath.path) {

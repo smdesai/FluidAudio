@@ -64,3 +64,75 @@ func prepareVocabularyBoostingInputs(
         spotDuration: spotDuration
     )
 }
+
+func shouldRunAutomaticTdtVeto(
+    customVocab: CustomVocabularyContext,
+    asrModels: AsrModels?,
+    disableAutoTdtVeto: Bool,
+    tdtPrimary: Bool,
+    beamSize: Int
+) -> Bool {
+    guard !disableAutoTdtVeto else { return false }
+    guard !tdtPrimary, beamSize == 0 else { return false }
+    guard customVocab.terms.count > ContextBiasingConstants.largeVocabThreshold else { return false }
+    guard let asrModels, asrModels.jointLogits != nil else { return false }
+    return true
+}
+
+func prepareBeamBiasConfig(
+    vocabPath: String?,
+    audioSamples: [Float],
+    asrManager: AsrManager,
+    asrModels: AsrModels,
+    bonus: Float,
+    logger: AppLogger
+) async throws -> (vocabulary: CustomVocabularyContext?, bias: TdtBeamBiasConfig?) {
+    guard let vocabPath else { return (nil, nil) }
+
+    let boostingInputs = try await prepareVocabularyBoostingInputs(
+        vocabPath: vocabPath,
+        audioSamples: audioSamples,
+        asrManager: asrManager,
+        logger: logger
+    )
+    let vocab = boostingInputs.vocabulary
+
+    let tokenizerURL = AsrModels.defaultCacheDirectory(for: asrModels.version)
+        .appendingPathComponent("tokenizer.model")
+    let tokenizer = try SentencePieceTokenizer(modelData: try Data(contentsOf: tokenizerURL))
+
+    var keywordTokenSequences: [[Int]] = []
+    var keptTermIndices: [Int] = []
+    for (index, term) in vocab.terms.enumerated() {
+        let ids = tokenizer.encode(term.text)
+        if !ids.isEmpty {
+            keywordTokenSequences.append(ids)
+            keptTermIndices.append(index)
+        }
+    }
+    guard !keywordTokenSequences.isEmpty else { return (vocab, nil) }
+
+    let beamIndexForTermIndex = Dictionary(uniqueKeysWithValues: keptTermIndices.enumerated().map { ($1, $0) })
+    let detectionSlopFrames = 4
+    let windows = boostingInputs.spotResult.detections.compactMap { detection -> TdtBeamBiasWindow? in
+        guard let termIndex = vocab.terms.firstIndex(where: { $0.text == detection.term.text }) else { return nil }
+        guard let beamIndex = beamIndexForTermIndex[termIndex] else { return nil }
+        return TdtBeamBiasWindow(
+            keywordIndex: beamIndex,
+            startFrame: max(0, detection.startFrame - detectionSlopFrames),
+            endFrame: detection.endFrame + detectionSlopFrames
+        )
+    }
+
+    logger.info(
+        "Beam: loaded \(vocab.terms.count) vocab terms, \(keywordTokenSequences.count) tokenized, \(windows.count) CTC windows"
+    )
+    return (
+        vocab,
+        TdtBeamBiasConfig(
+            keywordTokenSequences: keywordTokenSequences,
+            bonus: bonus,
+            windows: windows
+        )
+    )
+}

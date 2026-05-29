@@ -179,6 +179,43 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
         }
     }
 
+    func testStopwordAllowsHighSimilarityContentReplacement() async throws {
+        let vocab = CustomVocabularyContext(terms: [])
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+
+        let result = rescorer.checkStopwordRules(
+            normalizedWord: "those",
+            spanLength: 1,
+            spanWords: [],
+            vocabTerm: "Bose",
+            currentSimilarity: 0.50
+        )
+
+        XCTAssertFalse(result.shouldSkip)
+        XCTAssertGreaterThanOrEqual(result.adjustedMinSimilarity, 0.60)
+    }
+
+    func testStopwordRejectsLowSimilarityReplacement() async throws {
+        let vocab = CustomVocabularyContext(terms: [])
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+
+        let result = rescorer.checkStopwordRules(
+            normalizedWord: "before",
+            spanLength: 1,
+            spanWords: [],
+            vocabTerm: "Bose",
+            currentSimilarity: 0.50
+        )
+
+        XCTAssertTrue(result.shouldSkip)
+    }
+
     func testMultiWordSpanAnchoredEdgeAcceptsExactPhrase() async throws {
         let vocab = CustomVocabularyContext(
             terms: [CustomVocabularyTerm(text: "Dr. Felix Quinones")]
@@ -192,6 +229,61 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
         XCTAssertTrue(
             rescorer.multiWordSpanHasAnchoredEdge(
                 spanWords: ["dr", "felix", "quinones"],
+                forms: forms
+            ))
+    }
+
+    func testMultiWordSpanAnchoredEdgeAcceptsCollapsedTrailingName() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Bao Halverson")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertTrue(
+            rescorer.multiWordSpanHasAnchoredEdge(
+                spanWords: ["dr", "bauhalversen"],
+                forms: forms
+            ))
+    }
+
+    func testAdjacentOmittedVocabEdgeRejectsDuplicatePrefix() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Aaron Petrov")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertTrue(
+            rescorer.spanHasAdjacentOmittedVocabEdge(
+                spanWords: ["aaron", "petrov"],
+                previousWord: "dr",
+                nextWord: nil,
+                forms: forms
+            ))
+    }
+
+    func testAdjacentOmittedVocabEdgeAllowsCollapsedNameWithoutPrefix() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Bao Halverson")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertFalse(
+            rescorer.spanHasAdjacentOmittedVocabEdge(
+                spanWords: ["dr", "bauhalversen"],
+                previousWord: nil,
+                nextWord: nil,
                 forms: forms
             ))
     }
@@ -245,5 +337,46 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
             rescorer.preserveCapitalization(original: "Somovert.", replacement: "Somavert"),
             "Somavert."
         )
+    }
+
+    func testMultiWordComponentSetIncludesPhraseWords() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [
+                CustomVocabularyTerm(text: "Dr. Aaron Petrov"),
+                CustomVocabularyTerm(text: "Atryn"),
+            ]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+
+        let components = rescorer.buildMultiWordVocabularyComponentSet()
+
+        XCTAssertTrue(components.contains("dr"))
+        XCTAssertTrue(components.contains("aaron"))
+        XCTAssertTrue(components.contains("petrov"))
+        XCTAssertFalse(components.contains("atryn"))
+    }
+
+    func testShortWordThresholdTightensForLargeVocabulary() async throws {
+        let terms =
+            (0...ContextBiasingConstants.largeVocabThreshold).map { index in
+                CustomVocabularyTerm(text: "Distractor\(index)")
+            } + [CustomVocabularyTerm(text: "Atgam")]
+        let vocab = CustomVocabularyContext(terms: terms)
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+
+        let threshold = rescorer.checkLengthRatioRules(
+            normalizedWord: "team",
+            vocabTerm: "Atgam",
+            currentSimilarity: 0.60,
+            minSimilarity: 0.55
+        )
+
+        XCTAssertEqual(threshold, ContextBiasingConstants.largeVocabShortWordSimilarity, accuracy: 0.001)
     }
 }

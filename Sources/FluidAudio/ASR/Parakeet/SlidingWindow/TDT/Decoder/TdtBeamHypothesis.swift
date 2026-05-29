@@ -84,9 +84,27 @@ public struct TdtBeamBiasConfig: Sendable {
     /// after adaptive scaling.
     public var bonus: Float = 4.5
 
-    public init(keywordTokenSequences: [[Int]], bonus: Float = 4.5) {
+    /// Optional detection windows from the CTC context graph. When present,
+    /// keyword first-token activation is allowed only inside matching windows.
+    /// Continuation tokens remain biased once a phrase has started.
+    public let windows: [TdtBeamBiasWindow]
+
+    public init(keywordTokenSequences: [[Int]], bonus: Float = 4.5, windows: [TdtBeamBiasWindow] = []) {
         self.keywordTokenSequences = keywordTokenSequences.filter { !$0.isEmpty }
         self.bonus = bonus
+        self.windows = windows
+    }
+}
+
+public struct TdtBeamBiasWindow: Sendable {
+    public let keywordIndex: Int
+    public let startFrame: Int
+    public let endFrame: Int
+
+    public init(keywordIndex: Int, startFrame: Int, endFrame: Int) {
+        self.keywordIndex = keywordIndex
+        self.startFrame = startFrame
+        self.endFrame = endFrame
     }
 }
 
@@ -129,6 +147,10 @@ struct TdtBeamHypothesis {
 
     /// Active partial keyword matches (only used when bias config is set).
     var biasMatches: [TdtBeamBiasMatch]
+
+    /// Bias windows consumed by this hypothesis. A CTC detection should seed
+    /// a phrase at most once per hypothesis to avoid repeated phrase loops.
+    var consumedBiasWindows: Set<Int>
 
     /// Tokens emitted at the current `timeIndex`. Used to enforce
     /// `maxSymbolsPerStep` so a hypothesis can't get stuck.

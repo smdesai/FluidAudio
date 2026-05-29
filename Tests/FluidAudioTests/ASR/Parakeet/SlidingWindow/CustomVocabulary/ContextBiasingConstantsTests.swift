@@ -36,6 +36,8 @@ final class ContextBiasingConstantsTests: XCTestCase {
             ContextBiasingConstants.defaultMinSimilarity,
             ContextBiasingConstants.lengthRatioThreshold,
             ContextBiasingConstants.shortWordSimilarity,
+            ContextBiasingConstants.largeVocabShortWordSimilarity,
+            ContextBiasingConstants.largeVocabMultiWordToSingleWordSimilarity,
             ContextBiasingConstants.stopwordSpanSimilarity,
         ]
         for threshold in thresholds {

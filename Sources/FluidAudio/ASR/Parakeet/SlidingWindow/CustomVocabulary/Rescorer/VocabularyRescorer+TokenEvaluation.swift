@@ -220,6 +220,15 @@ extension VocabularyRescorer {
 
         // Single-word stopword check - skip entirely
         if spanLength == 1 && Self.stopwords.contains(normalizedWord) {
+            let normalizedVocab = Self.normalizeForSimilarity(vocabTerm)
+            let similarity = Self.stringSimilarity(normalizedWord, normalizedVocab)
+            let lengthRatio = Float(normalizedWord.count) / Float(max(1, normalizedVocab.count))
+            if similarity >= 0.60
+                && lengthRatio >= ContextBiasingConstants.lengthRatioThreshold
+                && normalizedWord.count > ContextBiasingConstants.shortWordMaxLength
+            {
+                return (shouldSkip: false, adjustedMinSimilarity: max(minSimilarity, 0.60))
+            }
             debugLog("    [STOPWORD] '\(normalizedWord)' is a stopword, skipping replacement with '\(vocabTerm)'")
             return (shouldSkip: true, adjustedMinSimilarity: minSimilarity)
         }
@@ -254,6 +263,19 @@ extension VocabularyRescorer {
         minSimilarity: Float
     ) -> Float {
         let lengthRatio = Float(normalizedWord.count) / Float(vocabTerm.count)
+        if vocabulary.terms.count > ContextBiasingConstants.largeVocabThreshold
+            && normalizedWord.count <= ContextBiasingConstants.shortWordMaxLength
+        {
+            let adjusted = max(minSimilarity, ContextBiasingConstants.largeVocabShortWordSimilarity)
+            if adjusted > minSimilarity && currentSimilarity >= minSimilarity {
+                debugLog(
+                    "    [LENGTH] '\(normalizedWord)' short in large vocab, raising threshold to "
+                        + "\(String(format: "%.2f", adjusted))"
+                )
+            }
+            return adjusted
+        }
+
         if lengthRatio < ContextBiasingConstants.lengthRatioThreshold
             && normalizedWord.count <= ContextBiasingConstants.shortWordMaxLength
         {
@@ -275,6 +297,12 @@ extension VocabularyRescorer {
         if normalizedWord.count >= ContextBiasingConstants.longWordMinLength
             && lengthRatio >= ContextBiasingConstants.lengthRatioThreshold
         {
+            if vocabulary.terms.count <= ContextBiasingConstants.largeVocabThreshold {
+                let phoneticFloor = ContextBiasingConstants.smallVocabLongWordPhoneticSimilarity
+                if currentSimilarity >= phoneticFloor {
+                    return min(minSimilarity, phoneticFloor)
+                }
+            }
             let adjusted = max(minSimilarity, ContextBiasingConstants.longWordSimilarity)
             if adjusted > minSimilarity && currentSimilarity >= minSimilarity {
                 debugLog(

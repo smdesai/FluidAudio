@@ -238,6 +238,11 @@ enum TranscribeCommand {
         /// rescorer disagrees with the CTC decision and the disagreement
         /// exceeds `tdtRescoreVetoMargin` log-prob points.
         var tdtRescoreVeto: Bool = false
+        /// Disable automatic TDT veto review for broad custom-vocabulary lists.
+        /// By default, large keyword files get a TDT posterior sanity check
+        /// when JointDecisionLogits is available, because broad lists contain
+        /// many distractors that can otherwise cause single-word false accepts.
+        var disableAutoTdtVeto: Bool = false
         /// Margin (log-prob units) by which the original must outscore the
         /// candidate to trigger a veto. 0 = veto on any disagreement; higher
         /// values demand stronger evidence before vetoing. Default 10.0
@@ -436,6 +441,8 @@ enum TranscribeCommand {
             case "--tdt-rescore-veto":
                 parsed.tdtRescore = true
                 parsed.tdtRescoreVeto = true
+            case "--no-auto-tdt-veto":
+                parsed.disableAutoTdtVeto = true
             case "--tdt-rescore-veto-margin":
                 if i + 1 < args.count {
                     parsed.tdtRescoreVetoMargin = Float(args[i + 1]) ?? 10.0
@@ -581,39 +588,30 @@ enum TranscribeCommand {
             var beamResultOpt: BeamTranscribeResult? = nil
             if args.beamSize > 0 {
                 do {
-                    var vocabForBias: CustomVocabularyContext? = nil
-                    var biasKeywords: [[Int]] = []
-                    if let vocabPath = args.customVocabPath,
-                        let asrModels = await asrManager.loadedModels
-                    {
-                        let (vocab, _) = try await CustomVocabularyContext.loadWithCtcTokens(
-                            from: vocabPath)
-                        vocabForBias = vocab
-                        biasKeywords = try tokenizeVocabularyForBeamBias(
-                            asrModels: asrModels, vocabulary: vocab)
-                        logger.info(
-                            "Beam: loaded \(vocab.terms.count) vocab terms, "
-                                + "\(biasKeywords.count) tokenized for bias")
-                    }
-
-                    let bias: TdtBeamBiasConfig? =
-                        biasKeywords.isEmpty
-                        ? nil
-                        : TdtBeamBiasConfig(
-                            keywordTokenSequences: biasKeywords,
-                            bonus: args.beamBiasBonus
+                    let asrModels = await asrManager.loadedModels
+                    let beamBias: (vocabulary: CustomVocabularyContext?, bias: TdtBeamBiasConfig?)?
+                    if let asrModels {
+                        beamBias = try await prepareBeamBiasConfig(
+                            vocabPath: args.customVocabPath,
+                            audioSamples: samples,
+                            asrManager: asrManager,
+                            asrModels: asrModels,
+                            bonus: args.beamBiasBonus,
+                            logger: logger
                         )
+                    } else {
+                        beamBias = nil
+                    }
                     let beamConfig = TdtBeamConfig(
                         beamSize: args.beamSize,
                         topKPerHypothesis: args.beamTopK ?? args.beamSize,
                         lengthPenalty: args.beamLengthPenalty,
                         pruningThreshold: args.beamPruning,
-                        bias: bias
+                        bias: beamBias?.bias
                     )
                     beamResultOpt = try await runTdtBeamTranscribe(
-                        asrModels: await asrManager.loadedModels,
+                        asrModels: asrModels,
                         audioSamples: samples,
-                        vocabulary: vocabForBias,
                         beamConfig: beamConfig,
                         logger: logger
                     )
@@ -761,7 +759,19 @@ enum TranscribeCommand {
                         // TDT rescorer disagrees with.
                         var finalText = rescoreOutput.text
                         var keptReplacements = rescoreOutput.replacements
-                        if args.tdtRescore {
+                        let autoTdtVeto = shouldRunAutomaticTdtVeto(
+                            customVocab: customVocab,
+                            asrModels: await asrManager.loadedModels,
+                            disableAutoTdtVeto: args.disableAutoTdtVeto,
+                            tdtPrimary: args.tdtPrimary,
+                            beamSize: args.beamSize
+                        )
+                        if args.tdtRescore || autoTdtVeto {
+                            if autoTdtVeto && !args.tdtRescore {
+                                logger.info(
+                                    "Running automatic TDT veto review for broad vocabulary (\(customVocab.terms.count) terms)"
+                                )
+                            }
                             do {
                                 let (kept, vetoed, rebuilt) = try await applyTdtRescoreReview(
                                     asrModels: asrManager.loadedModels,
@@ -770,13 +780,13 @@ enum TranscribeCommand {
                                     rescoredText: rescoreOutput.text,
                                     tokenTimings: tokenTimings,
                                     replacements: rescoreOutput.replacements,
-                                    veto: args.tdtRescoreVeto,
+                                    veto: args.tdtRescoreVeto || autoTdtVeto,
                                     vetoMargin: args.tdtRescoreVetoMargin,
                                     vetoMinOrigScore: args.tdtRescoreVetoMinOrigScore,
                                     logger: logger
                                 )
                                 keptReplacements = kept
-                                if args.tdtRescoreVeto {
+                                if args.tdtRescoreVeto || autoTdtVeto {
                                     finalText = rebuilt
                                     if !vetoed.isEmpty {
                                         logger.info(
@@ -1270,6 +1280,7 @@ enum TranscribeCommand {
                 --vocab-min-similarity <0-1>     Minimum string similarity for replacement (default: auto)
                 --vocab-cbw <float>              Context-biasing weight boost (default: auto)
                 --vocab-margin <sec>             CTC frame alignment margin (default: 0.5)
+                --no-auto-tdt-veto               Disable automatic TDT veto for broad vocabularies
 
             PARAKEET VARIANT MODE (--parakeet-variant):
                 --parakeet-variant <variant>     Engine: parakeet-eou-160ms, nemotron-560ms, …

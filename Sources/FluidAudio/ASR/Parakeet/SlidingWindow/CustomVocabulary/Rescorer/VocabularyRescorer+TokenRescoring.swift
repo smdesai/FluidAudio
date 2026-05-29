@@ -279,7 +279,6 @@ extension VocabularyRescorer {
 
         // Build normalized vocabulary set for guard checks
         let vocabularyNormalizedSet = buildVocabularyNormalizedSet()
-
         // Pre-compute normalized words for all timings
         let normalizedWords = wordTimings.map { Self.normalizeForSimilarity($0.word) }
 
@@ -484,6 +483,7 @@ extension VocabularyRescorer {
 
         // Build normalized vocabulary set for guard checks
         let vocabularyNormalizedSet = buildVocabularyNormalizedSet()
+        let multiWordComponentSet = buildMultiWordVocabularyComponentSet()
 
         // TERM-CENTRIC LOOP: For each vocabulary term, find similar TDT words and run constrained CTC
         for term in vocabulary.terms {
@@ -517,8 +517,13 @@ extension VocabularyRescorer {
                 // Multi-word phrase matching: look for consecutive TDT words that match the phrase
                 let maxWordCount = multiWordForms.map { $0.wordCount }.max() ?? 0
                 let minWordCount = multiWordForms.map { $0.wordCount }.min() ?? 0
-                let maxSpan = min(4, maxWordCount + 1)  // Allow some flexibility
-                let minSpan = max(2, minWordCount)
+                let maxSpan = min(4, maxWordCount)
+                // Allow a source span to be one word shorter than the vocab
+                // phrase. This handles collapsed proper-name tails like
+                // `Dr. Bauhalversen` -> `Dr. Bao Halverson` while the anchored
+                // edge + similarity guards still reject unrelated prefixes or
+                // suffixes such as `to Dr. Felix`.
+                let minSpan = max(2, minWordCount - 1)
 
                 guard minSpan <= maxSpan else { continue }
 
@@ -536,6 +541,21 @@ extension VocabularyRescorer {
                         guard !normalizedPhrase.isEmpty else { continue }
                         let normalizedSpanWords = spanIndices.map { Self.normalizeForSimilarity(wordTimings[$0].word) }
                         guard multiWordSpanHasAnchoredEdge(spanWords: normalizedSpanWords, forms: multiWordForms) else {
+                            continue
+                        }
+                        let previousWord =
+                            startIdx > 0 ? Self.normalizeForSimilarity(wordTimings[startIdx - 1].word) : nil
+                        let nextIdx = startIdx + spanLength
+                        let nextWord =
+                            nextIdx < wordTimings.count ? Self.normalizeForSimilarity(wordTimings[nextIdx].word) : nil
+                        guard
+                            !spanHasAdjacentOmittedVocabEdge(
+                                spanWords: normalizedSpanWords,
+                                previousWord: previousWord,
+                                nextWord: nextWord,
+                                forms: multiWordForms
+                            )
+                        else {
                             continue
                         }
 
@@ -630,6 +650,13 @@ extension VocabularyRescorer {
                         continue
                     }
 
+                    if multiWordComponentSet.contains(normalizedWord)
+                        && !normalizedCurrentSet.contains(normalizedWord)
+                    {
+                        debugLog("  Skipping '\(vocabTerm)': word '\(tdtWord)' is protected by multi-word vocab")
+                        continue
+                    }
+
                     // Check similarity against ALL forms (single word)
                     var bestSimilarity: Float = 0
                     var matchedSpanLength = 1
@@ -661,7 +688,8 @@ extension VocabularyRescorer {
                         let norm2MatchesVocab = singleWordForms.contains {
                             Self.stringSimilarity(norm2, $0.normalized) >= 0.9
                         }
-                        if !norm2MatchesVocab {
+                        let crossesStopword = Self.multiWordStopwords.contains(norm2)
+                        if !norm2MatchesVocab && !crossesStopword {
                             let concatenated = normalizedWord + norm2  // No space
                             for form in singleWordForms {
                                 let concatSimilarity = Self.stringSimilarity(concatenated, form.normalized)
@@ -683,7 +711,8 @@ extension VocabularyRescorer {
                             Self.stringSimilarity(norm2, $0.normalized) >= 0.9
                                 || Self.stringSimilarity(norm3, $0.normalized) >= 0.9
                         }
-                        if !laterWordMatchesVocab {
+                        let crossesStopword = Self.multiWordStopwords.contains(norm2) || Self.multiWordStopwords.contains(norm3)
+                        if !laterWordMatchesVocab && !crossesStopword {
                             let concatenated = normalizedWord + norm2 + norm3
                             for form in singleWordForms {
                                 let concatSimilarity = Self.stringSimilarity(concatenated, form.normalized)
@@ -726,6 +755,15 @@ extension VocabularyRescorer {
                     )
                     if shouldSkipStopword { continue }
                     minSimilarityForSpan = adjustedSimilarity
+
+                    if matchedSpanLength >= 2
+                        && vocabulary.terms.count > ContextBiasingConstants.largeVocabThreshold
+                    {
+                        minSimilarityForSpan = max(
+                            minSimilarityForSpan,
+                            ContextBiasingConstants.largeVocabMultiWordToSingleWordSimilarity
+                        )
+                    }
 
                     if bestSimilarity < minSimilarityForSpan { continue }
 
@@ -955,6 +993,7 @@ extension VocabularyRescorer {
                 tdtContext: tdtContext
             )
             guard evalResult.shouldReplace else { continue }
+            guard detection.score + cbw > evalResult.originalScore else { continue }
             guard passesCtcAlignmentValidation(detection: detection, alignments: ctcWordAlignments, cbw: cbw) else {
                 continue
             }
