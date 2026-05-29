@@ -44,7 +44,9 @@ public struct TdtBeamDecoder: Sendable {
         encoderSequenceLength: Int,
         decoderModel: MLModel,
         jointLogitsModel: MLModel,
-        initialState: TdtDecoderState
+        initialState: TdtDecoderState,
+        globalFrameOffset: Int = 0,
+        isLastChunk: Bool = false
     ) async throws -> DecodeResult {
         let hyp: TdtHypothesis = try await decode(
             encoderOutput: encoderOutput,
@@ -52,8 +54,8 @@ public struct TdtBeamDecoder: Sendable {
             decoderModel: decoderModel,
             jointLogitsModel: jointLogitsModel,
             initialState: initialState,
-            globalFrameOffset: 0,
-            isLastChunk: false
+            globalFrameOffset: globalFrameOffset,
+            isLastChunk: isLastChunk
         )
         return DecodeResult(
             tokens: hyp.ySequence,

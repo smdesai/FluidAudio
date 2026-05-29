@@ -193,6 +193,14 @@ public enum ContextBiasingConstants {
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
     public static let defaultAlpha: Float = 0.5
 
+    /// Per-token reward for greedy CTC alignment words.
+    ///
+    /// CTC-WS compares context-graph candidates against words from the
+    /// greedy CTC alignment. This weight is added for each non-blank greedy
+    /// token to make the baseline harder to beat, reducing false accepts.
+    /// The default follows arXiv:2406.07096 section 3.6.
+    public static let defaultCtcAlignmentTokenWeight: Float = 0.5
+
     /// Default margin in seconds for CTC frame alignment.
     ///
     /// When aligning vocabulary terms to transcript words, this margin

@@ -1,4 +1,3 @@
-import Accelerate
 import CoreML
 import Foundation
 
@@ -11,6 +10,9 @@ extension CtcKeywordSpotter {
     // MARK: - Log Probability Computation
 
     func computeLogProbs(for audioSamples: [Float]) async throws -> CtcLogProbResult {
+        guard models != nil else {
+            throw ASRError.processingFailed("CtcKeywordSpotter was initialized without CTC models")
+        }
         guard !audioSamples.isEmpty else {
             return CtcLogProbResult(
                 logProbs: [], frameDuration: 0, totalFrames: 0, audioSamplesUsed: 0)
@@ -150,6 +152,9 @@ extension CtcKeywordSpotter {
         let (audioInput, clampedCount) = try prepareAudioArray(audioSamples)
         let melInput = try makeAudioFeatureProvider(array: audioInput, length: clampedCount)
 
+        guard let models else {
+            throw ASRError.processingFailed("CtcKeywordSpotter was initialized without CTC models")
+        }
         let melModel = models.melSpectrogram
         let encoderModel = models.encoder
 
@@ -217,7 +222,12 @@ extension CtcKeywordSpotter {
         // Convert logits -> log-probabilities and trim padding frames.
         // Apply temperature scaling (CTC_TEMPERATURE) and blank bias (BLANK_BIAS)
         let postT0 = Date()
-        let allLogProbs = try makeLogProbs(from: ctcRaw, temperature: temperature, blankBias: blankBias)
+        let allLogProbs = try CtcLogProbUtils.logProbs(
+            from: ctcRaw,
+            blankId: blankId,
+            temperature: temperature,
+            blankBias: blankBias
+        )
         let trimmed = trimLogProbs(allLogProbs, audioSampleCount: clampedCount)
         let frameCount = trimmed.count
         let postDt = Date().timeIntervalSince(postT0)
@@ -258,6 +268,9 @@ extension CtcKeywordSpotter {
 
         // Detect expected input rank from the MelSpectrogram model's 'audio' feature description.
         // Canary-1b-v2 expects rank 1 [samples], parakeet-ctc-0.6b expects rank 2 [1, samples].
+        guard let models else {
+            throw ASRError.processingFailed("CtcKeywordSpotter was initialized without CTC models")
+        }
         let melModel = models.melSpectrogram
         let audioDesc = melModel.modelDescription.inputDescriptionsByName["audio"]
         let expectedRank = audioDesc?.multiArrayConstraint?.shape.count ?? 1
@@ -366,206 +379,6 @@ extension CtcKeywordSpotter {
     }
 
     // MARK: - Log Probability Processing
-
-    private func makeLogProbs(
-        from ctcOutput: MLMultiArray,
-        temperature: Float = 1.0,
-        blankBias: Float = 0.0
-    ) throws -> [[Float]] {
-        let rank = ctcOutput.shape.count
-        guard rank == 3 || rank == 4 else {
-            throw ASRError.processingFailed("Unexpected CTC output rank: \(ctcOutput.shape)")
-        }
-
-        let shape = ctcOutput.shape.map { $0.intValue }
-        let strides = ctcOutput.strides.map { $0.intValue }
-
-        let vocabSize: Int
-        let timeSteps: Int
-        let timeStride: Int
-        let vocabStride: Int
-
-        if rank == 3 {
-            // Expected shape: [1, timeSteps, vocabSize]
-            timeSteps = shape[1]
-            vocabSize = shape[2]
-            timeStride = strides[1]
-            vocabStride = strides[2]
-        } else {
-            // Expected shape: [1, vocabSize, 1, timeSteps]
-            vocabSize = shape[1]
-            timeSteps = shape[3]
-            vocabStride = strides[1]
-            timeStride = strides[3]
-        }
-
-        if vocabSize <= 0 || timeSteps <= 0 {
-            return []
-        }
-
-        // Per-frame fp32 row buffer reused across iterations. We materialize
-        // each frame contiguously (gathered by vocabStride) before passing it
-        // to log-softmax / blank-bias / vDSP. This trades T allocations for
-        // direct pointer access — orders of magnitude faster than the old
-        // MLMultiArray subscript-by-NSNumber hot loop, which paid an ObjC
-        // dispatch + array-allocation per element (T*V calls).
-        var logProbs: [[Float]] = []
-        logProbs.reserveCapacity(timeSteps)
-
-        var rowBuffer = [Float](repeating: 0, count: vocabSize)
-
-        switch ctcOutput.dataType {
-        case .float32:
-            let basePtr = ctcOutput.dataPointer.bindMemory(
-                to: Float.self, capacity: ctcOutput.count)
-            for t in 0..<timeSteps {
-                rowBuffer.withUnsafeMutableBufferPointer { dst in
-                    let dstPtr = dst.baseAddress!
-                    if vocabStride == 1 {
-                        // Contiguous along vocab — single memcpy.
-                        dstPtr.update(from: basePtr.advanced(by: t * timeStride), count: vocabSize)
-                    } else {
-                        // Strided gather.
-                        var src = basePtr.advanced(by: t * timeStride)
-                        for v in 0..<vocabSize {
-                            dstPtr[v] = src.pointee
-                            src = src.advanced(by: vocabStride)
-                        }
-                    }
-                }
-                logProbs.append(
-                    finalizeLogProbRow(
-                        rowBuffer, temperature: temperature, blankBias: blankBias))
-            }
-
-        case .float16:
-            // Read fp16 raw shorts and convert to fp32 per row using vImage.
-            let basePtr = ctcOutput.dataPointer.bindMemory(
-                to: UInt16.self, capacity: ctcOutput.count)
-            // Temporary fp16 row when vocabStride != 1 (gather then convert).
-            var fp16Row = [UInt16](repeating: 0, count: vocabSize)
-            for t in 0..<timeSteps {
-                let srcStart = basePtr.advanced(by: t * timeStride)
-                fp16Row.withUnsafeMutableBufferPointer { fp16Buf in
-                    let fp16Ptr = fp16Buf.baseAddress!
-                    if vocabStride == 1 {
-                        fp16Ptr.update(from: srcStart, count: vocabSize)
-                    } else {
-                        var src = srcStart
-                        for v in 0..<vocabSize {
-                            fp16Ptr[v] = src.pointee
-                            src = src.advanced(by: vocabStride)
-                        }
-                    }
-                    rowBuffer.withUnsafeMutableBufferPointer { fp32Buf in
-                        var srcBuf = vImage_Buffer(
-                            data: fp16Ptr,
-                            height: 1,
-                            width: vImagePixelCount(vocabSize),
-                            rowBytes: vocabSize * MemoryLayout<UInt16>.stride
-                        )
-                        var dstBuf = vImage_Buffer(
-                            data: fp32Buf.baseAddress!,
-                            height: 1,
-                            width: vImagePixelCount(vocabSize),
-                            rowBytes: vocabSize * MemoryLayout<Float>.stride
-                        )
-                        vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, 0)
-                    }
-                }
-                logProbs.append(
-                    finalizeLogProbRow(
-                        rowBuffer, temperature: temperature, blankBias: blankBias))
-            }
-
-        default:
-            throw ASRError.processingFailed(
-                "Unsupported CTC output dtype: \(ctcOutput.dataType.rawValue)")
-        }
-
-        return logProbs
-    }
-
-    /// Apply temperature, log-softmax, and blank bias to a single fp32 row.
-    /// Returns a fresh `[Float]` so the caller can append it. Uses Accelerate
-    /// for the softmax math.
-    private func finalizeLogProbRow(
-        _ row: [Float], temperature: Float, blankBias: Float
-    ) -> [Float] {
-        let n = row.count
-        var scaled = row
-        if temperature != 1.0 {
-            var inv = 1.0 / temperature
-            scaled.withUnsafeMutableBufferPointer { buf in
-                vDSP_vsmul(buf.baseAddress!, 1, &inv, buf.baseAddress!, 1, vDSP_Length(n))
-            }
-        }
-
-        // log-softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))
-        var maxVal: Float = 0
-        scaled.withUnsafeBufferPointer { buf in
-            vDSP_maxv(buf.baseAddress!, 1, &maxVal, vDSP_Length(n))
-        }
-        var negMax = -maxVal
-        // shifted = scaled - max
-        var shifted = [Float](repeating: 0, count: n)
-        scaled.withUnsafeBufferPointer { src in
-            shifted.withUnsafeMutableBufferPointer { dst in
-                vDSP_vsadd(src.baseAddress!, 1, &negMax, dst.baseAddress!, 1, vDSP_Length(n))
-            }
-        }
-        // exp(shifted)
-        var expBuf = [Float](repeating: 0, count: n)
-        shifted.withUnsafeBufferPointer { src in
-            expBuf.withUnsafeMutableBufferPointer { dst in
-                var count: Int32 = Int32(n)
-                vvexpf(dst.baseAddress!, src.baseAddress!, &count)
-            }
-        }
-        var sumExp: Float = 0
-        expBuf.withUnsafeBufferPointer { buf in
-            vDSP_sve(buf.baseAddress!, 1, &sumExp, vDSP_Length(n))
-        }
-        var negLogSumExp = -logf(sumExp)
-        var result = [Float](repeating: 0, count: n)
-        shifted.withUnsafeBufferPointer { src in
-            result.withUnsafeMutableBufferPointer { dst in
-                vDSP_vsadd(
-                    src.baseAddress!, 1, &negLogSumExp, dst.baseAddress!, 1, vDSP_Length(n))
-            }
-        }
-
-        if blankBias != 0.0 && blankId < n {
-            result[blankId] -= blankBias
-        }
-        return result
-    }
-
-    private func logSoftmax(_ logits: [Float], temperature: Float = 1.0) -> [Float] {
-        guard !logits.isEmpty else { return [] }
-
-        // Apply temperature scaling: divide logits by temperature before softmax
-        // Higher temperature = softer distribution (spreads probability mass)
-        // Lower temperature = sharper distribution (more peaked)
-        let scaledLogits = temperature != 1.0 ? logits.map { $0 / temperature } : logits
-
-        let maxLogit = scaledLogits.max() ?? 0
-        var sumExp: Float = 0
-
-        for i in 0..<scaledLogits.count {
-            sumExp += expf(scaledLogits[i] - maxLogit)
-        }
-
-        let logSumExp = logf(sumExp)
-        var result: [Float] = Array(repeating: 0, count: scaledLogits.count)
-
-        // log_softmax(x_i) = (x_i - max) - log(sum(exp(x_j - max)))
-        for i in 0..<scaledLogits.count {
-            result[i] = (scaledLogits[i] - maxLogit) - logSumExp
-        }
-
-        return result
-    }
 
     private func trimLogProbs(_ logProbs: [[Float]], audioSampleCount: Int) -> [[Float]] {
         guard !logProbs.isEmpty else { return logProbs }

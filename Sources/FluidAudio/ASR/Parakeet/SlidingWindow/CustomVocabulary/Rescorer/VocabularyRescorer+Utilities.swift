@@ -85,16 +85,46 @@ extension VocabularyRescorer {
         return minSimilarity
     }
 
+    /// Multi-word replacement candidates should be anchored at one edge of a
+    /// vocabulary form. This prevents spans like `to Dr. Felix Quinones` or
+    /// `Dr. Felix Quinones reviewed` from replacing and deleting the leading
+    /// or trailing non-vocabulary word.
+    func multiWordSpanHasAnchoredEdge(spanWords: [String], forms: [NormalizedForm]) -> Bool {
+        guard let first = spanWords.first, let last = spanWords.last else { return false }
+        for form in forms {
+            let words = form.normalized.split(separator: " ").map(String.init)
+            guard let formFirst = words.first, let formLast = words.last else { continue }
+            if spanWords.count > words.count {
+                if first == formFirst && last == formLast { return true }
+                continue
+            }
+            if first == formFirst || last == formLast { return true }
+        }
+        return false
+    }
+
     // MARK: - Text Utilities
 
     /// Preserve capitalization from original word in replacement
     func preserveCapitalization(original: String, replacement: String) -> String {
         guard let firstChar = original.first else { return replacement }
 
-        if firstChar.isUppercase && replacement.first?.isLowercase == true {
-            return replacement.prefix(1).uppercased() + replacement.dropFirst()
+        let trailingPunctuation = original.reversed().prefix { char in
+            char.isPunctuation && char != "-" && char != "'"
+        }.reversed()
+        let suffix = String(trailingPunctuation)
+        let replacementWithPunctuation =
+            suffix.isEmpty || replacement.hasSuffix(suffix) ? replacement : replacement + suffix
+
+        let replacementHasIntentionalCasing = replacement.contains { $0.isUppercase }
+        if replacementHasIntentionalCasing {
+            return replacementWithPunctuation
         }
-        return replacement
+
+        if firstChar.isUppercase && replacementWithPunctuation.first?.isLowercase == true {
+            return replacementWithPunctuation.prefix(1).uppercased() + replacementWithPunctuation.dropFirst()
+        }
+        return replacementWithPunctuation
     }
 
     /// Normalize text for similarity checks: lowercase, collapse whitespace,

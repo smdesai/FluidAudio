@@ -178,4 +178,72 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
             )
         }
     }
+
+    func testMultiWordSpanAnchoredEdgeAcceptsExactPhrase() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Felix Quinones")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertTrue(
+            rescorer.multiWordSpanHasAnchoredEdge(
+                spanWords: ["dr", "felix", "quinones"],
+                forms: forms
+            ))
+    }
+
+    func testMultiWordSpanAnchoredEdgeRejectsLeadingExtraWord() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Felix Quinones")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertFalse(
+            rescorer.multiWordSpanHasAnchoredEdge(
+                spanWords: ["to", "dr", "felix", "quinones"],
+                forms: forms
+            ))
+    }
+
+    func testMultiWordSpanAnchoredEdgeRejectsTrailingExtraWord() async throws {
+        let vocab = CustomVocabularyContext(
+            terms: [CustomVocabularyTerm(text: "Dr. Felix Quinones")]
+        )
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+        let forms = rescorer.buildNormalizedForms(for: vocab.terms[0])
+
+        XCTAssertFalse(
+            rescorer.multiWordSpanHasAnchoredEdge(
+                spanWords: ["dr", "felix", "quinones", "reviewed"],
+                forms: forms
+            ))
+    }
+
+    func testPreserveCapitalizationKeepsCanonicalCasingAndTrailingPunctuation() async throws {
+        let vocab = CustomVocabularyContext(terms: [])
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: vocab
+        )
+
+        XCTAssertEqual(
+            rescorer.preserveCapitalization(original: "Hamachord,", replacement: "Hemacord"),
+            "Hemacord,"
+        )
+        XCTAssertEqual(
+            rescorer.preserveCapitalization(original: "Somovert.", replacement: "Somavert"),
+            "Somavert."
+        )
+    }
 }

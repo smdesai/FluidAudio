@@ -125,6 +125,42 @@ extension AsrModels {
         let computeUnits: MLComputeUnits
     }
 
+    private enum ModelRole {
+        case preprocessor
+        case encoder
+        case decoder
+        case joint
+        case ctcHead
+        case jointLogits
+    }
+
+    private static func computeUnits(
+        for role: ModelRole,
+        requested: MLComputeUnits,
+        version: AsrModelVersion
+    ) -> MLComputeUnits {
+        // Preserve explicit CPU-only requests for CI/debugging.
+        if requested == .cpuOnly {
+            return .cpuOnly
+        }
+
+        switch role {
+        case .preprocessor:
+            // Split preprocessors are CPU/fallback-heavy and can emit E5RT
+            // shape-propagation errors when ANE is allowed. Fused frontend
+            // models include the encoder and should use ANE.
+            return version.hasFusedEncoder ? .cpuAndNeuralEngine : .cpuOnly
+        case .encoder, .ctcHead:
+            return .cpuAndNeuralEngine
+        case .decoder:
+            // CoreML LSTM is not ANE-supported.
+            return .cpuOnly
+        case .joint, .jointLogits:
+            // Single-step joint heads are tiny and include argmax/top-k/int outputs.
+            return .cpuOnly
+        }
+    }
+
     private static func createModelSpecs(
         using config: MLModelConfiguration,
         version: AsrModelVersion,
@@ -133,16 +169,35 @@ extension AsrModels {
         if version.hasFusedEncoder {
             // Fused preprocessor+encoder runs on ANE (it contains the conformer encoder)
             return [
-                ModelSpec(fileName: Names.preprocessorFile, computeUnits: config.computeUnits)
+                ModelSpec(
+                    fileName: Names.preprocessorFile,
+                    computeUnits: computeUnits(
+                        for: .preprocessor,
+                        requested: config.computeUnits,
+                        version: version
+                    )
+                )
             ]
         }
         let fileNames = getModelFileNames(version: version, encoderPrecision: encoderPrecision)
         return [
-            // Preprocessor ops map to CPU-only across all platforms. XCode profiling shows
-            // that 100% of the the operations map to the CPU anyways.
-            ModelSpec(fileName: Names.preprocessorFile, computeUnits: .cpuOnly),
+            ModelSpec(
+                fileName: Names.preprocessorFile,
+                computeUnits: computeUnits(
+                    for: .preprocessor,
+                    requested: config.computeUnits,
+                    version: version
+                )
+            ),
 
-            ModelSpec(fileName: fileNames.encoder, computeUnits: config.computeUnits),
+            ModelSpec(
+                fileName: fileNames.encoder,
+                computeUnits: computeUnits(
+                    for: .encoder,
+                    requested: config.computeUnits,
+                    version: version
+                )
+            ),
         ]
     }
 
@@ -290,7 +345,7 @@ extension AsrModels {
             version.repo,
             modelNames: [fileNames.decoder],
             directory: parentDirectory,
-            computeUnits: config.computeUnits,
+            computeUnits: computeUnits(for: .decoder, requested: config.computeUnits, version: version),
             variant: downloadVariant,
             progressHandler: progressHandler
         )
@@ -306,7 +361,7 @@ extension AsrModels {
             version.repo,
             modelNames: [fileNames.joint],
             directory: parentDirectory,
-            computeUnits: config.computeUnits,
+            computeUnits: computeUnits(for: .joint, requested: config.computeUnits, version: version),
             variant: downloadVariant,
             progressHandler: progressHandler
         )
@@ -331,7 +386,11 @@ extension AsrModels {
             let ctcHeadPath = repoDir.appendingPathComponent(Names.ctcHeadFile)
             if FileManager.default.fileExists(atPath: ctcHeadPath.path) {
                 let ctcConfig = MLModelConfiguration()
-                ctcConfig.computeUnits = config.computeUnits
+                ctcConfig.computeUnits = computeUnits(
+                    for: .ctcHead,
+                    requested: config.computeUnits,
+                    version: version
+                )
                 ctcHeadModel = try? MLModel(contentsOf: ctcHeadPath, configuration: ctcConfig)
                 if ctcHeadModel != nil {
                     logger.info("[Beta] Loaded CTC head model from local directory")
@@ -347,7 +406,11 @@ extension AsrModels {
                         .parakeetCtc110m,
                         modelNames: [Names.ctcHeadFile],
                         directory: parentDirectory,
-                        computeUnits: config.computeUnits,
+                        computeUnits: computeUnits(
+                            for: .ctcHead,
+                            requested: config.computeUnits,
+                            version: version
+                        ),
                         progressHandler: progressHandler
                     )
                     ctcHeadModel = ctcModels[Names.ctcHeadFile]
@@ -371,7 +434,11 @@ extension AsrModels {
             let jointLogitsPath = repoDir.appendingPathComponent(Names.jointLogitsFile)
             if FileManager.default.fileExists(atPath: jointLogitsPath.path) {
                 let jlConfig = MLModelConfiguration()
-                jlConfig.computeUnits = config.computeUnits
+                jlConfig.computeUnits = computeUnits(
+                    for: .jointLogits,
+                    requested: config.computeUnits,
+                    version: version
+                )
                 jointLogitsModel = try? MLModel(contentsOf: jointLogitsPath, configuration: jlConfig)
                 if jointLogitsModel != nil {
                     logger.info("Loaded \(Names.jointLogitsFile) from local directory")
@@ -551,18 +618,45 @@ extension AsrModels {
         let specs: [DownloadSpec]
         if version.hasFusedEncoder {
             specs = [
-                // Fused preprocessor+encoder runs on ANE
-                DownloadSpec(fileName: Names.preprocessorFile, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.decoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.joint, computeUnits: defaultUnits),
+                DownloadSpec(
+                    fileName: Names.preprocessorFile,
+                    computeUnits: computeUnits(
+                        for: .preprocessor,
+                        requested: defaultUnits,
+                        version: version
+                    )
+                ),
+                DownloadSpec(
+                    fileName: fileNames.decoder,
+                    computeUnits: computeUnits(for: .decoder, requested: defaultUnits, version: version)
+                ),
+                DownloadSpec(
+                    fileName: fileNames.joint,
+                    computeUnits: computeUnits(for: .joint, requested: defaultUnits, version: version)
+                ),
             ]
         } else {
             specs = [
-                // Preprocessor ops map to CPU-only across all platforms.
-                DownloadSpec(fileName: Names.preprocessorFile, computeUnits: .cpuOnly),
-                DownloadSpec(fileName: fileNames.encoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.decoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.joint, computeUnits: defaultUnits),
+                DownloadSpec(
+                    fileName: Names.preprocessorFile,
+                    computeUnits: computeUnits(
+                        for: .preprocessor,
+                        requested: defaultUnits,
+                        version: version
+                    )
+                ),
+                DownloadSpec(
+                    fileName: fileNames.encoder,
+                    computeUnits: computeUnits(for: .encoder, requested: defaultUnits, version: version)
+                ),
+                DownloadSpec(
+                    fileName: fileNames.decoder,
+                    computeUnits: computeUnits(for: .decoder, requested: defaultUnits, version: version)
+                ),
+                DownloadSpec(
+                    fileName: fileNames.joint,
+                    computeUnits: computeUnits(for: .joint, requested: defaultUnits, version: version)
+                ),
             ]
         }
 

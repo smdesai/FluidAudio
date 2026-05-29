@@ -76,7 +76,8 @@ extension CtcModels {
     public static func loadDirect(from directory: URL, variant: CtcModelVariant = .ctc110m) async throws -> CtcModels {
         logger.info("Loading CTC models directly from: \(directory.path)")
 
-        let config = defaultConfiguration()
+        let melConfig = melSpectrogramConfiguration()
+        let encoderConfig = defaultConfiguration()
 
         // Load MelSpectrogram model
         let melPath = directory.appendingPathComponent("MelSpectrogram.mlmodelc")
@@ -87,12 +88,12 @@ extension CtcModels {
         // Try loading directly first (for pre-compiled models), then try compiling
         let melModel: MLModel
         do {
-            melModel = try MLModel(contentsOf: melPath, configuration: config)
+            melModel = try MLModel(contentsOf: melPath, configuration: melConfig)
             logger.info("Loaded MelSpectrogram directly from: \(melPath.path)")
         } catch {
             logger.info("Direct load failed, attempting compilation...")
             let compiledMelURL = try await MLModel.compileModel(at: melPath)
-            melModel = try MLModel(contentsOf: compiledMelURL, configuration: config)
+            melModel = try MLModel(contentsOf: compiledMelURL, configuration: melConfig)
         }
 
         // Load AudioEncoder model
@@ -103,17 +104,17 @@ extension CtcModels {
 
         let encoderModel: MLModel
         do {
-            encoderModel = try MLModel(contentsOf: encoderPath, configuration: config)
+            encoderModel = try MLModel(contentsOf: encoderPath, configuration: encoderConfig)
             logger.info("Loaded AudioEncoder directly from: \(encoderPath.path)")
         } catch {
             logger.info("Direct load failed, attempting compilation...")
             let compiledEncoderURL = try await MLModel.compileModel(at: encoderPath)
-            encoderModel = try MLModel(contentsOf: compiledEncoderURL, configuration: config)
+            encoderModel = try MLModel(contentsOf: compiledEncoderURL, configuration: encoderConfig)
         }
 
         // Log compute units configuration
         let computeUnitsStr: String
-        switch config.computeUnits {
+        switch encoderConfig.computeUnits {
         case .cpuOnly: computeUnitsStr = "cpuOnly"
         case .cpuAndGPU: computeUnitsStr = "cpuAndGPU"
         case .cpuAndNeuralEngine: computeUnitsStr = "cpuAndNeuralEngine"
@@ -130,7 +131,7 @@ extension CtcModels {
         return CtcModels(
             melSpectrogram: melModel,
             encoder: encoderModel,
-            configuration: config,
+            configuration: encoderConfig,
             vocabulary: vocab,
             variant: variant
         )
@@ -149,25 +150,27 @@ extension CtcModels {
         logger.info("Loading CTC models (\(variant.displayName)) from: \(directory.path)")
 
         let parentDirectory = directory.deletingLastPathComponent()
-        let config = defaultConfiguration()
+        let melConfig = melSpectrogramConfiguration()
+        let encoderConfig = defaultConfiguration()
 
         // DownloadUtils expects the base directory (without the repo folder) and
         // resolves the repo's folderName internally.
-        let modelNames = [
-            ModelNames.CTC.melSpectrogramPath,
-            ModelNames.CTC.audioEncoderPath,
-        ]
-
-        let models = try await DownloadUtils.loadModels(
+        let melModels = try await DownloadUtils.loadModels(
             variant.repo,
-            modelNames: modelNames,
+            modelNames: [ModelNames.CTC.melSpectrogramPath],
             directory: parentDirectory,
-            computeUnits: config.computeUnits
+            computeUnits: melConfig.computeUnits
+        )
+        let encoderModels = try await DownloadUtils.loadModels(
+            variant.repo,
+            modelNames: [ModelNames.CTC.audioEncoderPath],
+            directory: parentDirectory,
+            computeUnits: encoderConfig.computeUnits
         )
 
         guard
-            let melModel = models[ModelNames.CTC.melSpectrogramPath],
-            let encoderModel = models[ModelNames.CTC.audioEncoderPath]
+            let melModel = melModels[ModelNames.CTC.melSpectrogramPath],
+            let encoderModel = encoderModels[ModelNames.CTC.audioEncoderPath]
         else {
             throw AsrModelsError.loadingFailed("Failed to load CTC MelSpectrogram or AudioEncoder models")
         }
@@ -179,7 +182,7 @@ extension CtcModels {
         return CtcModels(
             melSpectrogram: melModel,
             encoder: encoderModel,
-            configuration: config,
+            configuration: encoderConfig,
             vocabulary: vocab,
             variant: variant
         )
@@ -221,10 +224,15 @@ extension CtcModels {
         ]
 
         for name in modelNames {
+            let computeUnits: MLComputeUnits =
+                name == ModelNames.CTC.melSpectrogramPath
+                ? melSpectrogramConfiguration().computeUnits
+                : defaultConfiguration().computeUnits
             _ = try await DownloadUtils.loadModels(
                 variant.repo,
                 modelNames: [name],
-                directory: parentDir
+                directory: parentDir,
+                computeUnits: computeUnits
             )
         }
 
@@ -249,6 +257,13 @@ extension CtcModels {
     /// Default CoreML configuration for CTC inference.
     public static func defaultConfiguration() -> MLModelConfiguration {
         MLModelConfigurationUtils.defaultConfiguration(computeUnits: .cpuAndNeuralEngine)
+    }
+
+    /// MelSpectrogram uses waveform/STFT ops that are CPU-heavy and can trigger
+    /// E5RT shape-propagation warnings when ANE is allowed. Keep it CPU-only;
+    /// the CTC AudioEncoder remains CPU+NE via `defaultConfiguration()`.
+    private static func melSpectrogramConfiguration() -> MLModelConfiguration {
+        MLModelConfigurationUtils.defaultConfiguration(computeUnits: .cpuOnly)
     }
 
     /// Check whether required CTC model bundles and vocabulary exist at a directory.

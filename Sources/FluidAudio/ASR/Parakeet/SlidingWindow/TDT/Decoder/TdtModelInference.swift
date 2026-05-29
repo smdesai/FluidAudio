@@ -273,7 +273,7 @@ internal struct TdtModelInference: Sendable {
         guard shape[0] == 1 else {
             throw ASRError.processingFailed("Unsupported decoder batch dimension: \(shape[0])")
         }
-        guard projection.dataType == .float32 else {
+        guard projection.dataType == .float32 || projection.dataType == .float16 else {
             throw ASRError.processingFailed("Unsupported decoder projection type: \(projection.dataType)")
         }
 
@@ -311,17 +311,62 @@ internal struct TdtModelInference: Sendable {
         let strides = projection.strides.map { $0.intValue }
         let hiddenStride = strides[hiddenAxis]
 
-        let dataPointer = projection.dataPointer.bindMemory(to: Float.self, capacity: projection.count)
-        let startPtr = dataPointer.advanced(by: 0)
-
         let destPtr = out.dataPointer.bindMemory(to: Float.self, capacity: hiddenSize)
         let destStrides = out.strides.map { $0.intValue }
         let destHiddenStride = destStrides[1]
-        let destStrideCblas = try makeBlasIndex(destHiddenStride, label: "Decoder destination stride")
 
-        let count = try makeBlasIndex(hiddenSize, label: "Decoder projection length")
-        let stride = try makeBlasIndex(hiddenStride, label: "Decoder projection stride")
-        cblas_scopy(count, startPtr, stride, destPtr, destStrideCblas)
+        if projection.dataType == .float32 {
+            let dataPointer = projection.dataPointer.bindMemory(to: Float.self, capacity: projection.count)
+            let startPtr = dataPointer.advanced(by: 0)
+            let destStrideCblas = try makeBlasIndex(destHiddenStride, label: "Decoder destination stride")
+            let count = try makeBlasIndex(hiddenSize, label: "Decoder projection length")
+            let stride = try makeBlasIndex(hiddenStride, label: "Decoder projection stride")
+            cblas_scopy(count, startPtr, stride, destPtr, destStrideCblas)
+            return out
+        }
+
+        let dataPointer = projection.dataPointer.bindMemory(to: UInt16.self, capacity: projection.count)
+        if hiddenStride == 1 && destHiddenStride == 1 {
+            var src = vImage_Buffer(
+                data: dataPointer,
+                height: 1,
+                width: vImagePixelCount(hiddenSize),
+                rowBytes: hiddenSize * MemoryLayout<UInt16>.stride
+            )
+            var dst = vImage_Buffer(
+                data: destPtr,
+                height: 1,
+                width: vImagePixelCount(hiddenSize),
+                rowBytes: hiddenSize * MemoryLayout<Float>.stride
+            )
+            vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+        } else {
+            var packed = [UInt16](repeating: 0, count: hiddenSize)
+            for hiddenIndex in 0..<hiddenSize {
+                packed[hiddenIndex] = dataPointer[hiddenIndex * hiddenStride]
+            }
+            var converted = [Float](repeating: 0, count: hiddenSize)
+            packed.withUnsafeBufferPointer { packedBuffer in
+                converted.withUnsafeMutableBufferPointer { convertedBuffer in
+                    var src = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: packedBuffer.baseAddress!),
+                        height: 1,
+                        width: vImagePixelCount(hiddenSize),
+                        rowBytes: hiddenSize * MemoryLayout<UInt16>.stride
+                    )
+                    var dst = vImage_Buffer(
+                        data: convertedBuffer.baseAddress!,
+                        height: 1,
+                        width: vImagePixelCount(hiddenSize),
+                        rowBytes: hiddenSize * MemoryLayout<Float>.stride
+                    )
+                    vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                }
+            }
+            for hiddenIndex in 0..<hiddenSize {
+                destPtr[hiddenIndex * destHiddenStride] = converted[hiddenIndex]
+            }
+        }
 
         return out
     }

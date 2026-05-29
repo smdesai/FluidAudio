@@ -11,7 +11,8 @@ import Foundation
 public struct CtcKeywordSpotter: Sendable {
 
     let logger = AppLogger(category: "CtcKeywordSpotter")
-    let models: CtcModels
+    let models: CtcModels?
+    let vocabulary: [Int: String]
     public let blankId: Int
 
     /// Computed property to avoid storing non-Sendable MLPredictionOptions.
@@ -52,8 +53,24 @@ public struct CtcKeywordSpotter: Sendable {
     /// Public result type containing detections and cached CTC log-probabilities.
     /// The log-probs can be reused for scoring additional words without re-running the CTC model.
     public struct SpotKeywordsResult: Sendable {
+        public init(
+            detections: [KeywordDetection],
+            wordAlignments: [CtcWordAlignment],
+            logProbs: [[Float]],
+            frameDuration: Double,
+            totalFrames: Int
+        ) {
+            self.detections = detections
+            self.wordAlignments = wordAlignments
+            self.logProbs = logProbs
+            self.frameDuration = frameDuration
+            self.totalFrames = totalFrames
+        }
+
         /// Keyword detections for vocabulary terms
         public let detections: [KeywordDetection]
+        /// Greedy CTC word alignment used as the baseline for context-biasing candidates.
+        public let wordAlignments: [CtcWordAlignment]
         /// CTC log-probabilities [T, V] for reuse in rescoring
         public let logProbs: [[Float]]
         /// Duration of each CTC frame in seconds
@@ -93,6 +110,18 @@ public struct CtcKeywordSpotter: Sendable {
 
     public init(models: CtcModels, blankId: Int = ContextBiasingConstants.defaultBlankId) {
         self.models = models
+        self.vocabulary = models.vocabulary
+        self.blankId = blankId
+    }
+
+    /// Initialize a spotter for precomputed CTC log-probabilities.
+    ///
+    /// This path is used by the shared TDT-CTC head integration, where the
+    /// ASR encoder has already produced CTC logits and no separate CTC model
+    /// bundle should be loaded just to run graph search and constrained DP.
+    public init(vocabulary: [Int: String], blankId: Int = ContextBiasingConstants.defaultBlankId) {
+        self.models = nil
+        self.vocabulary = vocabulary
         self.blankId = blankId
     }
 
@@ -120,63 +149,20 @@ public struct CtcKeywordSpotter: Sendable {
         let inferDt = Date().timeIntervalSince(inferT0)
         let logProbs = ctcResult.logProbs
         guard !logProbs.isEmpty else {
-            return SpotKeywordsResult(detections: [], logProbs: [], frameDuration: 0, totalFrames: 0)
+            return SpotKeywordsResult(
+                detections: [], wordAlignments: [], logProbs: [], frameDuration: 0, totalFrames: 0)
         }
 
         let frameDuration = ctcResult.frameDuration
         let totalFrames = ctcResult.totalFrames
 
-        var results: [KeywordDetection] = []
         let dpT0 = Date()
-        var consideredTerms = 0
-
-        for term in customVocabulary.terms {
-            // Skip short terms to reduce false positives (per NeMo CTC-WS paper)
-            guard term.text.count >= customVocabulary.minTermLength else {
-                if debugMode {
-                    logger.debug(
-                        "  Skipping '\(term.text)': too short (\(term.text.count) < \(customVocabulary.minTermLength) chars)"
-                    )
-                }
-                continue
-            }
-
-            let ids = term.ctcTokenIds ?? term.tokenIds
-            guard let ids, !ids.isEmpty else { continue }
-            consideredTerms += 1
-
-            // Adjust threshold for multi-token phrases
-            let tokenCount = ids.count
-            let adjustedThreshold: Float =
-                minScore.map { base in
-                    let extraTokens = max(0, tokenCount - ContextBiasingConstants.baselineTokenCountForThreshold)
-                    return base - Float(extraTokens) * ContextBiasingConstants.thresholdRelaxationPerToken
-                } ?? ContextBiasingConstants.defaultMinSpotterScore
-
-            // Find ALL occurrences of this keyword (not just the best one)
-            let multipleDetections = ctcWordSpotMultiple(
-                logProbs: logProbs,
-                keywordTokens: ids,
-                minScore: adjustedThreshold,
-                mergeOverlap: true
-            )
-
-            for (score, start, end) in multipleDetections {
-                let startTime = TimeInterval(start) * frameDuration
-                let endTime = TimeInterval(end) * frameDuration
-
-                let detection = KeywordDetection(
-                    term: term,
-                    score: score,
-                    totalFrames: totalFrames,
-                    startFrame: start,
-                    endFrame: end,
-                    startTime: startTime,
-                    endTime: endTime
-                )
-                results.append(detection)
-            }
-        }
+        let results = spotKeywordsFromLogProbs(
+            logProbs: logProbs,
+            frameDuration: frameDuration,
+            customVocabulary: customVocabulary,
+            minScore: minScore
+        ).detections
 
         if ctcProfileEnabled {
             let dpDt = Date().timeIntervalSince(dpT0)
@@ -185,12 +171,18 @@ public struct CtcKeywordSpotter: Sendable {
                     String(
                         format:
                             "CTC-PROFILE inference=%.3fs (%d frames) DP=%.3fs (%d terms scored, %d detections)\n",
-                        inferDt, totalFrames, dpDt, consideredTerms, results.count
+                        inferDt, totalFrames, dpDt, customVocabulary.terms.count, results.count
                     ).utf8))
         }
 
         return SpotKeywordsResult(
             detections: results,
+            wordAlignments: CtcWordAligner.align(
+                logProbs: logProbs,
+                vocabulary: vocabulary,
+                blankId: blankId,
+                frameDuration: frameDuration
+            ),
             logProbs: logProbs,
             frameDuration: frameDuration,
             totalFrames: totalFrames
@@ -215,57 +207,74 @@ public struct CtcKeywordSpotter: Sendable {
     ) -> SpotKeywordsResult {
         let totalFrames = logProbs.count
         guard totalFrames > 0 else {
-            return SpotKeywordsResult(detections: [], logProbs: [], frameDuration: 0, totalFrames: 0)
+            return SpotKeywordsResult(
+                detections: [], wordAlignments: [], logProbs: [], frameDuration: 0, totalFrames: 0)
         }
 
-        var results: [KeywordDetection] = []
+        let graphVocab = CustomVocabularyContext(
+            terms: customVocabulary.terms.filter { term in
+                guard let tokenIds = term.ctcTokenIds ?? term.tokenIds else { return false }
+                return !tokenIds.contains(ContextBiasingConstants.wildcardTokenId)
+            },
+            alpha: customVocabulary.alpha,
+            minCtcScore: customVocabulary.minCtcScore,
+            minSimilarity: customVocabulary.minSimilarity,
+            minCombinedConfidence: customVocabulary.minCombinedConfidence,
+            minTermLength: customVocabulary.minTermLength
+        )
+        let graph = CtcContextGraph(
+            vocabulary: graphVocab,
+            minScore: minScore,
+            blankId: blankId,
+            contextScore: 0
+        )
+        let graphDetections = graph.spot(logProbs: logProbs)
+        var results = graphDetections.map { detection in
+            KeywordDetection(
+                term: detection.entry.term,
+                score: detection.score,
+                totalFrames: totalFrames,
+                startFrame: detection.startFrame,
+                endFrame: detection.endFrame,
+                startTime: TimeInterval(detection.startFrame) * frameDuration,
+                endTime: TimeInterval(detection.endFrame) * frameDuration
+            )
+        }
 
         for term in customVocabulary.terms {
-            guard term.text.count >= customVocabulary.minTermLength else {
-                if debugMode {
-                    logger.debug(
-                        "  Skipping '\(term.text)': too short (\(term.text.count) < \(customVocabulary.minTermLength) chars)"
-                    )
-                }
-                continue
-            }
+            guard let ids = term.ctcTokenIds ?? term.tokenIds else { continue }
+            guard ids.contains(ContextBiasingConstants.wildcardTokenId) else { continue }
+            guard term.text.count >= customVocabulary.minTermLength, !ids.isEmpty else { continue }
 
-            let ids = term.ctcTokenIds ?? term.tokenIds
-            guard let ids, !ids.isEmpty else { continue }
-
-            let tokenCount = ids.count
-            let adjustedThreshold: Float =
-                minScore.map { base in
-                    let extraTokens = max(0, tokenCount - ContextBiasingConstants.baselineTokenCountForThreshold)
-                    return base - Float(extraTokens) * ContextBiasingConstants.thresholdRelaxationPerToken
-                } ?? ContextBiasingConstants.defaultMinSpotterScore
-
+            let adjustedThreshold = Self.adjustedSpotterThreshold(minScore, tokenCount: ids.count)
             let multipleDetections = ctcWordSpotMultiple(
                 logProbs: logProbs,
                 keywordTokens: ids,
                 minScore: adjustedThreshold,
                 mergeOverlap: true
             )
-
             for (score, start, end) in multipleDetections {
-                let startTime = TimeInterval(start) * frameDuration
-                let endTime = TimeInterval(end) * frameDuration
-
-                let detection = KeywordDetection(
-                    term: term,
-                    score: score,
-                    totalFrames: totalFrames,
-                    startFrame: start,
-                    endFrame: end,
-                    startTime: startTime,
-                    endTime: endTime
-                )
-                results.append(detection)
+                results.append(
+                    KeywordDetection(
+                        term: term,
+                        score: score,
+                        totalFrames: totalFrames,
+                        startFrame: start,
+                        endFrame: end,
+                        startTime: TimeInterval(start) * frameDuration,
+                        endTime: TimeInterval(end) * frameDuration
+                    ))
             }
         }
 
         return SpotKeywordsResult(
             detections: results,
+            wordAlignments: CtcWordAligner.align(
+                logProbs: logProbs,
+                vocabulary: vocabulary,
+                blankId: blankId,
+                frameDuration: frameDuration
+            ),
             logProbs: logProbs,
             frameDuration: frameDuration,
             totalFrames: totalFrames
@@ -354,6 +363,12 @@ public struct CtcKeywordSpotter: Sendable {
             mergeOverlap: mergeOverlap,
             blankId: blankId
         )
+    }
+
+    private static func adjustedSpotterThreshold(_ minScore: Float?, tokenCount: Int) -> Float {
+        let base = minScore ?? ContextBiasingConstants.defaultMinSpotterScore
+        let extraTokens = max(0, tokenCount - ContextBiasingConstants.baselineTokenCountForThreshold)
+        return base - Float(extraTokens) * ContextBiasingConstants.thresholdRelaxationPerToken
     }
 
 }

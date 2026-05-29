@@ -13,16 +13,10 @@ struct BeamTranscribeResult {
     let processingTime: TimeInterval
 }
 
-/// Run TDT beam search end-to-end on a single audio buffer.
+/// Run TDT beam search end-to-end on an audio buffer.
 ///
-/// Bypasses the sliding-window greedy pipeline; runs the encoder once over
-/// the full audio (padded to the 15s window) and decodes with
-/// `TdtBeamDecoder`. When `keywordTokenSequences` is non-empty, shallow-
-/// fusion biasing is enabled inside the beam decoder.
-///
-/// Throws when:
-/// - The loaded model bundle doesn't expose `jointLogits`.
-/// - Audio exceeds the encoder's 15s window (caller should fall back).
+/// Audio longer than the encoder window is decoded in overlapping chunks,
+/// then token-level suffix/prefix deduplication stitches the chunk outputs.
 func runTdtBeamTranscribe(
     asrModels: AsrModels?,
     audioSamples: [Float],
@@ -39,12 +33,6 @@ func runTdtBeamTranscribe(
         )
     }
     let maxSamples = ASRConstants.maxModelSamples
-    guard audioSamples.count <= maxSamples else {
-        throw ASRError.processingFailed(
-            "Beam mode v1 requires audio ≤ \(maxSamples) samples; got \(audioSamples.count). "
-                + "Long-audio sliding-window beam decoding not implemented yet."
-        )
-    }
 
     let tokenizerURL = AsrModels.defaultCacheDirectory(for: asrModels.version)
         .appendingPathComponent("tokenizer.model")
@@ -55,16 +43,9 @@ func runTdtBeamTranscribe(
     let encoderRunner = try TdtRescorer(
         asrModels: asrModels, tokenizerModelURL: tokenizerURL)
 
-    var padded = audioSamples
-    if padded.count < maxSamples {
-        padded.append(contentsOf: [Float](repeating: 0, count: maxSamples - padded.count))
-    }
-
     let t0 = Date()
-    let (encoderOutput, validLength) = try await encoderRunner.runEncoder(audioSamples: padded)
-    logger.info(
-        "Beam: encoder ready (\(validLength) valid frames, \(audioSamples.count) audio samples)"
-    )
+    let chunkStarts = beamChunkStarts(audioSampleCount: audioSamples.count, maxSamples: maxSamples)
+    logger.info("Beam: \(chunkStarts.count) chunk(s) for \(audioSamples.count) samples")
 
     // Build the decoder with the right blankId for this model version.
     let tdtConfig = TdtConfig(blankId: asrModels.version.blankId)
@@ -74,34 +55,90 @@ func runTdtBeamTranscribe(
     )
     let decoder = TdtBeamDecoder(config: asrConfig, beamConfig: beamConfig)
 
-    let initialState = TdtDecoderState.make(decoderLayers: asrModels.version.decoderLayers)
-    let result: TdtBeamDecoder.DecodeResult = try await decoder.decode(
-        encoderOutput: encoderOutput,
-        encoderSequenceLength: validLength,
-        decoderModel: asrModels.decoder,
-        jointLogitsModel: jointLogits,
-        initialState: initialState
-    )
+    var previousTokens: [Int] = []
+    var allTokens: [Int] = []
+    var allTimestamps: [Int] = []
+    var allConfidences: [Float] = []
+    var totalScore: Float = 0
+    for (chunkIndex, start) in chunkStarts.enumerated() {
+        let end = min(start + maxSamples, audioSamples.count)
+        var chunkAudio = Array(audioSamples[start..<end])
+        if chunkAudio.count < maxSamples {
+            chunkAudio.append(contentsOf: [Float](repeating: 0, count: maxSamples - chunkAudio.count))
+        }
+
+        let (encoderOutput, validLength) = try await encoderRunner.runEncoder(audioSamples: chunkAudio)
+        let initialState = TdtDecoderState.make(decoderLayers: asrModels.version.decoderLayers)
+        let frameOffset = start / ASRConstants.samplesPerEncoderFrame
+        let result = try await decoder.decode(
+            encoderOutput: encoderOutput,
+            encoderSequenceLength: validLength,
+            decoderModel: asrModels.decoder,
+            jointLogitsModel: jointLogits,
+            initialState: initialState,
+            globalFrameOffset: frameOffset,
+            isLastChunk: chunkIndex == chunkStarts.count - 1
+        )
+
+        let lastEmittedFrame = allTimestamps.last ?? Int.min
+        var removedCount = chunkIndex == 0 ? 0 : result.timestamps.prefix { $0 <= lastEmittedFrame + 1 }.count
+        removedCount += overlapPrefixLength(
+            previous: previousTokens,
+            current: Array(result.tokens.dropFirst(removedCount))
+        )
+        let keptTokens = Array(result.tokens.dropFirst(removedCount))
+        allTokens.append(contentsOf: keptTokens)
+        allTimestamps.append(contentsOf: result.timestamps.dropFirst(removedCount))
+        allConfidences.append(contentsOf: result.tokenConfidences.dropFirst(removedCount))
+        previousTokens = allTokens
+        totalScore += result.score
+    }
     let processingTime = Date().timeIntervalSince(t0)
 
     // Detokenize the token sequence into text. Use the TDT vocabulary
     // (which was loaded with the model) and strip SentencePiece markers.
     let text = detokenize(
-        tokenIds: result.tokens,
+        tokenIds: allTokens,
         vocab: asrModels.vocabulary
     )
 
     logger.info(
-        "Beam: emitted \(result.tokens.count) tokens, score=\(String(format: "%.2f", result.score)) in \(String(format: "%.3f", processingTime))s"
+        "Beam: emitted \(allTokens.count) tokens, score=\(String(format: "%.2f", totalScore)) in \(String(format: "%.3f", processingTime))s"
     )
 
     return BeamTranscribeResult(
         text: text,
-        tokens: result.tokens,
-        timestamps: result.timestamps,
-        confidences: result.tokenConfidences,
+        tokens: allTokens,
+        timestamps: allTimestamps,
+        confidences: allConfidences,
         processingTime: processingTime
     )
+}
+
+private func beamChunkStarts(audioSampleCount: Int, maxSamples: Int) -> [Int] {
+    guard audioSampleCount > maxSamples else { return [0] }
+    let overlapSamples = 2 * ASRConstants.sampleRate
+    let stride = max(ASRConstants.samplesPerEncoderFrame, maxSamples - overlapSamples)
+    var starts: [Int] = []
+    var start = 0
+    while start < audioSampleCount {
+        starts.append(start)
+        if start + maxSamples >= audioSampleCount { break }
+        start += stride
+    }
+    return starts
+}
+
+private func overlapPrefixLength(previous: [Int], current: [Int], maxOverlap: Int = 24) -> Int {
+    guard !previous.isEmpty, !current.isEmpty else { return 0 }
+    let limit = min(maxOverlap, previous.count, current.count)
+    if limit == 0 { return 0 }
+    for length in stride(from: limit, through: 1, by: -1) {
+        if Array(previous.suffix(length)) == Array(current.prefix(length)) {
+            return length
+        }
+    }
+    return 0
 }
 
 /// Tokenize a custom vocabulary against the TDT vocab (SentencePiece

@@ -198,6 +198,7 @@ extension VocabularyRescorer {
         tokenTimings: [TokenTiming],
         logProbs: [[Float]],
         frameDuration: Double,
+        ctcWordAlignments: [CtcWordAlignment] = [],
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
         minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
@@ -220,6 +221,7 @@ extension VocabularyRescorer {
                 cbw: cbw,
                 marginSeconds: marginSeconds,
                 minSimilarity: minSimilarity,
+                ctcWordAlignments: ctcWordAlignments,
                 tdtContext: tdtContext
             )
         } else {
@@ -231,6 +233,7 @@ extension VocabularyRescorer {
                 cbw: cbw,
                 marginSeconds: marginSeconds,
                 minSimilarity: minSimilarity,
+                ctcWordAlignments: ctcWordAlignments,
                 tdtContext: tdtContext
             )
         }
@@ -254,6 +257,7 @@ extension VocabularyRescorer {
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
         minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        ctcWordAlignments: [CtcWordAlignment] = [],
         tdtContext: TdtScorerContext? = nil
     ) -> RescoreOutput {
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
@@ -459,6 +463,7 @@ extension VocabularyRescorer {
         cbw: Float = ContextBiasingConstants.defaultCbw,
         marginSeconds: Double = ContextBiasingConstants.defaultMarginSeconds,
         minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor,
+        ctcWordAlignments: [CtcWordAlignment] = [],
         tdtContext: TdtScorerContext? = nil
     ) -> RescoreOutput {
         guard !wordTimings.isEmpty, !logProbs.isEmpty else {
@@ -529,6 +534,10 @@ extension VocabularyRescorer {
                         let tdtPhrase = spanWords.joined(separator: " ")
                         let normalizedPhrase = Self.normalizeForSimilarity(tdtPhrase)
                         guard !normalizedPhrase.isEmpty else { continue }
+                        let normalizedSpanWords = spanIndices.map { Self.normalizeForSimilarity(wordTimings[$0].word) }
+                        guard multiWordSpanHasAnchoredEdge(spanWords: normalizedSpanWords, forms: multiWordForms) else {
+                            continue
+                        }
 
                         // Check similarity against ALL forms (canonical + aliases)
                         var bestSimilarity: Float = 0
@@ -793,6 +802,7 @@ extension VocabularyRescorer {
                 cbw: cbw,
                 marginSeconds: marginSeconds,
                 vocabularyNormalizedSet: vocabularyNormalizedSet,
+                ctcWordAlignments: ctcWordAlignments,
                 pendingReplacements: &pendingReplacements,
                 tdtContext: tdtContext
             )
@@ -830,6 +840,7 @@ extension VocabularyRescorer {
         cbw: Float,
         marginSeconds: Double,
         vocabularyNormalizedSet: Set<String>,
+        ctcWordAlignments: [CtcWordAlignment],
         pendingReplacements: inout [PendingReplacement],
         tdtContext: TdtScorerContext? = nil
     ) {
@@ -910,6 +921,8 @@ extension VocabularyRescorer {
             if span.count >= 2 {
                 let allStopwords = normalizedSpanWords.allSatisfy { Self.stopwords.contains($0) }
                 if allStopwords { continue }
+                let containsStopword = normalizedSpanWords.contains { Self.multiWordStopwords.contains($0) }
+                if containsStopword { continue }
             }
 
             // Compute similarity for ranking only — the gate is CTC
@@ -942,6 +955,9 @@ extension VocabularyRescorer {
                 tdtContext: tdtContext
             )
             guard evalResult.shouldReplace else { continue }
+            guard passesCtcAlignmentValidation(detection: detection, alignments: ctcWordAlignments, cbw: cbw) else {
+                continue
+            }
 
             debugLog(
                 "  [SPOTTER-RESCUE] '\(originalPhrase)' → '\(vocabTerm)' "
@@ -957,6 +973,41 @@ extension VocabularyRescorer {
                 )
             )
         }
+    }
+
+    /// Validate spotter-rescue candidates against greedy CTC word alignment.
+    ///
+    /// This is the paper's false-accept guard: a context-graph hit should not
+    /// replace a high-scoring greedy CTC word in the same frame interval unless
+    /// the boosted context score wins in CTC space. When no alignment overlaps
+    /// the detection, the older CTC-vs-CTC evaluator remains the only gate.
+    private func passesCtcAlignmentValidation(
+        detection: CtcKeywordSpotter.KeywordDetection,
+        alignments: [CtcWordAlignment],
+        cbw: Float
+    ) -> Bool {
+        guard !alignments.isEmpty else { return true }
+
+        let candidateScore = detection.score + cbw
+        let passes = CtcAlignmentValidator.candidateBeatsGreedyAlignment(
+            candidateScore: candidateScore,
+            candidateStartFrame: detection.startFrame,
+            candidateEndFrame: detection.endFrame,
+            alignments: alignments
+        )
+        if !passes {
+            let greedyScore =
+                CtcAlignmentValidator.bestOverlappingGreedyScore(
+                    candidateStartFrame: detection.startFrame,
+                    candidateEndFrame: detection.endFrame,
+                    alignments: alignments
+                ) ?? -.infinity
+            debugLog(
+                "  [CTC-ALIGN] rejecting '\(detection.term.text)': boosted=\(String(format: "%.2f", candidateScore)) "
+                    + "<= greedy=\(String(format: "%.2f", greedyScore))"
+            )
+        }
+        return passes
     }
 
     /// Find the indices of TDT words whose [startTime, endTime] window

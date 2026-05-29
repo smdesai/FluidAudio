@@ -14,7 +14,8 @@ struct EncoderFrameView {
     private let timeStride: Int
     private let hiddenStride: Int
     private let timeBaseOffset: Int
-    private let basePointer: UnsafeMutablePointer<Float>
+    private let baseFloat32Pointer: UnsafeMutablePointer<Float>?
+    private let baseFloat16Pointer: UnsafeMutablePointer<UInt16>?
 
     /// Initialize with explicit hidden size (for model-version-aware callers)
     init(encoderOutput: MLMultiArray, validLength: Int, expectedHiddenSize: Int) throws {
@@ -48,12 +49,18 @@ struct EncoderFrameView {
         }
         self.array = encoderOutput
 
-        guard encoderOutput.dataType == .float32 else {
+        switch encoderOutput.dataType {
+        case .float32:
+            self.baseFloat32Pointer = encoderOutput.dataPointer.bindMemory(
+                to: Float.self, capacity: encoderOutput.count)
+            self.baseFloat16Pointer = nil
+        case .float16:
+            self.baseFloat32Pointer = nil
+            self.baseFloat16Pointer = encoderOutput.dataPointer.bindMemory(
+                to: UInt16.self, capacity: encoderOutput.count)
+        default:
             throw ASRError.processingFailed("Unsupported encoder output type: \(encoderOutput.dataType)")
         }
-
-        self.basePointer = encoderOutput.dataPointer.bindMemory(
-            to: Float.self, capacity: encoderOutput.count)
 
         if timeStride >= 0 {
             self.timeBaseOffset = 0
@@ -81,20 +88,72 @@ struct EncoderFrameView {
         }
 
         let frameOffset = timeBaseOffset + index * timeStride
-        let frameStart = basePointer.advanced(by: frameOffset)
 
         guard hiddenStride != 0 else {
             throw ASRError.processingFailed("Invalid hidden stride: 0")
         }
-        let sourcePointer = UnsafePointer<Float>(frameStart)
-        let count = try makeBlasIndex(hiddenSize, label: "Hidden size")
-        let incX = try makeBlasIndex(hiddenStride, label: "Hidden stride")
-        let destStrideCblas = try makeBlasIndex(destinationStride, label: "Destination stride")
+
+        if let baseFloat32Pointer {
+            let frameStart = baseFloat32Pointer.advanced(by: frameOffset)
+            let sourcePointer = UnsafePointer<Float>(frameStart)
+            let count = try makeBlasIndex(hiddenSize, label: "Hidden size")
+            let incX = try makeBlasIndex(hiddenStride, label: "Hidden stride")
+            let destStrideCblas = try makeBlasIndex(destinationStride, label: "Destination stride")
+
+            if hiddenStride == 1 && destinationStride == 1 {
+                destination.update(from: sourcePointer, count: hiddenSize)
+            } else {
+                cblas_scopy(count, sourcePointer, incX, destination, destStrideCblas)
+            }
+            return
+        }
+
+        guard let baseFloat16Pointer else {
+            throw ASRError.processingFailed("Encoder output has no readable backing pointer")
+        }
 
         if hiddenStride == 1 && destinationStride == 1 {
-            destination.update(from: sourcePointer, count: hiddenSize)
+            let sourcePointer = UnsafePointer<UInt16>(baseFloat16Pointer.advanced(by: frameOffset))
+            var src = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: sourcePointer),
+                height: 1,
+                width: vImagePixelCount(hiddenSize),
+                rowBytes: hiddenSize * MemoryLayout<UInt16>.stride
+            )
+            var dst = vImage_Buffer(
+                data: destination,
+                height: 1,
+                width: vImagePixelCount(hiddenSize),
+                rowBytes: hiddenSize * MemoryLayout<Float>.stride
+            )
+            vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
         } else {
-            cblas_scopy(count, sourcePointer, incX, destination, destStrideCblas)
+            var packed = [UInt16](repeating: 0, count: hiddenSize)
+            let sourceBase = baseFloat16Pointer.advanced(by: frameOffset)
+            for hiddenIndex in 0..<hiddenSize {
+                packed[hiddenIndex] = sourceBase[hiddenIndex * hiddenStride]
+            }
+            var converted = [Float](repeating: 0, count: hiddenSize)
+            packed.withUnsafeBufferPointer { packedBuffer in
+                converted.withUnsafeMutableBufferPointer { convertedBuffer in
+                    var src = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: packedBuffer.baseAddress!),
+                        height: 1,
+                        width: vImagePixelCount(hiddenSize),
+                        rowBytes: hiddenSize * MemoryLayout<UInt16>.stride
+                    )
+                    var dst = vImage_Buffer(
+                        data: convertedBuffer.baseAddress!,
+                        height: 1,
+                        width: vImagePixelCount(hiddenSize),
+                        rowBytes: hiddenSize * MemoryLayout<Float>.stride
+                    )
+                    vImageConvert_Planar16FtoPlanarF(&src, &dst, 0)
+                }
+            }
+            for hiddenIndex in 0..<hiddenSize {
+                destination[hiddenIndex * destinationStride] = converted[hiddenIndex]
+            }
         }
     }
 }

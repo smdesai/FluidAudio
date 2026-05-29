@@ -762,6 +762,7 @@ public enum CtcEarningsBenchmark {
                     tokenTimings: tokenTimings,
                     logProbs: logProbs,
                     frameDuration: frameDuration,
+                    ctcWordAlignments: ctcResult.wordAlignments,
                     cbw: cbw,
                     marginSeconds: marginSeconds,
                     minSimilarity: minSimilarity

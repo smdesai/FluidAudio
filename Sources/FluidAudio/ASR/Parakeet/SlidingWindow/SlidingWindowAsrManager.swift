@@ -592,6 +592,7 @@ public actor SlidingWindowAsrManager {
                 tokenTimings: tokenTimings,
                 logProbs: logProbs,
                 frameDuration: spotResult.frameDuration,
+                ctcWordAlignments: spotResult.wordAlignments,
                 cbw: cbw,
                 marginSeconds: 0.5,
                 minSimilarity: minSimilarity

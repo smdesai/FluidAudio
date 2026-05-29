@@ -274,4 +274,38 @@ public struct CustomVocabularyContext: Sendable {
         let tokenizedVocab = CustomVocabularyContext(terms: tokenizedTerms)
         return (tokenizedVocab, ctcModels)
     }
+
+    /// Load vocabulary from file and tokenize with CTC tokenizer only.
+    ///
+    /// Use this when CTC log-probabilities come from a shared TDT-CTC head,
+    /// so the separate CTC encoder models are not needed.
+    public static func loadWithCtcTokensOnly(
+        from path: String,
+        ctcModelDirectory: URL = CtcModels.defaultCacheDirectory(for: .ctc110m)
+    ) async throws -> CustomVocabularyContext {
+        let vocabURL = URL(fileURLWithPath: path)
+        let loadedVocab = try loadFromSimpleFormat(from: vocabURL)
+        let ctcTokenizer = try await CtcTokenizer.load(from: ctcModelDirectory)
+
+        let tokenizedTerms = loadedVocab.terms.compactMap { term -> CustomVocabularyTerm? in
+            let tokenIds = ctcTokenizer.encode(term.text)
+            guard !tokenIds.isEmpty else { return nil }
+            return CustomVocabularyTerm(
+                text: term.text,
+                weight: term.weight,
+                aliases: term.aliases,
+                tokenIds: term.tokenIds,
+                ctcTokenIds: tokenIds
+            )
+        }
+
+        return CustomVocabularyContext(
+            terms: tokenizedTerms,
+            alpha: loadedVocab.alpha,
+            minCtcScore: loadedVocab.minCtcScore,
+            minSimilarity: loadedVocab.minSimilarity,
+            minCombinedConfidence: loadedVocab.minCombinedConfidence,
+            minTermLength: loadedVocab.minTermLength
+        )
+    }
 }
