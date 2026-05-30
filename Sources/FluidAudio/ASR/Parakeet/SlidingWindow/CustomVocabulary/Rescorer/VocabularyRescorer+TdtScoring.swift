@@ -239,7 +239,8 @@ extension VocabularyRescorer {
         frameDuration: Double,
         cbw: Float,
         marginSeconds: Double,
-        tdtContext: TdtScorerContext?
+        tdtContext: TdtScorerContext?,
+        ctcWordAlignments: [CtcWordAlignment] = []
     ) -> CTCMatchResult {
         if let tdtContext,
             let tdtResult = evaluateTDTMatch(
@@ -255,7 +256,8 @@ extension VocabularyRescorer {
             logProbs: logProbs,
             frameDuration: frameDuration,
             cbw: cbw,
-            marginSeconds: marginSeconds
+            marginSeconds: marginSeconds,
+            ctcWordAlignments: ctcWordAlignments
         )
     }
 }

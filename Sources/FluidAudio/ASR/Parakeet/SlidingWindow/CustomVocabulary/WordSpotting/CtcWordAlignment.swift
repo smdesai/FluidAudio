@@ -183,6 +183,41 @@ enum CtcAlignmentValidator {
         return candidateScore > greedyScore
     }
 
+    /// Large-vocabulary false-accept veto for the primary term-centric path.
+    ///
+    /// The size-gated spotter-rescue pass already validates its detections
+    /// against the greedy CTC word alignment, but the primary string-similarity
+    /// path does not — so for large keyword lists a `+cbw`-boosted distractor
+    /// (e.g. `prior` → `priorix`) can replace a correctly-decoded common word
+    /// with no acoustic check. This applies the same veto on that path, but
+    /// only above `largeVocabThreshold`: the small-dictionary path is already at
+    /// 100% precision and is intentionally left untouched.
+    ///
+    /// - Parameters:
+    ///   - boostedVocabScore: per-token vocab CTC score with cbw already added
+    ///     (same scale as `CtcWordAlignment.normalizedScore`).
+    ///   - candidateStartFrame/candidateEndFrame: the matched CTC frame interval.
+    ///   - alignments: greedy CTC word alignment for the utterance.
+    ///   - vocabularyTermCount: number of terms in the active vocabulary.
+    ///   - largeVocabThreshold: the size above which the veto activates.
+    /// - Returns: `true` if the replacement may proceed; `false` if vetoed.
+    static func candidatePassesLargeVocabAlignmentVeto(
+        boostedVocabScore: Float,
+        candidateStartFrame: Int,
+        candidateEndFrame: Int,
+        alignments: [CtcWordAlignment],
+        vocabularyTermCount: Int,
+        largeVocabThreshold: Int
+    ) -> Bool {
+        guard vocabularyTermCount > largeVocabThreshold else { return true }
+        return candidateBeatsGreedyAlignment(
+            candidateScore: boostedVocabScore,
+            candidateStartFrame: candidateStartFrame,
+            candidateEndFrame: candidateEndFrame,
+            alignments: alignments
+        )
+    }
+
     static func bestOverlappingGreedyScore(
         candidateStartFrame: Int,
         candidateEndFrame: Int,

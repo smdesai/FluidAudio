@@ -145,4 +145,78 @@ final class CtcWordAlignmentTests: XCTestCase {
 
         XCTAssertTrue(passes)
     }
+
+    // MARK: - Large-vocab false-accept veto (fix #1)
+
+    /// The `prior` → `priorix` regression: the greedy CTC decode produced the
+    /// correct common word `prior` with a strong per-token score; the distractor
+    /// drug name `priorix` only wins the CTC-vs-CTC comparison because of the
+    /// +cbw boost. With a large vocabulary the alignment veto must block it.
+    private func priorAlignment() -> CtcWordAlignment {
+        // Greedy "prior": 2 tokens, summed score -0.6 → normalizedScore -0.3.
+        CtcWordAlignment(
+            word: "prior",
+            tokenIds: [11, 12],
+            score: -0.6,
+            startFrame: 40,
+            endFrame: 43,
+            startTime: 1.6,
+            endTime: 1.72
+        )
+    }
+
+    func testLargeVocabVetoBlocksBoostedDistractorBelowGreedyWord() {
+        // priorix boosted score -0.5 is below the greedy "prior" word (-0.3),
+        // so even after the +cbw boost the replacement must be vetoed.
+        let passes = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
+            boostedVocabScore: -0.5,
+            candidateStartFrame: 41,
+            candidateEndFrame: 44,
+            alignments: [priorAlignment()],
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertFalse(passes, "Boosted distractor below the overlapping greedy word must be vetoed in large vocab")
+    }
+
+    func testLargeVocabVetoDisabledForSmallVocab() {
+        // Identical scores, but a small vocabulary leaves the veto disabled so
+        // the proven small-dictionary path (100% precision) is unchanged.
+        let passes = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
+            boostedVocabScore: -0.5,
+            candidateStartFrame: 41,
+            candidateEndFrame: 44,
+            alignments: [priorAlignment()],
+            vocabularyTermCount: 3,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "Veto must not fire at or below the large-vocab threshold")
+    }
+
+    func testLargeVocabVetoAllowsCandidateBeatingGreedyWord() {
+        // A genuine keyword whose boosted score beats the greedy word is allowed
+        // through even in a large vocabulary.
+        let passes = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
+            boostedVocabScore: -0.1,
+            candidateStartFrame: 41,
+            candidateEndFrame: 44,
+            alignments: [priorAlignment()],
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "Candidate beating the greedy word must still be accepted")
+    }
+
+    func testLargeVocabVetoAllowsWhenNoGreedyOverlap() {
+        // No greedy word covers the candidate frames → nothing to defend, allow.
+        let passes = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
+            boostedVocabScore: -50.0,
+            candidateStartFrame: 200,
+            candidateEndFrame: 204,
+            alignments: [priorAlignment()],
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "No overlapping greedy word means no veto")
+    }
 }

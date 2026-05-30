@@ -420,7 +420,8 @@ extension VocabularyRescorer {
                     frameDuration: frameDuration,
                     cbw: cbw,
                     marginSeconds: marginSeconds,
-                    tdtContext: tdtContext
+                    tdtContext: tdtContext,
+                    ctcWordAlignments: ctcWordAlignments
                 )
 
                 if result.shouldReplace {
@@ -611,7 +612,8 @@ extension VocabularyRescorer {
                             frameDuration: frameDuration,
                             cbw: cbw,
                             marginSeconds: marginSeconds,
-                            tdtContext: tdtContext
+                            tdtContext: tdtContext,
+                            ctcWordAlignments: ctcWordAlignments
                         )
 
                         if result.shouldReplace {
@@ -711,7 +713,8 @@ extension VocabularyRescorer {
                             Self.stringSimilarity(norm2, $0.normalized) >= 0.9
                                 || Self.stringSimilarity(norm3, $0.normalized) >= 0.9
                         }
-                        let crossesStopword = Self.multiWordStopwords.contains(norm2) || Self.multiWordStopwords.contains(norm3)
+                        let crossesStopword =
+                            Self.multiWordStopwords.contains(norm2) || Self.multiWordStopwords.contains(norm3)
                         if !laterWordMatchesVocab && !crossesStopword {
                             let concatenated = normalizedWord + norm2 + norm3
                             for form in singleWordForms {
@@ -797,7 +800,8 @@ extension VocabularyRescorer {
                         frameDuration: frameDuration,
                         cbw: cbw,
                         marginSeconds: marginSeconds,
-                        tdtContext: tdtContext
+                        tdtContext: tdtContext,
+                        ctcWordAlignments: ctcWordAlignments
                     )
 
                     if result.shouldReplace {

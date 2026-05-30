@@ -25,13 +25,16 @@ extension VocabularyRescorer {
     ///   - frameDuration: Duration of each CTC frame in seconds
     ///   - cbw: Context-biasing weight
     ///   - marginSeconds: Temporal margin around word for CTC search
+    ///   - ctcWordAlignments: greedy CTC word alignment used as a large-vocab
+    ///     false-accept veto (empty disables the veto).
     /// - Returns: Evaluation result with replacement decision
     func evaluateCTCMatch(
         candidate: CTCMatchCandidate,
         logProbs: [[Float]],
         frameDuration: Double,
         cbw: Float,
-        marginSeconds: Double
+        marginSeconds: Double,
+        ctcWordAlignments: [CtcWordAlignment] = []
     ) -> CTCMatchResult {
         // Calculate frame window
         let marginFrames = Int(marginSeconds / frameDuration)
@@ -111,7 +114,30 @@ extension VocabularyRescorer {
         let boostedVocabScore = vocabCtcScore + adaptiveCbwValue
 
         // CTC-vs-CTC comparison
-        let shouldReplace = boostedVocabScore > originalCtcScore
+        var shouldReplace = boostedVocabScore > originalCtcScore
+
+        // LARGE-VOCAB FALSE-ACCEPT VETO:
+        //
+        // The CTC-vs-CTC comparison above can be flipped by the +cbw boost
+        // alone, letting a distractor that scores acoustically *below* the
+        // correctly-decoded word win (e.g. `prior` → `priorix` on a 650-term
+        // list). The greedy CTC word alignment is the paper's false-accept
+        // guard for exactly this case. We compare the boosted vocab score
+        // against the greedy word covering the candidate's actual frames
+        // (both are per-token-normalized — `ctcWordSpotConstrained` normalizes
+        // by token count, matching `CtcWordAlignment.normalizedScore`). The
+        // veto is restricted to large vocabularies; the small-dictionary path
+        // is already at 100% precision and is left unchanged.
+        if shouldReplace {
+            shouldReplace = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
+                boostedVocabScore: boostedVocabScore,
+                candidateStartFrame: spanStartFrame,
+                candidateEndFrame: spanEndFrame,
+                alignments: ctcWordAlignments,
+                vocabularyTermCount: vocabulary.terms.count,
+                largeVocabThreshold: ContextBiasingConstants.largeVocabThreshold
+            )
+        }
 
         // Debug output
         let label = candidate.spanLength > 1 ? "[MULTI] " : ""
@@ -134,6 +160,18 @@ extension VocabularyRescorer {
                 + "= \(String(format: "%.2f", boostedVocabScore))"
         )
         debugLog("    -> \(shouldReplace ? "REPLACE" : "KEEP") (vocab \(shouldReplace ? ">" : "<=") original)")
+        if boostedVocabScore > originalCtcScore && !shouldReplace {
+            let greedyScore =
+                CtcAlignmentValidator.bestOverlappingGreedyScore(
+                    candidateStartFrame: spanStartFrame,
+                    candidateEndFrame: spanEndFrame,
+                    alignments: ctcWordAlignments
+                ) ?? -.infinity
+            debugLog(
+                "    [CTC-ALIGN] vetoed '\(candidate.vocabTerm)': boosted="
+                    + "\(String(format: "%.2f", boostedVocabScore)) <= greedy=\(String(format: "%.2f", greedyScore))"
+            )
+        }
 
         // Preserve capitalization from original
         let firstOriginalWord =
