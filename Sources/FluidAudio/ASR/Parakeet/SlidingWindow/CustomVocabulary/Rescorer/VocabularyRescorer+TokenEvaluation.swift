@@ -116,6 +116,24 @@ extension VocabularyRescorer {
         // CTC-vs-CTC comparison
         var shouldReplace = boostedVocabScore > originalCtcScore
 
+        // LARGE-VOCAB RAW-ACOUSTIC-MARGIN GATE:
+        //
+        // The comparison above adds the full cbw boost before comparing, so a
+        // distractor whose *raw* (pre-boost) acoustic score is far below the
+        // original word can still win on the boost alone. Require the raw vocab
+        // score to stay within `slack` of the original — the distractor must
+        // have genuine acoustic support. Restricted to large vocabularies; the
+        // small-dictionary path is unchanged.
+        if shouldReplace {
+            shouldReplace = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
+                rawVocabScore: vocabCtcScore,
+                originalScore: originalCtcScore,
+                slack: ContextBiasingConstants.largeVocabRawAcousticMarginSlack,
+                vocabularyTermCount: vocabulary.terms.count,
+                largeVocabThreshold: ContextBiasingConstants.largeVocabThreshold
+            )
+        }
+
         // LARGE-VOCAB FALSE-ACCEPT VETO:
         //
         // The CTC-vs-CTC comparison above can be flipped by the +cbw boost

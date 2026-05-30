@@ -219,4 +219,61 @@ final class CtcWordAlignmentTests: XCTestCase {
         )
         XCTAssertTrue(passes, "No overlapping greedy word means no veto")
     }
+
+    // MARK: - Raw-acoustic-margin gate (fix #2)
+
+    /// The +cbw boost can flip the CTC-vs-CTC comparison even when the
+    /// distractor's *raw* (pre-boost) acoustic score is far below the original
+    /// word's. The margin gate requires the distractor to have real acoustic
+    /// support — its raw score must not trail the original by more than `slack`.
+    func testRawAcousticMarginVetoesDistractorWithNoAcousticSupport() {
+        // Distractor raw score -6.0 trails the original word -1.0 by 5.0,
+        // well beyond a 1.5 slack: only the boost carried it, so veto.
+        let passes = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
+            rawVocabScore: -6.0,
+            originalScore: -1.0,
+            slack: 1.5,
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertFalse(passes, "Distractor with no raw acoustic support must be vetoed")
+    }
+
+    func testRawAcousticMarginAllowsDistractorWithinSlack() {
+        // Raw score -2.0 trails original -1.0 by only 1.0 (<= slack 1.5): the
+        // distractor has genuine acoustic support, so allow the boost to decide.
+        let passes = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
+            rawVocabScore: -2.0,
+            originalScore: -1.0,
+            slack: 1.5,
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "Distractor with raw support within slack must pass")
+    }
+
+    func testRawAcousticMarginAllowsWhenVocabBeatsOriginalRaw() {
+        // A genuine keyword whose raw score already beats the original passes.
+        let passes = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
+            rawVocabScore: -0.5,
+            originalScore: -1.0,
+            slack: 1.5,
+            vocabularyTermCount: 650,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "Keyword beating the original raw score must pass")
+    }
+
+    func testRawAcousticMarginDisabledForSmallVocab() {
+        // Same large trailing margin, but a small vocabulary leaves the gate
+        // disabled so the proven small-dictionary path is unchanged.
+        let passes = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
+            rawVocabScore: -6.0,
+            originalScore: -1.0,
+            slack: 1.5,
+            vocabularyTermCount: 3,
+            largeVocabThreshold: 10
+        )
+        XCTAssertTrue(passes, "Margin gate must not fire at or below the large-vocab threshold")
+    }
 }

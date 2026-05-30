@@ -218,6 +218,34 @@ enum CtcAlignmentValidator {
         )
     }
 
+    /// Large-vocabulary raw-acoustic-margin gate for the primary path.
+    ///
+    /// The CTC-vs-CTC comparison adds `cbw` to the vocab score before comparing
+    /// against the original word, so the boost alone can flip a correct word to
+    /// an acoustically-weaker distractor. This requires the vocab term's *raw*
+    /// (pre-boost) score to stay within `slack` log-probs of the original — i.e.
+    /// the distractor must have genuine acoustic support, not just the boost.
+    /// Only active above `largeVocabThreshold`; the small-dictionary path is
+    /// already at 100% precision and is left unchanged.
+    ///
+    /// - Parameters:
+    ///   - rawVocabScore: vocab term CTC score WITHOUT the cbw boost.
+    ///   - originalScore: original phrase CTC score (same per-token scale).
+    ///   - slack: maximum allowed deficit of `rawVocabScore` below `originalScore`.
+    ///   - vocabularyTermCount: number of terms in the active vocabulary.
+    ///   - largeVocabThreshold: the size above which the gate activates.
+    /// - Returns: `true` if the replacement may proceed; `false` if vetoed.
+    static func passesLargeVocabRawAcousticMargin(
+        rawVocabScore: Float,
+        originalScore: Float,
+        slack: Float,
+        vocabularyTermCount: Int,
+        largeVocabThreshold: Int
+    ) -> Bool {
+        guard vocabularyTermCount > largeVocabThreshold else { return true }
+        return rawVocabScore >= originalScore - slack
+    }
+
     static func bestOverlappingGreedyScore(
         candidateStartFrame: Int,
         candidateEndFrame: Int,

@@ -191,6 +191,23 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer+ConstrainedCTC.swift` stopword check
     public static let stopwordSpanSimilarity: Float = 0.85
 
+    /// Maximum amount a vocabulary term's *raw* (pre-cbw) CTC score may trail
+    /// the original word's CTC score and still be allowed to replace it, on
+    /// large vocabularies.
+    ///
+    /// Without this gate the +cbw boost alone can flip the CTC-vs-CTC
+    /// comparison: a distractor scoring far below the correctly-decoded word
+    /// (e.g. `prior` vs `priorix`) wins purely on the boost. Requiring the raw
+    /// vocab score to stay within `slack` log-probs of the original forces the
+    /// distractor to have genuine acoustic support before the boost decides.
+    /// Only applied above `largeVocabThreshold`; the small-dictionary path is
+    /// already at 100% precision and is left untouched.
+    ///
+    /// - Value: `2.0` log-probs (per-token normalized scale, matching
+    ///   `ctcWordSpotConstrained`).
+    /// - Used in: `VocabularyRescorer.evaluateCTCMatch`
+    public static let largeVocabRawAcousticMarginSlack: Float = 2.0
+
     // MARK: - Context Biasing Weights
 
     /// Default context-biasing weight (CBW) per NeMo paper.
