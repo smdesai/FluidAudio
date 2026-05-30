@@ -16,23 +16,29 @@ public enum StringUtils {
         guard m > 0 else { return n }
         guard n > 0 else { return m }
 
-        var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
-
-        for i in 0...m { dp[i][0] = i }
-        for j in 0...n { dp[0][j] = j }
+        // Two rolling rows instead of a full (m+1)x(n+1) matrix. This is called
+        // O(V * W) times per utterance by the vocabulary rescorer (once per
+        // vocab term × TDT word), so the per-call 2D allocation dominated
+        // large-vocab rescoring time. Rolling rows give identical results with
+        // a single (n+1) buffer reused across rows.
+        var previous = Array(0...n)
+        var current = [Int](repeating: 0, count: n + 1)
 
         for i in 1...m {
+            current[0] = i
+            let ai = a[i - 1]
             for j in 1...n {
-                let cost = a[i - 1] == b[j - 1] ? 0 : 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,  // deletion
-                    dp[i][j - 1] + 1,  // insertion
-                    dp[i - 1][j - 1] + cost  // substitution
+                let cost = ai == b[j - 1] ? 0 : 1
+                current[j] = min(
+                    previous[j] + 1,  // deletion
+                    current[j - 1] + 1,  // insertion
+                    previous[j - 1] + cost  // substitution
                 )
             }
+            swap(&previous, &current)
         }
 
-        return dp[m][n]
+        return previous[n]
     }
 
     /// Convenience overload for String comparison (character-level distance)

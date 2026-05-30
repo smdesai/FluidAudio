@@ -486,6 +486,12 @@ extension VocabularyRescorer {
         let vocabularyNormalizedSet = buildVocabularyNormalizedSet()
         let multiWordComponentSet = buildMultiWordVocabularyComponentSet()
 
+        // Normalize each TDT word once. The term-centric loop below re-examines
+        // every word for every vocabulary term, so normalizing inside the loop
+        // recomputed this ~V times per word (the dominant large-vocab rescoring
+        // cost). Precompute once and index by word position.
+        let normalizedWordCache = wordTimings.map { Self.normalizeForSimilarity($0.word) }
+
         // TERM-CENTRIC LOOP: For each vocabulary term, find similar TDT words and run constrained CTC
         for term in vocabulary.terms {
             let vocabTerm = term.text
@@ -540,15 +546,15 @@ extension VocabularyRescorer {
                         let tdtPhrase = spanWords.joined(separator: " ")
                         let normalizedPhrase = Self.normalizeForSimilarity(tdtPhrase)
                         guard !normalizedPhrase.isEmpty else { continue }
-                        let normalizedSpanWords = spanIndices.map { Self.normalizeForSimilarity(wordTimings[$0].word) }
+                        let normalizedSpanWords = spanIndices.map { normalizedWordCache[$0] }
                         guard multiWordSpanHasAnchoredEdge(spanWords: normalizedSpanWords, forms: multiWordForms) else {
                             continue
                         }
                         let previousWord =
-                            startIdx > 0 ? Self.normalizeForSimilarity(wordTimings[startIdx - 1].word) : nil
+                            startIdx > 0 ? normalizedWordCache[startIdx - 1] : nil
                         let nextIdx = startIdx + spanLength
                         let nextWord =
-                            nextIdx < wordTimings.count ? Self.normalizeForSimilarity(wordTimings[nextIdx].word) : nil
+                            nextIdx < wordTimings.count ? normalizedWordCache[nextIdx] : nil
                         guard
                             !spanHasAdjacentOmittedVocabEdge(
                                 spanWords: normalizedSpanWords,
@@ -636,7 +642,7 @@ extension VocabularyRescorer {
                     guard !replacedIndices.contains(wordIdx) else { continue }
 
                     let tdtWord = timing.word
-                    let normalizedWord = Self.normalizeForSimilarity(tdtWord)
+                    let normalizedWord = normalizedWordCache[wordIdx]
                     guard !normalizedWord.isEmpty else { continue }
 
                     // Skip if already exact match to canonical (no replacement needed)
@@ -677,11 +683,11 @@ extension VocabularyRescorer {
                     // Pre-compute normalized adjacent words (only if needed)
                     let normalized2: String? =
                         (wordIdx + 1 < wordTimings.count && !replacedIndices.contains(wordIdx + 1))
-                        ? Self.normalizeForSimilarity(wordTimings[wordIdx + 1].word)
+                        ? normalizedWordCache[wordIdx + 1]
                         : nil
                     let normalized3: String? =
                         (wordIdx + 2 < wordTimings.count && !replacedIndices.contains(wordIdx + 2))
-                        ? Self.normalizeForSimilarity(wordTimings[wordIdx + 2].word)
+                        ? normalizedWordCache[wordIdx + 2]
                         : nil
 
                     // 2-word compound matching
@@ -747,7 +753,7 @@ extension VocabularyRescorer {
                     // STOPWORD CHECKS
                     let spanWords =
                         matchedSpanLength >= 2
-                        ? (0..<matchedSpanLength).map { Self.normalizeForSimilarity(wordTimings[wordIdx + $0].word) }
+                        ? (0..<matchedSpanLength).map { normalizedWordCache[wordIdx + $0] }
                         : []
                     let (shouldSkipStopword, adjustedSimilarity) = checkStopwordRules(
                         normalizedWord: normalizedWord,
