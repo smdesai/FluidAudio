@@ -97,7 +97,7 @@ public enum CtcEarningsBenchmark {
                     singleFileId = arguments[i + 1]
                     i += 1
                 }
-            case "--tdt-version":
+            case "--tdt-version", "--model-version":
                 if i + 1 < arguments.count {
                     switch arguments[i + 1].lowercased() {
                     case "v2", "2":
@@ -107,7 +107,7 @@ public enum CtcEarningsBenchmark {
                     case "110m", "ctc-110m", "tdt-ctc-110m":
                         tdtVersion = .tdtCtc110m
                     default:
-                        break
+                        print("WARNING: Invalid TDT version '\(arguments[i + 1])'. Using 'v2'.")
                     }
                     i += 1
                 }
@@ -1312,6 +1312,8 @@ public enum CtcEarningsBenchmark {
 
             Options:
                 --data-dir <path>     Path to earnings test dataset (auto-detected if downloaded)
+                --tdt-version <ver>   TDT model for transcription: 'v2' (default), 'v3', or '110m'
+                                      (alias: --model-version)
                 --ctc-model <path>    Path to CTC model directory (auto-detected if in standard location)
                 --ctc-variant <var>   CTC model variant: '110m' (default) or '06b'
                                       - 110m: Parakeet CTC 110M (hybrid TDT+CTC, blank-dominant)
