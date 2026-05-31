@@ -264,6 +264,29 @@ final class CtcWordAlignmentTests: XCTestCase {
         XCTAssertTrue(passes, "Keyword beating the original raw score must pass")
     }
 
+    // MARK: - High-similarity bypass (recall lever)
+
+    func testHighSimilarityBypassAboveCutoff() {
+        // A 0.88 string match to a vocab term is almost certainly the real
+        // term (TDT mis-spelled it), so the acoustic gates are bypassed.
+        XCTAssertTrue(
+            CtcAlignmentValidator.highStringSimilarityBypass(similarity: 0.88, cutoff: 0.85))
+        XCTAssertTrue(
+            CtcAlignmentValidator.highStringSimilarityBypass(similarity: 0.85, cutoff: 0.85),
+            "cutoff is inclusive")
+    }
+
+    func testHighSimilarityBypassBelowCutoffDoesNotFire() {
+        // Distractors live below the cutoff (prior/Priorix 0.714,
+        // night/knight 0.833, adbry/adbri 0.80), so the gates stay active.
+        XCTAssertFalse(
+            CtcAlignmentValidator.highStringSimilarityBypass(similarity: 0.833, cutoff: 0.85))
+        XCTAssertFalse(
+            CtcAlignmentValidator.highStringSimilarityBypass(similarity: 0.80, cutoff: 0.85))
+        XCTAssertFalse(
+            CtcAlignmentValidator.highStringSimilarityBypass(similarity: 0.714, cutoff: 0.85))
+    }
+
     func testRawAcousticMarginDisabledForSmallVocab() {
         // Same large trailing margin, but a small vocabulary leaves the gate
         // disabled so the proven small-dictionary path is unchanged.

@@ -244,6 +244,24 @@ public enum ContextBiasingConstants {
     /// - Used in: `VocabularyRescorer.evaluateCTCMatch`
     public static let largeVocabRawAcousticMarginSlack: Float = 2.0
 
+    /// String-similarity cutoff above which the large-vocab acoustic gates
+    /// (alignment veto + raw-acoustic margin) are bypassed.
+    ///
+    /// At very high string similarity a TDT word is almost certainly a
+    /// mis-spelling of the real keyword, not a distractor — but the acoustic
+    /// gates over-reject it because the mis-spelled original is itself a strong
+    /// acoustic competitor (it is the greedy argmax word). Bypassing the gates
+    /// above this cutoff recovers those true corrections.
+    ///
+    /// Tuned on FDA-extended keyword(650), v3, 600 files, from the gate-veto
+    /// tradeoff surface (recall gain / false-accept cost of bypassing both
+    /// gates at cutoff C): 0.85 -> +34 / +2; 0.82 -> +43 / +3; 0.80 -> +50 / +3.
+    /// Every documented distractor sits below 0.85 (prior/Priorix 0.714,
+    /// night/knight 0.833, adbry/adbri 0.80), so 0.85 is the safe knee.
+    ///
+    /// - Value: `0.85`. Overridable via `HIGH_SIM_BYPASS` for sweeps.
+    public static let highSimilarityGateBypass: Float = 0.85
+
     // MARK: - Context Biasing Weights
 
     /// Default context-biasing weight (CBW) per NeMo paper.

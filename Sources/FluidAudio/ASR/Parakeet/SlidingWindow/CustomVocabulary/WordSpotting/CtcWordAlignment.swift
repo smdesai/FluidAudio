@@ -246,6 +246,24 @@ enum CtcAlignmentValidator {
         return rawVocabScore >= originalScore - slack
     }
 
+    /// High string-similarity bypass for the large-vocab acoustic gates.
+    ///
+    /// When a TDT word is a very close string match to a vocabulary term
+    /// (e.g. `amphidase` -> `Amphadase` 0.89, `cosentix` -> `Cosentyx` 0.88),
+    /// it is almost certainly the real keyword the speaker said, mis-spelled by
+    /// the acoustic model. In that regime the alignment veto (fix#1) and
+    /// raw-acoustic margin (fix#2) systematically over-reject, because the
+    /// mis-spelled original IS the greedy argmax word and a strong per-token
+    /// acoustic competitor. Measured on FDA-extended v3, bypassing both gates
+    /// above 0.85 recovers ~34 true-keyword corrections for ~2 distractor
+    /// false-accepts; every documented distractor (prior/Priorix 0.714,
+    /// night/knight 0.833, adbry/adbri 0.80) sits below 0.85.
+    ///
+    /// - Returns: `true` if string similarity is high enough to skip the gates.
+    static func highStringSimilarityBypass(similarity: Float, cutoff: Float) -> Bool {
+        return similarity >= cutoff
+    }
+
     static func bestOverlappingGreedyScore(
         candidateStartFrame: Int,
         candidateEndFrame: Int,

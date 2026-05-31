@@ -25,6 +25,14 @@ extension VocabularyRescorer {
     static let gateTraceEnabled: Bool =
         ProcessInfo.processInfo.environment["FA_GATE_TRACE"] == "1"
 
+    /// String-similarity cutoff above which the large-vocab acoustic gates are
+    /// bypassed (recall lever). Defaults to
+    /// `ContextBiasingConstants.highSimilarityGateBypass`; `HIGH_SIM_BYPASS`
+    /// overrides it for sweeps.
+    static let highSimilarityGateBypass: Float =
+        ProcessInfo.processInfo.environment["HIGH_SIM_BYPASS"].flatMap { Float($0) }
+        ?? ContextBiasingConstants.highSimilarityGateBypass
+
     // MARK: - CTC Match Evaluation
 
     /// Evaluate a CTC match candidate and determine if replacement should occur.
@@ -130,6 +138,19 @@ extension VocabularyRescorer {
         var shouldReplace = boostedVocabScore > originalCtcScore
         let passedCtcVsCtc = shouldReplace
 
+        // HIGH-SIMILARITY BYPASS (recall lever):
+        //
+        // A very close string match to a vocabulary term is almost certainly
+        // the real keyword the speaker said, mis-spelled by TDT (`amphidase` ->
+        // `Amphadase` 0.89). The two acoustic gates below systematically
+        // over-reject these because the mis-spelled original is itself a strong
+        // acoustic competitor (it is the greedy argmax word). Above the cutoff
+        // we skip both gates; every known distractor sits below it.
+        let highSimBypass = CtcAlignmentValidator.highStringSimilarityBypass(
+            similarity: candidate.similarity,
+            cutoff: Self.highSimilarityGateBypass
+        )
+
         // LARGE-VOCAB RAW-ACOUSTIC-MARGIN GATE:
         //
         // The comparison above adds the full cbw boost before comparing, so a
@@ -139,7 +160,7 @@ extension VocabularyRescorer {
         // have genuine acoustic support. Restricted to large vocabularies; the
         // small-dictionary path is unchanged.
         var marginVetoed = false
-        if shouldReplace {
+        if shouldReplace && !highSimBypass {
             shouldReplace = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
                 rawVocabScore: vocabCtcScore,
                 originalScore: originalCtcScore,
@@ -163,7 +184,7 @@ extension VocabularyRescorer {
         // veto is restricted to large vocabularies; the small-dictionary path
         // is already at 100% precision and is left unchanged.
         var alignmentVetoed = false
-        if shouldReplace {
+        if shouldReplace && !highSimBypass {
             shouldReplace = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
                 boostedVocabScore: boostedVocabScore,
                 candidateStartFrame: spanStartFrame,
