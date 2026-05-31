@@ -19,6 +19,12 @@ extension VocabularyRescorer {
         ProcessInfo.processInfo.environment["MID_WORD_SIMILARITY"].flatMap { Float($0) }
         ?? ContextBiasingConstants.extraLargeVocabMidWordSimilarity
 
+    /// When set (env `FA_GATE_TRACE=1`), emit one stderr line per candidate
+    /// vetoed by the large-vocab acoustic gates, attributing fix#1 vs fix#2.
+    /// Diagnostic only.
+    static let gateTraceEnabled: Bool =
+        ProcessInfo.processInfo.environment["FA_GATE_TRACE"] == "1"
+
     // MARK: - CTC Match Evaluation
 
     /// Evaluate a CTC match candidate and determine if replacement should occur.
@@ -122,6 +128,7 @@ extension VocabularyRescorer {
 
         // CTC-vs-CTC comparison
         var shouldReplace = boostedVocabScore > originalCtcScore
+        let passedCtcVsCtc = shouldReplace
 
         // LARGE-VOCAB RAW-ACOUSTIC-MARGIN GATE:
         //
@@ -131,6 +138,7 @@ extension VocabularyRescorer {
         // score to stay within `slack` of the original — the distractor must
         // have genuine acoustic support. Restricted to large vocabularies; the
         // small-dictionary path is unchanged.
+        var marginVetoed = false
         if shouldReplace {
             shouldReplace = CtcAlignmentValidator.passesLargeVocabRawAcousticMargin(
                 rawVocabScore: vocabCtcScore,
@@ -139,6 +147,7 @@ extension VocabularyRescorer {
                 vocabularyTermCount: vocabulary.terms.count,
                 largeVocabThreshold: ContextBiasingConstants.largeVocabThreshold
             )
+            marginVetoed = !shouldReplace
         }
 
         // LARGE-VOCAB FALSE-ACCEPT VETO:
@@ -153,6 +162,7 @@ extension VocabularyRescorer {
         // by token count, matching `CtcWordAlignment.normalizedScore`). The
         // veto is restricted to large vocabularies; the small-dictionary path
         // is already at 100% precision and is left unchanged.
+        var alignmentVetoed = false
         if shouldReplace {
             shouldReplace = CtcAlignmentValidator.candidatePassesLargeVocabAlignmentVeto(
                 boostedVocabScore: boostedVocabScore,
@@ -162,6 +172,29 @@ extension VocabularyRescorer {
                 vocabularyTermCount: vocabulary.terms.count,
                 largeVocabThreshold: ContextBiasingConstants.largeVocabThreshold
             )
+            alignmentVetoed = !shouldReplace
+        }
+
+        // Gate attribution trace (env FA_GATE_TRACE=1). One stderr line per
+        // candidate that cleared similarity + CTC-vs-CTC but was then vetoed,
+        // so we can attribute recall losses to fix#2 (margin) vs fix#1
+        // (alignment) before tuning. Diagnostic only — no behavior change.
+        if Self.gateTraceEnabled && passedCtcVsCtc && !shouldReplace {
+            let greedy =
+                CtcAlignmentValidator.bestOverlappingGreedyScore(
+                    candidateStartFrame: spanStartFrame,
+                    candidateEndFrame: spanEndFrame,
+                    alignments: ctcWordAlignments
+                ) ?? Float.nan
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format:
+                            "GATE-TRACE %@->%@ sim=%.2f gate=%@ rawVocab=%.2f orig=%.2f boosted=%.2f greedy=%.2f\n",
+                        candidate.originalPhrase, candidate.vocabTerm, candidate.similarity,
+                        marginVetoed ? "margin(fix2)" : (alignmentVetoed ? "alignment(fix1)" : "ctc"),
+                        vocabCtcScore, originalCtcScore, boostedVocabScore, greedy
+                    ).utf8))
         }
 
         // Debug output
