@@ -180,6 +180,42 @@ public enum ContextBiasingConstants {
     /// floor to avoid float-rounding around exact 0.50 similarities.
     public static let smallVocabLongWordPhoneticSimilarity: Float = 0.40
 
+    /// Similarity floor for mid-length (5-char) single words on extra-large
+    /// vocabularies.
+    ///
+    /// 5-character common words sit in a dead-zone: longer than
+    /// `shortWordMaxLength` (4) so the short-word tier (0.80) does not apply,
+    /// shorter than `longWordMinLength` (6) so the long-word tier (0.70) does
+    /// not apply. They fell through to the bare 0.60 extra-large floor, which
+    /// let acoustically-similar distractors replace them (`first` -> `Kirsty`
+    /// 0.667, `prior` -> `Priorix` 0.714, `clean` -> `Creon` 0.600). Raising
+    /// the floor to 0.72 for this length on extra-large vocabularies blocks
+    /// those while leaving real 5-char keyword recoveries (which clear 0.72)
+    /// intact. Applies only above `extraLargeVocabThreshold`; smaller
+    /// vocabularies keep their existing tiers.
+    ///
+    /// Tuned on FDA-extended keyword(650), v3, 600 files. Sweep
+    /// (false-accepts / WER / recall):
+    /// - off:  58 FA / 2.81% / 72.4%
+    /// - 0.70: 19 FA / 2.75% / 71.1%  (`prior`->`Priorix` 0.714 survives)
+    /// - 0.72:  1 FA / 2.71% / 70.6%  (knee — best WER, near-zero FA)
+    /// - 0.75:  1 FA / 2.71% / 70.6%  (no extra benefit, same recall cost)
+    /// 0.72 is the knee: it clears 0.714 (`prior`/`Priorix`) while 0.75
+    /// over-tightens with no additional FA reduction.
+    ///
+    /// - Value: `0.72`
+    /// - Used in: `ContextBiasingConstants.singleWordSimilarityFloor`,
+    ///   overridable via `MID_WORD_SIMILARITY` for sweeps.
+    public static let extraLargeVocabMidWordSimilarity: Float = 0.72
+
+    /// Inclusive lower bound of the mid-length single-word tier (exclusive
+    /// upper bound is `longWordMinLength`). A word whose length is in
+    /// `[midWordMinLength, longWordMinLength)` uses the mid-length floor on
+    /// extra-large vocabularies.
+    ///
+    /// - Value: `5`
+    public static let midWordMinLength: Int = 5
+
     /// Similarity threshold for spans containing stopwords.
     ///
     /// When a multi-word span contains common stopwords (articles, prepositions,
@@ -329,6 +365,47 @@ public enum ContextBiasingConstants {
             minSimilarity = 0.50
         }
         return VocabSizeConfig(minSimilarity: minSimilarity, cbw: 4.5)
+    }
+
+    /// Length-aware minimum similarity floor for a single-word replacement.
+    ///
+    /// Encapsulates the length-tier logic so it has one tested source of truth.
+    /// Tiers (only the relevant one applies, in order):
+    /// - large vocab (> `largeVocabThreshold`) + word length <=
+    ///   `shortWordMaxLength` -> `largeVocabShortWordSimilarity` (0.80)
+    /// - extra-large vocab (> `extraLargeVocabThreshold`) + word length in
+    ///   `[midWordMinLength, longWordMinLength)` -> `extraLargeVocabMidWordSimilarity`
+    ///   (0.75) — closes the 5-char dead-zone (`first`->`Kirsty`, `prior`->`Priorix`).
+    /// - word length >= `longWordMinLength` + length ratio >=
+    ///   `lengthRatioThreshold` -> `longWordSimilarity` (0.70)
+    /// - otherwise -> `base`
+    ///
+    /// The short-ratio-short-word and small-vocab-phonetic branches in
+    /// `checkLengthRatioRules` depend on `currentSimilarity` and stay inline;
+    /// this helper covers the size/length tiers that do not.
+    ///
+    /// - Returns: the minimum similarity a replacement must clear, never below `base`.
+    public static func singleWordSimilarityFloor(
+        wordLength: Int,
+        vocabTermLength: Int,
+        vocabularyTermCount: Int,
+        base: Float
+    ) -> Float {
+        if vocabularyTermCount > largeVocabThreshold && wordLength <= shortWordMaxLength {
+            return max(base, largeVocabShortWordSimilarity)
+        }
+        if vocabularyTermCount > extraLargeVocabThreshold
+            && wordLength >= midWordMinLength
+            && wordLength < longWordMinLength
+        {
+            return max(base, extraLargeVocabMidWordSimilarity)
+        }
+        let lengthRatio =
+            vocabTermLength > 0 ? Float(wordLength) / Float(vocabTermLength) : 0
+        if wordLength >= longWordMinLength && lengthRatio >= lengthRatioThreshold {
+            return max(base, longWordSimilarity)
+        }
+        return base
     }
 
     /// Baseline token count for multi-token phrase threshold adjustment.

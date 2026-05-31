@@ -126,4 +126,46 @@ final class ContextBiasingConstantsTests: XCTestCase {
         let effective = max(largeVocabConfig.minSimilarity, callerThreshold)
         XCTAssertEqual(effective, 0.55, accuracy: 0.01, "Size-based stricter threshold should win")
     }
+
+    // MARK: - Single-word length-tier floor (fix #3: 5-6 char dead-zone)
+
+    private let base: Float = 0.60  // extra-large vocab floor
+
+    func testMidLengthDeadZoneRaisedForExtraLargeVocab() {
+        // 5-char common word vs 6-char distractor (first/kirsty, prior/priorix,
+        // clean/creon) previously fell through every tier to the 0.60 floor.
+        // The new mid-length tier must raise the bar above their similarity.
+        let floor = ContextBiasingConstants.singleWordSimilarityFloor(
+            wordLength: 5, vocabTermLength: 6, vocabularyTermCount: 650, base: base)
+        XCTAssertGreaterThan(
+            floor, 0.667, "5-char word in extra-large vocab must be gated above first->kirsty sim (0.667)")
+        XCTAssertGreaterThan(floor, 0.714, "must also exceed prior->priorix sim (0.714)")
+    }
+
+    func testMidLengthTierInertForSmallVocab() {
+        // Small vocab must keep the existing floor (path is 100% precision).
+        let floor = ContextBiasingConstants.singleWordSimilarityFloor(
+            wordLength: 5, vocabTermLength: 6, vocabularyTermCount: 5, base: 0.50)
+        XCTAssertEqual(floor, 0.50, accuracy: 0.001, "small vocab unchanged")
+    }
+
+    func testShortWordTierUnchanged() {
+        // <=4 char words in large vocab still use the 0.80 short-word floor.
+        let floor = ContextBiasingConstants.singleWordSimilarityFloor(
+            wordLength: 4, vocabTermLength: 7, vocabularyTermCount: 650, base: base)
+        XCTAssertEqual(floor, ContextBiasingConstants.largeVocabShortWordSimilarity, accuracy: 0.001)
+    }
+
+    func testLongWordTierUnchanged() {
+        // >=6 char words with high length ratio still use the 0.70 long-word floor.
+        let floor = ContextBiasingConstants.singleWordSimilarityFloor(
+            wordLength: 8, vocabTermLength: 9, vocabularyTermCount: 650, base: base)
+        XCTAssertEqual(floor, ContextBiasingConstants.longWordSimilarity, accuracy: 0.001)
+    }
+
+    func testMidLengthTierConstantInRange() {
+        let t = ContextBiasingConstants.extraLargeVocabMidWordSimilarity
+        XCTAssertGreaterThan(t, ContextBiasingConstants.minSimilarityFloor)
+        XCTAssertLessThanOrEqual(t, 1.0)
+    }
 }

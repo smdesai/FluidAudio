@@ -12,6 +12,13 @@ extension VocabularyRescorer {
         logger.debug(message())
     }
 
+    /// Mid-length (5-char) similarity floor for extra-large vocabularies.
+    /// Defaults to `ContextBiasingConstants.extraLargeVocabMidWordSimilarity`;
+    /// `MID_WORD_SIMILARITY` overrides it for threshold sweeps.
+    static let midWordSimilarityThreshold: Float =
+        ProcessInfo.processInfo.environment["MID_WORD_SIMILARITY"].flatMap { Float($0) }
+        ?? ContextBiasingConstants.extraLargeVocabMidWordSimilarity
+
     // MARK: - CTC Match Evaluation
 
     /// Evaluate a CTC match candidate and determine if replacement should occur.
@@ -326,6 +333,25 @@ extension VocabularyRescorer {
             if adjusted > minSimilarity && currentSimilarity >= minSimilarity {
                 debugLog(
                     "    [LENGTH] '\(normalizedWord)' short in large vocab, raising threshold to "
+                        + "\(String(format: "%.2f", adjusted))"
+                )
+            }
+            return adjusted
+        }
+
+        // Mid-length (5-char) dead-zone on extra-large vocabularies: too long
+        // for the short-word tier, too short for the long-word tier, so these
+        // common words (`first`->`Kirsty`, `prior`->`Priorix`, `clean`->`Creon`)
+        // previously fell through to the bare floor. Raise the bar.
+        if vocabulary.terms.count > ContextBiasingConstants.extraLargeVocabThreshold
+            && normalizedWord.count >= ContextBiasingConstants.midWordMinLength
+            && normalizedWord.count < ContextBiasingConstants.longWordMinLength
+        {
+            let adjusted = max(minSimilarity, Self.midWordSimilarityThreshold)
+            if adjusted > minSimilarity && currentSimilarity >= minSimilarity {
+                debugLog(
+                    "    [LENGTH] '\(normalizedWord)' mid-length in extra-large vocab "
+                        + "(ratio=\(String(format: "%.2f", lengthRatio))), raising threshold to "
                         + "\(String(format: "%.2f", adjusted))"
                 )
             }
