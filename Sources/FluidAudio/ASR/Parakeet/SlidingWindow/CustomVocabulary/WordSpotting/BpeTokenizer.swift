@@ -63,15 +63,25 @@ public final class BpeTokenizer: Sendable {
             throw Error.missingField("model.vocab")
         }
 
-        // Parse merges: ["a b", "c d", ...]
-        guard let mergesArray = model["merges"] as? [String] else {
+        // Parse merges. Two serializations exist across HuggingFace
+        // `tokenizers` versions and both are valid BPE:
+        //   - legacy string form:  ["a b", "c d", ...]   (tokenizers < 0.20)
+        //   - array form:          [["a","b"], ["c","d"], ...]  (tokenizers >= 0.20)
+        // Accept both so models exported by newer converters load unchanged.
+        let merges: [(String, String)]
+        if let mergesStrings = model["merges"] as? [String] {
+            merges = mergesStrings.compactMap { mergeStr -> (String, String)? in
+                let parts = mergeStr.split(separator: " ", maxSplits: 1)
+                guard parts.count == 2 else { return nil }
+                return (String(parts[0]), String(parts[1]))
+            }
+        } else if let mergesPairs = model["merges"] as? [[String]] {
+            merges = mergesPairs.compactMap { pair -> (String, String)? in
+                guard pair.count == 2 else { return nil }
+                return (pair[0], pair[1])
+            }
+        } else {
             throw Error.missingField("model.merges")
-        }
-
-        let merges = mergesArray.compactMap { mergeStr -> (String, String)? in
-            let parts = mergeStr.split(separator: " ", maxSplits: 1)
-            guard parts.count == 2 else { return nil }
-            return (String(parts[0]), String(parts[1]))
         }
 
         // Parse added_tokens (special tokens like <unk>, <pad>)

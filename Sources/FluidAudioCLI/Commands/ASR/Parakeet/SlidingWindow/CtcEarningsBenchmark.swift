@@ -8,6 +8,17 @@ import Foundation
 /// TDT provides low WER transcription, CTC provides high recall dictionary detection.
 public enum CtcEarningsBenchmark {
 
+    private struct PreparedBenchmarkVocabulary {
+        let words: [String]
+        let normalizedTerms: [NormalizedVocabularyTerm]
+        let context: CustomVocabularyContext
+    }
+
+    private struct NormalizedVocabularyTerm: Codable, Sendable {
+        let word: String
+        let normalized: String
+    }
+
     /// Keywords mode for vocabulary selection
     /// - chunk: Use dictionary.txt (chunk-level keywords) for both vocabulary and scoring
     /// - file: Use keywords.txt (file-level keywords) for vocabulary, dictionary.txt for scoring
@@ -49,6 +60,7 @@ public enum CtcEarningsBenchmark {
         var outputFile = "ctc_earnings_benchmark.json"
         var maxFiles: Int? = nil
         var ctcModelPath: String? = nil
+        var keywordsFileOverride: String? = nil
         var singleFileId: String? = nil
         // Note: Using v2 by default because v3 has issues with certain audio files
         // (returns empty transcription for ~7 files in Earnings22 dataset)
@@ -90,6 +102,11 @@ public enum CtcEarningsBenchmark {
             case "--ctc-model":
                 if i + 1 < arguments.count {
                     ctcModelPath = arguments[i + 1]
+                    i += 1
+                }
+            case "--keywords-file":
+                if i + 1 < arguments.count {
+                    keywordsFileOverride = arguments[i + 1]
                     i += 1
                 }
             case "--file-id":
@@ -189,6 +206,9 @@ public enum CtcEarningsBenchmark {
         print("  CTC variant: \(ctcVariant.displayName)")
         print("  CTC model: \(ctcModelPath ?? "not found")")
         print("  Keywords mode: \(keywordsMode.rawValue)")
+        if let keywordsFileOverride {
+            print("  Keywords file override: \(keywordsFileOverride)")
+        }
 
         guard let finalDataDir = dataDir else {
             print("ERROR: Data directory not found")
@@ -211,28 +231,69 @@ public enum CtcEarningsBenchmark {
         let dataDirResolved = finalDataDir
 
         do {
+            let profileEnabled = ProcessInfo.processInfo.environment["FA_BENCH_PROFILE"] == "1"
+            let commandT0 = Date()
             // Load TDT models for transcription
             print(
                 "Loading TDT models (\(tdtVersion == .v2 ? "v2" : tdtVersion == .tdtCtc110m ? "110m" : "v3")) for transcription..."
             )
+            let tdtLoadT0 = Date()
             let tdtModels = try await AsrModels.downloadAndLoad(version: tdtVersion)
             let asrManager = AsrManager(config: .default)
             try await asrManager.loadModels(tdtModels)
+            let tdtLoadDuration = Date().timeIntervalSince(tdtLoadT0)
             print("TDT models loaded successfully")
 
             // Load CTC models for keyword spotting
             print("Loading CTC models from: \(modelPath)")
+            let ctcLoadT0 = Date()
             let modelDir = URL(fileURLWithPath: modelPath)
             let ctcModels = try await CtcModels.loadDirect(from: modelDir, variant: ctcVariant)
+            let ctcLoadDuration = Date().timeIntervalSince(ctcLoadT0)
             print(
                 "Loaded CTC vocabulary with \(ctcModels.vocabulary.count) tokens, variant: \(ctcModels.variant.displayName)"
             )
+            let ctcTokenizer = try? await CtcTokenizer.load(from: modelDir)
+            if ctcTokenizer != nil {
+                print("Loaded CTC tokenizer from tokenizer.json")
+            } else {
+                print("CTC tokenizer unavailable; falling back to greedy vocab tokenization")
+            }
 
             // Create keyword spotter
             let vocabSize = ctcModels.vocabulary.count
             let blankId = vocabSize  // Blank is at index = vocab_size
             let spotter = CtcKeywordSpotter(models: ctcModels, blankId: blankId)
             print("Created CTC spotter with blankId=\(blankId)")
+
+            let preparedVocabulary: PreparedBenchmarkVocabulary?
+            let vocabularyT0 = Date()
+            if let keywordsFileOverride {
+                let overrideURL = URL(fileURLWithPath: (keywordsFileOverride as NSString).expandingTildeInPath)
+                preparedVocabulary = try prepareBenchmarkVocabulary(
+                    from: overrideURL,
+                    ctcVocabulary: ctcModels.vocabulary,
+                    ctcTokenizer: ctcTokenizer
+                )
+                print("Loaded shared keywords override with \(preparedVocabulary?.words.count ?? 0) entries")
+            } else {
+                preparedVocabulary = nil
+            }
+            let vocabularyDuration = Date().timeIntervalSince(vocabularyT0)
+
+            let sharedRescorer: VocabularyRescorer?
+            let rescorerCreateT0 = Date()
+            if let preparedVocabulary {
+                sharedRescorer = try await VocabularyRescorer.create(
+                    spotter: spotter,
+                    vocabulary: preparedVocabulary.context,
+                    config: .default,
+                    ctcModelDirectory: URL(fileURLWithPath: modelPath)
+                )
+            } else {
+                sharedRescorer = nil
+            }
+            let rescorerCreateDuration = Date().timeIntervalSince(rescorerCreateT0)
 
             // Collect test files
             let dataDirURL = URL(fileURLWithPath: dataDirResolved)
@@ -271,10 +332,12 @@ public enum CtcEarningsBenchmark {
             var totalDictFound = 0
             var totalAudioDuration = 0.0
             var totalProcessingTime = 0.0
+            var totalWallProcessingTime = 0.0
             // Precision/Recall metrics: word found AND in correct position
             var totalTruePositives = 0  // In reference AND in hypothesis
             var totalFalsePositives = 0  // In hypothesis but NOT in reference
             var totalFalseNegatives = 0  // In reference but NOT in hypothesis
+            var totalDistractorFalseAccepts = 0  // Active-vocab terms in hypothesis but not reference/check words
 
             // Pre-compute beam config + tokenizer URL once so each per-file
             // invocation doesn't re-load tokenizer.model.
@@ -292,7 +355,8 @@ public enum CtcEarningsBenchmark {
             }
 
             for (index, fileId) in fileIds.enumerated() {
-                if let result = try await processFile(
+                let fileWallT0 = Date()
+                if var result = try await processFile(
                     fileId: fileId,
                     dataDir: dataDirURL,
                     asrManager: asrManager,
@@ -301,25 +365,38 @@ public enum CtcEarningsBenchmark {
                     keywordsMode: keywordsMode,
                     useConstrainedCTC: useConstrainedCTC,
                     beamConfigBase: beamConfigOuter,
-                    beamBiasBonus: beamBiasBonus
+                    beamBiasBonus: beamBiasBonus,
+                    rescorerTokenizerDir: URL(fileURLWithPath: modelPath),
+                    vocabularyOverride: preparedVocabulary,
+                    sharedRescorer: sharedRescorer,
+                    ctcTokenizer: ctcTokenizer
                 ) {
+                    let fileWallDuration = Date().timeIntervalSince(fileWallT0)
+                    result["wallProcessingTime"] = round(fileWallDuration * 1000) / 1000
                     results.append(result)
                     totalWer += result["wer"] as? Double ?? 0
                     totalDictChecks += result["dictTotal"] as? Int ?? 0
                     totalDictFound += result["dictFound"] as? Int ?? 0
                     totalAudioDuration += result["audioLength"] as? Double ?? 0
                     totalProcessingTime += result["processingTime"] as? Double ?? 0
+                    totalWallProcessingTime += fileWallDuration
                     totalTruePositives += result["truePositives"] as? Int ?? 0
                     totalFalsePositives += result["falsePositives"] as? Int ?? 0
                     totalFalseNegatives += result["falseNegatives"] as? Int ?? 0
+                    totalDistractorFalseAccepts += result["distractorFalseAccepts"] as? Int ?? 0
 
                     let wer = result["wer"] as? Double ?? 0
                     let dictFound = result["dictFound"] as? Int ?? 0
                     let dictTotal = result["dictTotal"] as? Int ?? 0
+                    let distractorFalseAccepts = result["distractorFalseAccepts"] as? Int ?? 0
+                    let innerProcessing = result["processingTime"] as? Double ?? 0
                     let indexStr = String(format: "[%3d/%d]", index + 1, fileIds.count)
                     let paddedId = fileId.padding(toLength: 25, withPad: " ", startingAt: 0)
                     print(
-                        "\(indexStr) \(paddedId) WER: \(String(format: "%5.1f", wer))%  Dict: \(dictFound)/\(dictTotal)"
+                        "\(indexStr) \(paddedId) WER: \(String(format: "%5.1f", wer))%  "
+                            + "Dict: \(dictFound)/\(dictTotal)  DistractorFA: \(distractorFalseAccepts)  "
+                            + "Wall: \(String(format: "%.2f", fileWallDuration))s "
+                            + "(inner \(String(format: "%.2f", innerProcessing))s)"
                     )
                 }
             }
@@ -354,10 +431,29 @@ public enum CtcEarningsBenchmark {
                 "Vocab Recall: \(String(format: "%.1f", recall * 100))% (TP=\(totalTruePositives), FN=\(totalFalseNegatives))"
             )
             print("Vocab F-score: \(String(format: "%.1f", fscore * 100))%")
+            print("Distractor False Accepts: \(totalDistractorFalseAccepts)")
             print("Total audio: \(String(format: "%.1f", totalAudioDuration))s")
             print("Total processing: \(String(format: "%.1f", totalProcessingTime))s")
+            print("Total wall processing: \(String(format: "%.1f", totalWallProcessingTime))s")
             if totalProcessingTime > 0 {
                 print("RTFx: \(String(format: "%.2f", totalAudioDuration / totalProcessingTime))x")
+            }
+            if totalWallProcessingTime > 0 {
+                print("Wall RTFx: \(String(format: "%.2f", totalAudioDuration / totalWallProcessingTime))x")
+            }
+            if profileEnabled {
+                let commandDuration = Date().timeIntervalSince(commandT0)
+                let measuredSetup = tdtLoadDuration + ctcLoadDuration + vocabularyDuration + rescorerCreateDuration
+                let unaccounted = max(0, commandDuration - measuredSetup - totalWallProcessingTime)
+                print(
+                    "Benchmark Profile: setupTDT=\(String(format: "%.2f", tdtLoadDuration))s "
+                        + "setupCTC=\(String(format: "%.2f", ctcLoadDuration))s "
+                        + "vocab=\(String(format: "%.2f", vocabularyDuration))s "
+                        + "rescorer=\(String(format: "%.2f", rescorerCreateDuration))s "
+                        + "files=\(String(format: "%.2f", totalWallProcessingTime))s "
+                        + "unaccounted=\(String(format: "%.2f", unaccounted))s "
+                        + "command=\(String(format: "%.2f", commandDuration))s"
+                )
             }
             print(String(repeating: "=", count: 60))
 
@@ -374,8 +470,10 @@ public enum CtcEarningsBenchmark {
                 "vocabPrecision": round(precision * 1000) / 1000,
                 "vocabRecall": round(recall * 1000) / 1000,
                 "vocabFscore": round(fscore * 1000) / 1000,
+                "distractorFalseAccepts": totalDistractorFalseAccepts,
                 "totalAudioDuration": round(totalAudioDuration * 100) / 100,
                 "totalProcessingTime": round(totalProcessingTime * 100) / 100,
+                "totalWallProcessingTime": round(totalWallProcessingTime * 100) / 100,
             ]
 
             let output: [String: Any] = [
@@ -427,7 +525,11 @@ public enum CtcEarningsBenchmark {
         keywordsMode: KeywordsMode,
         useConstrainedCTC: Bool,
         beamConfigBase: TdtBeamConfig? = nil,
-        beamBiasBonus: Float = 4.5
+        beamBiasBonus: Float = 4.5,
+        rescorerTokenizerDir: URL? = nil,
+        vocabularyOverride: PreparedBenchmarkVocabulary? = nil,
+        sharedRescorer: VocabularyRescorer? = nil,
+        ctcTokenizer: CtcTokenizer? = nil
     ) async throws -> [String: Any]? {
         let wavFile = dataDir.appendingPathComponent("\(fileId).wav")
         let dictionaryFile = dataDir.appendingPathComponent("\(fileId).dictionary.txt")
@@ -454,7 +556,9 @@ public enum CtcEarningsBenchmark {
         // - chunk: Use dictionary.txt (chunk-level keywords)
         // - file: Use keywords.txt (file-level keywords, all keywords for entire file)
         let vocabularyWords: [String]
-        if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path),
+        if let vocabularyOverride {
+            vocabularyWords = vocabularyOverride.words
+        } else if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path),
             let keywordsContent = try? String(contentsOf: keywordsFile, encoding: .utf8)
         {
             let words =
@@ -483,6 +587,10 @@ public enum CtcEarningsBenchmark {
             checkWords = dictionaryWords
         }
 
+        let profileEnabled = ProcessInfo.processInfo.environment["FA_BENCH_PROFILE"] == "1"
+        let startTime = Date()
+        let audioT0 = Date()
+
         // Load reference text
         let referenceRaw =
             (try? String(contentsOf: textFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -503,8 +611,8 @@ public enum CtcEarningsBenchmark {
         // Resample to 16kHz
         let converter = AudioConverter()
         let samples = try converter.resampleBuffer(buffer)
-
-        let startTime = Date()
+        let audioLoadDuration = Date().timeIntervalSince(audioT0)
+        let tdtT0 = Date()
 
         // BEAM-MODE FAST PATH
         // When --beam-size > 0, skip the standard TDT-then-CTC pipeline and
@@ -514,12 +622,19 @@ public enum CtcEarningsBenchmark {
         // unchanged.
         if let beamConfigBase {
             let vocabFileURL: URL
-            if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path) {
+            if vocabularyOverride != nil {
+                vocabFileURL = dataDir.appendingPathComponent("__unused_keywords_override__.txt")
+            } else if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path) {
                 vocabFileURL = keywordsFile
             } else {
                 vocabFileURL = dictionaryFile
             }
-            let loadedVocab = try CustomVocabularyContext.loadFromSimpleFormat(from: vocabFileURL)
+            let loadedVocab: CustomVocabularyContext
+            if let vocabularyOverride {
+                loadedVocab = vocabularyOverride.context
+            } else {
+                loadedVocab = try CustomVocabularyContext.loadFromSimpleFormat(from: vocabFileURL)
+            }
 
             // Build the bias config: tokenize each vocab term against the
             // TDT vocab. Skip terms that produce no tokens (defensive — the
@@ -598,6 +713,13 @@ public enum CtcEarningsBenchmark {
             var truePositives = 0
             var falsePositives = 0
             var falseNegatives = 0
+            let distractorReport = computeDistractorFalseAccepts(
+                vocabularyTerms: vocabularyOverride?.normalizedTerms
+                    ?? normalizedVocabularyTerms(from: vocabularyWords),
+                checkWords: checkWords,
+                referenceNormalized: referenceNormalized,
+                hypothesisNormalized: hypothesisNormalized
+            )
             for word in checkWords {
                 let wordLower = word.lowercased()
                 let pattern = "\\b\(NSRegularExpression.escapedPattern(for: wordLower))\\b"
@@ -639,6 +761,8 @@ public enum CtcEarningsBenchmark {
                 "truePositives": truePositives,
                 "falsePositives": falsePositives,
                 "falseNegatives": falseNegatives,
+                "distractorFalseAccepts": distractorReport.count,
+                "distractorFalseAcceptedTerms": distractorReport.terms,
                 "audioLength": round(audioLength * 100) / 100,
                 "processingTime": round(processingTime * 1000) / 1000,
                 "ctcDetections": [] as [[String: Any]],
@@ -647,7 +771,8 @@ public enum CtcEarningsBenchmark {
 
         // 1. TDT transcription for low WER
         var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
-        let tdtResult = try await asrManager.transcribe(wavFile, decoderState: &decoderState)
+        let tdtResult = try await asrManager.transcribe(samples, decoderState: &decoderState)
+        let tdtDuration = Date().timeIntervalSince(tdtT0)
 
         // Skip files where TDT returns empty (some audio files cause model issues)
         if tdtResult.text.isEmpty {
@@ -670,42 +795,34 @@ public enum CtcEarningsBenchmark {
             }
         }
 
-        // 2. Build custom vocabulary for CTC keyword spotting
-        // Load using simple format which supports aliases: "word: alias1, alias2, ..."
-        // Then post-process to add CTC token IDs
-        let vocabFileURL: URL
-        if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path) {
-            vocabFileURL = keywordsFile
+        // 2. Build custom vocabulary for CTC keyword spotting. A shared
+        // --keywords-file override is pre-tokenized once in runCLI; otherwise
+        // each file keeps the existing chunk/file vocabulary behavior.
+        let customVocab: CustomVocabularyContext
+        if let vocabularyOverride {
+            customVocab = vocabularyOverride.context
         } else {
-            vocabFileURL = dictionaryFile
-        }
-
-        // Load vocabulary with alias support
-        let loadedVocab = try CustomVocabularyContext.loadFromSimpleFormat(from: vocabFileURL)
-
-        // Post-process: add CTC token IDs for each term
-        var vocabTerms: [CustomVocabularyTerm] = []
-        for term in loadedVocab.terms {
-            let tokenIds = tokenize(term.text, vocabulary: ctcModels.vocabulary)
-            if !tokenIds.isEmpty {
-                let termWithTokens = CustomVocabularyTerm(
-                    text: term.text,
-                    weight: term.weight,
-                    aliases: term.aliases,
-                    tokenIds: nil,
-                    ctcTokenIds: tokenIds
-                )
-                vocabTerms.append(termWithTokens)
+            let vocabFileURL: URL
+            if keywordsMode == .file, fm.fileExists(atPath: keywordsFile.path) {
+                vocabFileURL = keywordsFile
+            } else {
+                vocabFileURL = dictionaryFile
             }
+            customVocab = try prepareBenchmarkVocabulary(
+                from: vocabFileURL,
+                ctcVocabulary: ctcModels.vocabulary,
+                ctcTokenizer: ctcTokenizer
+            ).context
         }
-        let customVocab = CustomVocabularyContext(terms: vocabTerms)
 
         // 3. CTC keyword spotting for high recall dictionary detection
+        let ctcT0 = Date()
         let ctcResult = try await spotter.spotKeywordsWithLogProbs(
             audioSamples: samples,
             customVocabulary: customVocab,
             minScore: nil
         )
+        let ctcDuration = Date().timeIntervalSince(ctcT0)
         let logProbs = ctcResult.logProbs
         let frameDuration = ctcResult.frameDuration
 
@@ -714,20 +831,32 @@ public enum CtcEarningsBenchmark {
         // Set USE_TIMESTAMP_RESCORING=0 to use legacy string-similarity based matching
         let useRescorer = ProcessInfo.processInfo.environment["NO_CTC_RESCORING"] != "1"
         let hypothesis: String
+        var rescoreDuration = 0.0
         if useRescorer {
+            let rescoreT0 = Date()
             // Vocabulary-size-aware thresholds
             let vocabSize = vocabularyWords.count
             let vocabConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: vocabSize)
 
             let rescorerConfig = VocabularyRescorer.Config.default
 
-            let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
-            let rescorer = try await VocabularyRescorer.create(
-                spotter: spotter,
-                vocabulary: customVocab,
-                config: rescorerConfig,
-                ctcModelDirectory: ctcModelDir
-            )
+            // Prefer the explicit --ctc-model directory for the rescorer's
+            // tokenizer so it matches the spotter's CTC model (the tokenizer
+            // must agree with the model's vocab/channel order). Fall back to
+            // the default cache directory.
+            let ctcModelDir =
+                rescorerTokenizerDir ?? CtcModels.defaultCacheDirectory(for: ctcModels.variant)
+            let rescorer: VocabularyRescorer
+            if let sharedRescorer {
+                rescorer = sharedRescorer
+            } else {
+                rescorer = try await VocabularyRescorer.create(
+                    spotter: spotter,
+                    vocabulary: customVocab,
+                    config: rescorerConfig,
+                    ctcModelDirectory: ctcModelDir
+                )
+            }
 
             // Adjust similarity threshold based on vocabulary size
             // Key insight: minSimilarity is the main lever for WER vs Recall trade-off
@@ -770,11 +899,24 @@ public enum CtcEarningsBenchmark {
             } else {
                 hypothesis = tdtResult.text  // No rescoring (missing token timings or --no-constrained-ctc)
             }
+            rescoreDuration = Date().timeIntervalSince(rescoreT0)
         } else {
             hypothesis = tdtResult.text  // Baseline: no CTC corrections
         }
 
         let processingTime = Date().timeIntervalSince(startTime)
+        if profileEnabled {
+            let otherDuration = max(0, processingTime - audioLoadDuration - tdtDuration - ctcDuration - rescoreDuration)
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format:
+                            "BENCH-PROFILE %@ audio=%.3fs tdt=%.3fs ctc=%.3fs rescore=%.3fs other=%.3fs total=%.3fs frames=%d vocab=%d detections=%d\n",
+                        fileId, audioLoadDuration, tdtDuration, ctcDuration, rescoreDuration, otherDuration,
+                        processingTime,
+                        logProbs.count, customVocab.terms.count, ctcResult.detections.count
+                    ).utf8))
+        }
 
         // Normalize texts
         let referenceNormalized = TextNormalizer.normalize(referenceRaw)
@@ -803,16 +945,10 @@ public enum CtcEarningsBenchmark {
         var ctcFoundWords: Set<String> = []
         let checkWordsLowerSet = Set(checkWords.map { $0.lowercased() })
 
-        // 1. CTC detections (deduplicate - only count each word once, only if in checkWords)
-        // Reuse pre-computed logProbs for keyword detection (avoids duplicate CTC inference)
-        let spotResult = spotter.spotKeywordsFromLogProbs(
-            logProbs: logProbs,
-            frameDuration: frameDuration,
-            customVocabulary: customVocab,
-            minScore: nil
-        )
-
-        for detection in spotResult.detections {
+        // 1. CTC detections (deduplicate - only count each word once, only if in checkWords).
+        // Reuse the detections from the initial CTC spotter run; re-running the
+        // context graph over the same logits is a measurable cost in file-keyword mode.
+        for detection in ctcResult.detections {
             let detail: [String: Any] = [
                 "word": detection.term.text,
                 "score": round(Double(detection.score) * 100) / 100,
@@ -863,6 +999,12 @@ public enum CtcEarningsBenchmark {
         var truePositives = 0
         var falsePositives = 0
         var falseNegatives = 0
+        let distractorReport = computeDistractorFalseAccepts(
+            vocabularyTerms: vocabularyOverride?.normalizedTerms ?? normalizedVocabularyTerms(from: vocabularyWords),
+            checkWords: checkWords,
+            referenceNormalized: referenceNormalized,
+            hypothesisNormalized: hypothesisNormalized
+        )
 
         for word in checkWords {
             let wordLower = word.lowercased()
@@ -907,6 +1049,8 @@ public enum CtcEarningsBenchmark {
             "truePositives": truePositives,
             "falsePositives": falsePositives,
             "falseNegatives": falseNegatives,
+            "distractorFalseAccepts": distractorReport.count,
+            "distractorFalseAcceptedTerms": distractorReport.terms,
             "audioLength": round(audioLength * 100) / 100,
             "processingTime": round(processingTime * 1000) / 1000,
             "ctcDetections": detectionDetails,
@@ -914,14 +1058,109 @@ public enum CtcEarningsBenchmark {
         return result
     }
 
+    static func computeDistractorFalseAccepts(
+        vocabularyWords: [String],
+        checkWords: [String],
+        referenceNormalized: String,
+        hypothesisNormalized: String
+    ) -> (count: Int, terms: [String]) {
+        computeDistractorFalseAccepts(
+            vocabularyTerms: normalizedVocabularyTerms(from: vocabularyWords),
+            checkWords: checkWords,
+            referenceNormalized: referenceNormalized,
+            hypothesisNormalized: hypothesisNormalized
+        )
+    }
+
+    private static func computeDistractorFalseAccepts(
+        vocabularyTerms: [NormalizedVocabularyTerm],
+        checkWords: [String],
+        referenceNormalized: String,
+        hypothesisNormalized: String
+    ) -> (count: Int, terms: [String]) {
+        let checkSet = Set(checkWords.map { TextNormalizer.normalize($0).lowercased() })
+        let referenceLower = referenceNormalized.lowercased()
+        let hypothesisLower = hypothesisNormalized.lowercased()
+        var seen = Set<String>()
+        var acceptedTerms: [String] = []
+
+        for term in vocabularyTerms {
+            let word = term.word
+            let normalized = term.normalized
+            guard !normalized.isEmpty else { continue }
+            guard !checkSet.contains(normalized) else { continue }
+            guard seen.insert(normalized).inserted else { continue }
+            guard containsWholeNormalizedTerm(normalized, in: hypothesisLower) else { continue }
+            guard !containsWholeNormalizedTerm(normalized, in: referenceLower) else { continue }
+            acceptedTerms.append(word)
+        }
+
+        return (
+            acceptedTerms.count, acceptedTerms.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        )
+    }
+
+    private static func normalizedVocabularyTerms(from words: [String]) -> [NormalizedVocabularyTerm] {
+        words.map { NormalizedVocabularyTerm(word: $0, normalized: TextNormalizer.normalize($0).lowercased()) }
+    }
+
+    private static func containsWholeNormalizedTerm(_ term: String, in text: String) -> Bool {
+        let pattern = "(?<!\\S)\(NSRegularExpression.escapedPattern(for: term))(?!\\S)"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+            return regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil
+        }
+        return text.components(separatedBy: CharacterSet.whitespacesAndNewlines).contains(term)
+    }
+
+    private static func prepareBenchmarkVocabulary(
+        from url: URL,
+        ctcVocabulary: [Int: String],
+        ctcTokenizer: CtcTokenizer?
+    ) throws -> PreparedBenchmarkVocabulary {
+        let loadedVocab = try CustomVocabularyContext.loadFromSimpleFormat(from: url)
+        var vocabTerms: [CustomVocabularyTerm] = []
+        var words: [String] = []
+        vocabTerms.reserveCapacity(loadedVocab.terms.count)
+        words.reserveCapacity(loadedVocab.terms.count)
+        let tokenToId = ctcTokenizer == nil ? reverseVocabulary(ctcVocabulary) : [:]
+
+        for term in loadedVocab.terms {
+            let tokenIds = ctcTokenizer?.encode(term.text) ?? tokenize(term.text, tokenToId: tokenToId)
+            guard !tokenIds.isEmpty else { continue }
+            vocabTerms.append(
+                CustomVocabularyTerm(
+                    text: term.text,
+                    weight: term.weight,
+                    aliases: term.aliases,
+                    tokenIds: nil,
+                    ctcTokenIds: tokenIds
+                ))
+            words.append(term.text)
+        }
+
+        return PreparedBenchmarkVocabulary(
+            words: words,
+            normalizedTerms: normalizedVocabularyTerms(from: words),
+            context: CustomVocabularyContext(terms: vocabTerms)
+        )
+    }
+
     /// Simple tokenization using vocabulary lookup
     private static func tokenize(_ text: String, vocabulary: [Int: String]) -> [Int] {
-        // Build reverse vocabulary (token -> id)
+        tokenize(text, tokenToId: reverseVocabulary(vocabulary))
+    }
+
+    private static func reverseVocabulary(_ vocabulary: [Int: String]) -> [String: Int] {
         var tokenToId: [String: Int] = [:]
+        tokenToId.reserveCapacity(vocabulary.count)
         for (id, token) in vocabulary {
             tokenToId[token] = id
         }
+        return tokenToId
+    }
 
+    /// Simple tokenization using a pre-built token -> id lookup.
+    private static func tokenize(_ text: String, tokenToId: [String: Int]) -> [Int] {
         let normalizedText = text.lowercased()
         var result: [Int] = []
         var position = normalizedText.startIndex
@@ -1327,6 +1566,9 @@ public enum CtcEarningsBenchmark {
                                       - chunk: Use dictionary.txt (chunk-level keywords) for vocabulary
                                       - file: Use keywords.txt (file-level keywords) for vocabulary
                                       Scoring always uses dictionary.txt (words actually in chunk)
+                --keywords-file <path>
+                                      Override active vocabulary with one shared keywords file
+                                      (pre-tokenized once; scoring still uses each file's check/dictionary words)
 
             Default locations:
                 Dataset: ~/Library/Application Support/FluidAudio/earnings22-kws/test-dataset/
@@ -1353,6 +1595,9 @@ public enum CtcEarningsBenchmark {
 
                 # Run with file-level keywords (larger vocabulary)
                 fluidaudio ctc-earnings-benchmark --keywords file
+
+                # Run with one shared broad keyword vocabulary
+                fluidaudio ctc-earnings-benchmark --keywords-file /path/to/all_keywords.txt
 
                 # Run with explicit paths
                 fluidaudio ctc-earnings-benchmark \\

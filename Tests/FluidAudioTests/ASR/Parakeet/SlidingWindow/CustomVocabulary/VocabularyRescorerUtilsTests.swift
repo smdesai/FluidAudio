@@ -379,4 +379,40 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
 
         XCTAssertEqual(threshold, ContextBiasingConstants.largeVocabShortWordSimilarity, accuracy: 0.001)
     }
+
+    // MARK: - buildWordTimings minConfidence aggregation
+
+    func testWordTimingMinConfidenceIsMinOverTokens() async throws {
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: CustomVocabularyContext(terms: [])
+        )
+        // Two words: "▁me ps" (confident) then "▁ge v i" (one weak token 0.42).
+        let tokens = [
+            TokenTiming(token: "▁me", tokenId: 1, startTime: 0.0, endTime: 0.1, confidence: 0.99),
+            TokenTiming(token: "ps", tokenId: 2, startTime: 0.1, endTime: 0.2, confidence: 0.95),
+            TokenTiming(token: "▁ge", tokenId: 3, startTime: 0.3, endTime: 0.4, confidence: 0.88),
+            TokenTiming(token: "v", tokenId: 4, startTime: 0.4, endTime: 0.5, confidence: 0.42),
+            TokenTiming(token: "i", tokenId: 5, startTime: 0.5, endTime: 0.6, confidence: 0.91),
+        ]
+        let words = rescorer.buildWordTimings(from: tokens)
+        XCTAssertEqual(words.count, 2)
+        XCTAssertEqual(words[0].word, "meps")
+        XCTAssertEqual(words[0].minConfidence, 0.95, accuracy: 0.001, "min of 0.99, 0.95")
+        XCTAssertEqual(words[1].word, "gevi")
+        XCTAssertEqual(words[1].minConfidence, 0.42, accuracy: 0.001, "min of 0.88, 0.42, 0.91")
+    }
+
+    func testWordTimingMinConfidenceDefaultsHighForSingleConfidentToken() async throws {
+        let rescorer = try await VocabularyRescorer.create(
+            spotter: CtcKeywordSpotter(vocabulary: [:]),
+            vocabulary: CustomVocabularyContext(terms: [])
+        )
+        let tokens = [
+            TokenTiming(token: "▁prior", tokenId: 1, startTime: 0.0, endTime: 0.2, confidence: 1.0)
+        ]
+        let words = rescorer.buildWordTimings(from: tokens)
+        XCTAssertEqual(words.count, 1)
+        XCTAssertEqual(words[0].minConfidence, 1.0, accuracy: 0.001)
+    }
 }

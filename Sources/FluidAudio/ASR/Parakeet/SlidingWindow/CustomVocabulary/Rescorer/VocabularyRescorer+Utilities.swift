@@ -40,34 +40,34 @@ extension VocabularyRescorer {
 
     /// Build all normalized forms (canonical + aliases) for a vocabulary term
     func buildNormalizedForms(for term: CustomVocabularyTerm) -> [NormalizedForm] {
-        var rawForms: [String] = [term.text]
-        let termLower = term.textLowercased
+        normalizedFormsByTermLower[term.textLowercased] ?? []
+    }
 
-        // Look up canonical term in vocabulary to get ALL aliases
-        for vocabTerm in vocabulary.terms where vocabTerm.textLowercased == termLower {
-            if let aliases = vocabTerm.aliases {
-                rawForms.append(contentsOf: aliases)
+    static func buildNormalizedFormCache(for terms: [CustomVocabularyTerm]) -> [String: [NormalizedForm]] {
+        var rawFormsByTermLower: [String: [String]] = [:]
+        for term in terms {
+            rawFormsByTermLower[term.textLowercased, default: []].append(term.text)
+            if let aliases = term.aliases {
+                rawFormsByTermLower[term.textLowercased, default: []].append(contentsOf: aliases)
             }
         }
-        // Also add aliases from the term itself
-        if let aliases = term.aliases {
-            rawForms.append(contentsOf: aliases)
+
+        var cache: [String: [NormalizedForm]] = [:]
+        cache.reserveCapacity(rawFormsByTermLower.count)
+        for (termLower, rawForms) in rawFormsByTermLower {
+            var seen = Set<String>()
+            var forms: [NormalizedForm] = []
+            forms.reserveCapacity(rawForms.count)
+            for raw in rawForms {
+                let normalized = normalizeForSimilarity(raw)
+                guard !normalized.isEmpty else { continue }
+                guard seen.insert(normalized).inserted else { continue }
+                let wordCount = normalized.split(separator: " ").count
+                forms.append(NormalizedForm(normalized: normalized, wordCount: wordCount))
+            }
+            cache[termLower] = forms
         }
-
-        var seen = Set<String>()
-        var forms: [NormalizedForm] = []
-
-        for raw in rawForms {
-            let normalized = Self.normalizeForSimilarity(raw)
-            guard !normalized.isEmpty else { continue }
-            guard !seen.contains(normalized) else { continue }
-            seen.insert(normalized)
-
-            let wordCount = normalized.split(separator: " ").count
-            forms.append(NormalizedForm(normalized: normalized, wordCount: wordCount))
-        }
-
-        return forms
+        return cache
     }
 
     /// Build normalized component words from every multi-word vocabulary form.
@@ -76,9 +76,15 @@ extension VocabularyRescorer {
     /// known multi-word term with an unrelated single-word distractor, e.g.
     /// `Aaron` → `Atryn` when `Dr. Aaron Petrov` is also present.
     func buildMultiWordVocabularyComponentSet() -> Set<String> {
+        multiWordVocabularyComponentSet
+    }
+
+    static func buildMultiWordVocabularyComponentSet(
+        from normalizedFormsByTermLower: [String: [NormalizedForm]]
+    ) -> Set<String> {
         var components = Set<String>()
-        for term in vocabulary.terms {
-            for form in buildNormalizedForms(for: term) where form.wordCount > 1 {
+        for forms in normalizedFormsByTermLower.values {
+            for form in forms where form.wordCount > 1 {
                 let words = form.normalized.split(separator: " ").map(String.init)
                 components.formUnion(words)
             }
@@ -202,20 +208,15 @@ extension VocabularyRescorer {
 
     /// Build set of normalized vocabulary terms for guard checks
     func buildVocabularyNormalizedSet() -> Set<String> {
+        vocabularyNormalizedSet
+    }
+
+    static func buildVocabularyNormalizedSet(from normalizedFormsByTermLower: [String: [NormalizedForm]]) -> Set<String>
+    {
         var normalizedSet = Set<String>()
-        for term in vocabulary.terms {
-            let normalized = Self.normalizeForSimilarity(term.text)
-            if !normalized.isEmpty {
-                normalizedSet.insert(normalized)
-            }
-            // Also add aliases if present
-            if let aliases = term.aliases {
-                for alias in aliases {
-                    let normalizedAlias = Self.normalizeForSimilarity(alias)
-                    if !normalizedAlias.isEmpty {
-                        normalizedSet.insert(normalizedAlias)
-                    }
-                }
+        for forms in normalizedFormsByTermLower.values {
+            for form in forms {
+                normalizedSet.insert(form.normalized)
             }
         }
         return normalizedSet

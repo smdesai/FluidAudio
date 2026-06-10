@@ -17,6 +17,9 @@ public struct VocabularyRescorer: Sendable {
     let vocabulary: CustomVocabularyContext
     let ctcTokenizer: CtcTokenizer?
     let debugMode: Bool
+    let normalizedFormsByTermLower: [String: [NormalizedForm]]
+    let vocabularyNormalizedSet: Set<String>
+    let multiWordVocabularyComponentSet: Set<String>
 
     // BK-tree for efficient approximate string matching (experimental)
     // When enabled, uses BK-tree to find candidate vocabulary terms within edit distance
@@ -127,6 +130,11 @@ public struct VocabularyRescorer: Sendable {
         self.useBKTree = useBKTree
         self.bkTree = bkTree
         self.bkTreeMaxDistance = bkTreeMaxDistance
+        let normalizedFormsByTermLower = Self.buildNormalizedFormCache(for: vocabulary.terms)
+        self.normalizedFormsByTermLower = normalizedFormsByTermLower
+        self.vocabularyNormalizedSet = Self.buildVocabularyNormalizedSet(from: normalizedFormsByTermLower)
+        self.multiWordVocabularyComponentSet = Self.buildMultiWordVocabularyComponentSet(
+            from: normalizedFormsByTermLower)
         #if DEBUG
         self.debugMode = true  // Verbose logging in DEBUG builds
         #else
@@ -167,19 +175,26 @@ public struct VocabularyRescorer: Sendable {
         public let endTime: Double
         public let tokenStartIndex: Int
         public let tokenCount: Int
+        /// Minimum per-token TDT confidence across the word's tokens. Low values
+        /// flag words TDT was unsure about (typically mis-transcribed rare
+        /// keywords); used to trigger the confidence-gated rescue pass. Defaults
+        /// to 1.0 (fully confident) so callers that don't supply it are unaffected.
+        public let minConfidence: Float
 
         public init(
             word: String,
             startTime: Double,
             endTime: Double,
             tokenStartIndex: Int = 0,
-            tokenCount: Int = 0
+            tokenCount: Int = 0,
+            minConfidence: Float = 1.0
         ) {
             self.word = word
             self.startTime = startTime
             self.endTime = endTime
             self.tokenStartIndex = tokenStartIndex
             self.tokenCount = tokenCount
+            self.minConfidence = minConfidence
         }
     }
 
@@ -192,6 +207,7 @@ public struct VocabularyRescorer: Sendable {
         var wordEnd: Double = 0
         var currentTokenStart: Int = 0
         var currentTokenCount: Int = 0
+        var currentMinConfidence: Float = 1.0
 
         for (idx, timing) in tokenTimings.enumerated() {
             let token = timing.token
@@ -214,7 +230,8 @@ public struct VocabularyRescorer: Sendable {
                             startTime: wordStart,
                             endTime: wordEnd,
                             tokenStartIndex: currentTokenStart,
-                            tokenCount: currentTokenCount
+                            tokenCount: currentTokenCount,
+                            minConfidence: currentMinConfidence
                         ))
                 }
                 currentWord = ""
@@ -226,9 +243,11 @@ public struct VocabularyRescorer: Sendable {
                 wordStart = timing.startTime
                 currentTokenStart = idx
                 currentTokenCount = 1
+                currentMinConfidence = timing.confidence
             } else {
                 currentWord += token
                 currentTokenCount += 1
+                currentMinConfidence = min(currentMinConfidence, timing.confidence)
             }
             wordEnd = timing.endTime
         }
@@ -242,7 +261,8 @@ public struct VocabularyRescorer: Sendable {
                     startTime: wordStart,
                     endTime: wordEnd,
                     tokenStartIndex: currentTokenStart,
-                    tokenCount: currentTokenCount
+                    tokenCount: currentTokenCount,
+                    minConfidence: currentMinConfidence
                 ))
         }
 
