@@ -9,6 +9,55 @@ public class DownloadUtils {
     /// Shared URLSession with registry and proxy configuration
     public static let sharedSession: URLSession = ModelRegistry.configuredSession()
 
+    /// Offline-only mode. When true, every public download surface
+    /// (`fetchWithAuth`, `downloadRepo`, `downloadSubdirectory`,
+    /// `fetchHuggingFaceFile`) and the `loadModels` retry-with-redownload
+    /// fallback throws `DownloadUtils.OfflineError` instead of touching
+    /// the network. Applications that bundle their own model assets
+    /// should set this once at startup and route loading through manual
+    /// APIs (e.g. `MLModel(contentsOf:)`, `VadManager(config:vadModel:)`)
+    /// so a corrupt-detected `.mlmodelc` never silently re-downloads at
+    /// runtime.
+    ///
+    /// Defaults to `false`. `nonisolated(unsafe)` is acceptable because
+    /// the flag is set once at startup before any FluidAudio loaders
+    /// are touched and is read-only thereafter.
+    nonisolated(unsafe) public static var enforceOffline: Bool = false
+
+    /// Errors thrown when `enforceOffline` is on and FluidAudio would
+    /// otherwise attempt a network fetch or a cache rebuild that
+    /// requires network. Sibling to `HuggingFaceDownloadError`.
+    public enum OfflineError: LocalizedError {
+        /// A code path that would have hit the network was blocked.
+        /// `operation` is the short tag of the blocked entry point
+        /// (e.g. `"downloadRepo(parakeet-tdt-0.6b-v3-coreml)"`).
+        case networkDisabled(operation: String)
+
+        /// `loadModels` was invoked but one or more required files are
+        /// missing from the local cache. Caller bundled assets but the
+        /// bundle was incomplete; surfacing the missing list lets the
+        /// caller decide whether to ship a fix or fail loudly.
+        case modelMissing(repo: String, missing: [String])
+
+        public var errorDescription: String? {
+            switch self {
+            case .networkDisabled(let operation):
+                return "FluidAudio offline mode: \(operation) blocked"
+            case .modelMissing(let repo, let missing):
+                return
+                    "FluidAudio offline mode: required models missing for \(repo): \(missing.joined(separator: ", "))"
+            }
+        }
+    }
+
+    /// Throws `OfflineError.networkDisabled` if `enforceOffline` is on.
+    /// Call this at the top of any path that would touch the network.
+    private static func ensureOnlineAllowed(_ operation: String) throws {
+        if enforceOffline {
+            throw OfflineError.networkDisabled(operation: operation)
+        }
+    }
+
     /// Get HuggingFace token from environment if available.
     /// Supports multiple env vars for compatibility with different HuggingFace tools:
     /// - HF_TOKEN: Official HuggingFace CLI
@@ -34,6 +83,7 @@ public class DownloadUtils {
     /// Fetch data from a URL with HuggingFace authentication if available
     /// Use this for API calls that need auth tokens for private repos or higher rate limits
     public static func fetchWithAuth(from url: URL) async throws -> (Data, URLResponse) {
+        try ensureOnlineAllowed("fetchWithAuth(\(url.absoluteString))")
         let request = authorizedRequest(url: url)
         return try await sharedSession.data(for: request)
     }
@@ -127,6 +177,15 @@ public class DownloadUtils {
                 directory: directory, computeUnits: computeUnits, variant: variant,
                 progressHandler: progressHandler)
         } catch {
+            // In offline mode never delete cache + re-download. Surface
+            // the original load failure so the caller can decide.
+            if enforceOffline {
+                logger.warning(
+                    "Offline mode: load failed and re-download blocked. \(error.localizedDescription)"
+                )
+                throw error
+            }
+
             logger.warning("First load failed: \(error.localizedDescription)")
             logger.info("Deleting cache and re-downloading…")
             let repoPath = directory.appendingPathComponent(repo.folderName)
@@ -163,7 +222,8 @@ public class DownloadUtils {
     ///
     /// Clears both cache locations:
     /// - `~/Library/Application Support/FluidAudio/Models/` (ASR, VAD, Diarization)
-    /// - `~/.cache/fluidaudio/Models/` (TTS)
+    /// - the shared TTS root: `~/.cache/fluidaudio/` on macOS,
+    ///   `Application Support/fluidaudio/` on iOS (matches `TtsCacheDirectory`).
     public static func clearAllModelCaches() {
         let fm = FileManager.default
 
@@ -173,14 +233,16 @@ public class DownloadUtils {
             try? fm.removeItem(at: modelsDir)
         }
 
-        // TTS models (Kokoro, PocketTTS)
+        // TTS models (Kokoro, PocketTTS, Supertonic3, StyleTTS2).
+        // Remove the whole `fluidaudio/` root so every backend subdirectory
+        // (Models/, voice packs, etc.) is cleared, not just `Models/`.
         #if os(macOS)
         let home = fm.homeDirectoryForCurrentUser
-        let ttsCache = home.appendingPathComponent(".cache/fluidaudio/Models")
+        let ttsCache = home.appendingPathComponent(".cache/fluidaudio")
         try? fm.removeItem(at: ttsCache)
         #else
-        if let cacheDir = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            let ttsCache = cacheDir.appendingPathComponent("fluidaudio/Models")
+        if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let ttsCache = appSupport.appendingPathComponent("fluidaudio")
             try? fm.removeItem(at: ttsCache)
         }
         #endif
@@ -214,6 +276,17 @@ public class DownloadUtils {
         }
 
         if !allModelsExist {
+            // In offline mode surface a typed error listing the
+            // missing files instead of attempting a HuggingFace fetch.
+            if enforceOffline {
+                let missing = effectiveModels.filter { name in
+                    !FileManager.default.fileExists(atPath: repoPath.appendingPathComponent(name).path)
+                }.sorted()
+                logger.error(
+                    "Offline mode: required models missing at \(repoPath.path): \(missing)"
+                )
+                throw OfflineError.modelMissing(repo: repo.folderName, missing: missing)
+            }
             logger.info("Models not found in cache at \(repoPath.path)")
             try await downloadRepo(
                 repo, to: directory, variant: variant,
@@ -300,6 +373,7 @@ public class DownloadUtils {
         additionalModelNames: Set<String> = [],
         progressHandler: ProgressHandler? = nil
     ) async throws {
+        try ensureOnlineAllowed("downloadRepo(\(repo.folderName))")
         logger.info("Downloading \(repo.folderName) from HuggingFace...")
 
         let repoPath = directory.appendingPathComponent(repo.folderName)
@@ -386,9 +460,60 @@ public class DownloadUtils {
             }
         }
 
+        // Pull root-level files whose basename is in `names`. Some subPath repos
+        // keep shared auxiliary files at the repo root rather than inside the
+        // precision subdirectory, so a subPath-only traversal misses them.
+        func listRootFiles(matching names: Set<String>) async throws {
+            let dirURL = try ModelRegistry.apiModels(repo.remotePath, "tree/main")
+            let request = authorizedRequest(url: dirURL)
+            let (dirData, response) = try await sharedSession.data(for: request)
+
+            if let httpResponse = response as? HTTPURLResponse,
+                httpResponse.statusCode == 429 || httpResponse.statusCode == 503
+            {
+                throw HuggingFaceDownloadError.rateLimited(
+                    statusCode: httpResponse.statusCode, message: "Rate limited while listing root files")
+            }
+
+            try validateJSONResponse(dirData, path: "")
+
+            guard let items = try JSONSerialization.jsonObject(with: dirData) as? [[String: Any]] else {
+                throw HuggingFaceDownloadError.invalidResponse
+            }
+
+            for item in items {
+                guard let itemPath = item["path"] as? String,
+                    item["type"] as? String == "file",
+                    names.contains((itemPath as NSString).lastPathComponent)
+                else { continue }
+                let fileSize = item["size"] as? Int ?? -1
+                filesToDownload.append((path: itemPath, size: fileSize))
+            }
+        }
+
         // Start listing from subPath if specified, otherwise from root
         progressHandler?(DownloadProgress(fractionCompleted: 0.0, phase: .listing))
         try await listDirectory(path: subPath ?? "")
+
+        // Some subPath repos keep shared auxiliary files (e.g. vocab.json) at the
+        // repo *root* rather than inside the precision subdirectory — the bundled
+        // .mlmodelc dirs live under `q8/`, but the tokenizer vocab is shared across
+        // precisions and published once at the root. The subPath traversal above
+        // never visits the root, so those files are missed and the verify pass
+        // below throws `modelNotFound` (issue #649). For any required *file*
+        // (i.e. not an .mlmodelc/.mlpackage bundle) that the subPath sweep did not
+        // already collect, fall back to grabbing a matching root-level file.
+        if subPath != nil {
+            let collected = Set(filesToDownload.map { ($0.path as NSString).lastPathComponent })
+            let missingAux = requiredModels.filter { model in
+                !model.hasSuffix(".mlmodelc") && !model.hasSuffix(".mlpackage")
+                    && !collected.contains((model as NSString).lastPathComponent)
+            }
+            if !missingAux.isEmpty {
+                try await listRootFiles(matching: Set(missingAux))
+            }
+        }
+
         logger.info("Found \(filesToDownload.count) files to download")
 
         // Compute total known bytes for byte-weighted progress.
@@ -599,6 +724,7 @@ public class DownloadUtils {
         progressHandler: ProgressHandler? = nil,
         shouldSkip: (@Sendable (String) -> Bool)? = nil
     ) async throws {
+        try ensureOnlineAllowed("downloadSubdirectory(\(repo.folderName)/\(subdirectory))")
         progressHandler?(DownloadProgress(fractionCompleted: 0.0, phase: .listing))
         var filesToDownload: [(path: String, size: Int)] = []
 
@@ -724,6 +850,7 @@ public class DownloadUtils {
         maxAttempts: Int = 4,
         minBackoff: TimeInterval = 1.0
     ) async throws -> Data {
+        try ensureOnlineAllowed("fetchHuggingFaceFile(\(description))")
         var lastError: Error?
         let request = authorizedRequest(url: url)
 

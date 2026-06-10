@@ -12,7 +12,6 @@ import Foundation
 /// Backends:
 ///   kokoro-ane    — 7-stage ANE pipeline (per-stage timings, per-stage CU)
 ///   pocket-tts    — streaming flow-matching (no per-stage timings)
-///   magpie        — encoder-decoder + NanoCodec (6-stage timings, slow)
 ///   styletts2     — LibriTTS iteration_3, zero-shot w/ reference audio
 ///   supertonic3   — 4-stage multilingual flow-matching diffusion (31 langs)
 ///
@@ -96,7 +95,6 @@ public enum TtsBenchmarkCommand {
         var corpusName: String?
         var corpusPath: String?
         var voice: String?
-        var speakerName: String?
         var languageName: String?
         var computeUnitsName = "default"
         var outputJson: String?
@@ -134,11 +132,6 @@ public enum TtsBenchmarkCommand {
             case "--voice":
                 if i + 1 < arguments.count {
                     voice = arguments[i + 1]
-                    i += 1
-                }
-            case "--speaker":
-                if i + 1 < arguments.count {
-                    speakerName = arguments[i + 1]
                     i += 1
                 }
             case "--language":
@@ -245,7 +238,7 @@ public enum TtsBenchmarkCommand {
 
         guard let preset = TtsComputeUnitPreset(cliValue: computeUnitsName) else {
             logger.error(
-                "Unknown --compute-units value: \(computeUnitsName). Expected default | all-ane | cpu-and-gpu | cpu-only."
+                "Unknown --compute-units value: \(computeUnitsName). Expected default | all-ane | cpu-and-gpu | cpu-only | ane-tail-gpu."
             )
             exit(1)
         }
@@ -257,7 +250,7 @@ public enum TtsBenchmarkCommand {
         //   no flag, otherwise               → .parakeet
         let asrChoice: AsrChoice
         do {
-            asrChoice = try resolveAsrChoice(
+            asrChoice = try await resolveAsrChoice(
                 skipAsrFlag: skipAsr,
                 backendName: asrBackendName,
                 cohereModelDir: cohereModelDirArg,
@@ -286,12 +279,6 @@ public enum TtsBenchmarkCommand {
                     phrases: phrases, corpusLabel: corpusLabel,
                     voice: voice ?? PocketTtsConstants.defaultVoice,
                     languageName: languageName,
-                    preset: preset, outputJson: outputJson, audioDir: audioDir,
-                    asrChoice: asrChoice)
-            case .magpie:
-                try await runMagpie(
-                    phrases: phrases, corpusLabel: corpusLabel,
-                    speakerName: speakerName, languageName: languageName,
                     preset: preset, outputJson: outputJson, audioDir: audioDir,
                     asrChoice: asrChoice)
             case .styleTts2:
@@ -468,74 +455,6 @@ public enum TtsBenchmarkCommand {
                 extraFields: [
                     "frame_count": frameCount,
                     "chunk_count": lastChunkCount,
-                ]
-            )
-        }
-    }
-
-    // MARK: - Magpie driver
-
-    private static func runMagpie(
-        phrases: [(category: String, text: String)],
-        corpusLabel: String,
-        speakerName: String?,
-        languageName: String?,
-        preset: TtsComputeUnitPreset,
-        outputJson: String?,
-        audioDir: String?,
-        asrChoice: AsrChoice
-    ) async throws {
-        let units = preset.uniformUnits ?? .cpuAndNeuralEngine
-        let language = parseMagpieLanguage(languageName)
-        let speaker = parseMagpieSpeaker(speakerName)
-        logger.info("Magpie speaker=\(speaker.displayName) language=\(language.rawValue)")
-
-        let manager = MagpieTtsManager(
-            computeUnits: units, preferredLanguages: [language])
-
-        let coldStart = Date()
-        try await manager.initialize()
-        let coldStartS = Date().timeIntervalSince(coldStart)
-        logger.info(String(format: "Cold start (initialize): %.2fs", coldStartS))
-
-        let firstStart = Date()
-        _ = try await manager.synthesize(
-            text: "Initialization warm-up.", speaker: speaker, language: language)
-        let firstSynthMs = Date().timeIntervalSince(firstStart) * 1000
-        logger.info(String(format: "First synth: %.0f ms", firstSynthMs))
-
-        try await runPhraseLoop(
-            backendId: "magpie",
-            voiceLabel: speaker.displayName,
-            corpusLabel: corpusLabel,
-            phrases: phrases,
-            preset: preset,
-            coldStartS: coldStartS,
-            firstSynthMs: firstSynthMs,
-            outputJson: outputJson,
-            audioDir: audioDir,
-            asrChoice: asrChoice,
-            extraSummary: [
-                "speaker": speaker.displayName, "language": language.rawValue,
-            ]
-        ) { text in
-            // Magpie is a batch / offline model — `synthesize()` runs the
-            // full chunked AR + codec pipeline and returns a single
-            // `MagpieSynthesisResult`. TTFT therefore equals synthMs (no
-            // incremental yield to measure against).
-            let t0 = Date()
-            let result = try await manager.synthesize(
-                text: text, speaker: speaker, language: language)
-            let synthMs = Date().timeIntervalSince(t0) * 1000
-            return BackendPhraseSample(
-                synthMs: synthMs,
-                ttftMs: synthMs,
-                samples: result.samples,
-                sampleRate: result.sampleRate,
-                stageMs: [:],
-                extraFields: [
-                    "code_count": result.codeCount,
-                    "finished_on_eos": result.finishedOnEos,
                 ]
             )
         }
@@ -974,7 +893,6 @@ public enum TtsBenchmarkCommand {
     private enum Backend: String {
         case kokoroAne
         case pocketTts
-        case magpie
         case styleTts2
         case supertonic3
 
@@ -989,8 +907,6 @@ public enum TtsBenchmarkCommand {
             return .kokoroAne
         case "pocket-tts", "pockettts", "pocket":
             return .pocketTts
-        case "magpie":
-            return .magpie
         case "styletts2", "style-tts2", "styletts", "style-tts":
             return .styleTts2
         case "supertonic3", "supertonic-3", "sup3", "supertonic":
@@ -1006,24 +922,6 @@ public enum TtsBenchmarkCommand {
             return .english
         }
         return l
-    }
-
-    private static func parseMagpieLanguage(_ name: String?) -> MagpieLanguage {
-        guard let name, let l = MagpieLanguage(rawValue: name.lowercased()) else {
-            return .english
-        }
-        return l
-    }
-
-    private static func parseMagpieSpeaker(_ name: String?) -> MagpieSpeaker {
-        switch name?.lowercased() {
-        case "sofia": return .sofia
-        case "aria": return .aria
-        case "jason": return .jason
-        case "leo": return .leo
-        case "john", nil, "": return .john
-        default: return .john
-        }
     }
 
     /// Map an explicit `--language` flag or a `minimax-<lang>` corpus name
@@ -1122,14 +1020,14 @@ public enum TtsBenchmarkCommand {
         cohereComputeUnits: String?,
         corpusLabel: String,
         ttsBackend: Backend
-    ) throws -> AsrChoice {
+    ) async throws -> AsrChoice {
         let normalized = backendName?.lowercased()
         if skipAsrFlag || normalized == "none" {
             return .skip
         }
         switch normalized {
         case "cohere":
-            let dir = try resolveCohereModelDir(cohereModelDir)
+            let dir = try await resolveCohereModelDir(cohereModelDir)
             let language = inferCohereLanguage(
                 explicit: asrLanguage, corpus: corpusLabel)
             let units = try resolveCohereComputeUnits(cohereComputeUnits)
@@ -1153,34 +1051,39 @@ public enum TtsBenchmarkCommand {
     ///   1. Explicit `--cohere-model-dir <path>`.
     ///   2. The default cache location at
     ///      `~/Library/Application Support/FluidAudio/Models/cohere-transcribe/q8`,
-    ///      matching `Repo.cohereTranscribeCoreml.folderName`.
+    ///      matching `Repo.cohereTranscribeCoreml.folderName`. Auto-downloaded
+    ///      from HuggingFace if missing.
     ///
-    /// Auto-download is intentionally not wired here: the upstream
-    /// `Repo.cohereTranscribeCoreml` registration ships `vocab.json` in
-    /// `requiredModels`, but the file lives at the repo root rather than
-    /// under the `q8/` subPath, so `DownloadUtils.downloadRepo` would fail
-    /// the post-download verify. Fix this when the registry learns about
-    /// repo-root files; until then, callers must pre-populate the cache
-    /// (e.g. via `fluidaudio cohere-transcribe ... --model-dir <dir>`).
-    private static func resolveCohereModelDir(_ override: String?) throws -> URL {
+    /// `Repo.cohereTranscribeCoreml` ships `vocab.json` in `requiredModels`, and
+    /// that file lives at the repo root rather than under the `q8/` subPath.
+    /// `DownloadUtils.downloadRepo` now sweeps the repo root for required
+    /// auxiliary files (issue #649), so auto-download resolves it correctly.
+    private static func resolveCohereModelDir(_ override: String?) async throws -> URL {
         if let override {
             return resolveURL(override, isDirectory: true)
         }
         let appSupport = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask, appropriateFor: nil, create: true)
-        let target =
-            appSupport
-            .appendingPathComponent("FluidAudio/Models/cohere-transcribe/q8")
+        // `downloadRepo` appends `repo.folderName` (cohere-transcribe/q8), so
+        // pass the Models base dir and let it land the bundle at `target`.
+        let modelsBase = appSupport.appendingPathComponent("FluidAudio/Models")
+        let target = modelsBase.appendingPathComponent("cohere-transcribe/q8")
         let needed = [
             ModelNames.CohereTranscribe.encoderCompiledFile,
             ModelNames.CohereTranscribe.decoderCacheExternalV2CompiledFile,
             "vocab.json",
         ]
-        let missing = needed.filter { name in
-            !FileManager.default.fileExists(
-                atPath: target.appendingPathComponent(name).path)
+        func missingFiles() -> [String] {
+            needed.filter { name in
+                !FileManager.default.fileExists(
+                    atPath: target.appendingPathComponent(name).path)
+            }
         }
+        if !missingFiles().isEmpty {
+            try await DownloadUtils.downloadRepo(.cohereTranscribeCoreml, to: modelsBase)
+        }
+        let missing = missingFiles()
         guard missing.isEmpty else {
             throw NSError(
                 domain: "TtsBenchmark", code: 1,
@@ -1333,7 +1236,6 @@ public enum TtsBenchmarkCommand {
             Backends:
               kokoro-ane    7-stage ANE pipeline (per-stage timings, per-stage CU)
               pocket-tts    Streaming flow-matching (multilingual)
-              magpie        Encoder-decoder + NanoCodec (per-stage, slow)
               styletts2     LibriTTS iteration_3, zero-shot, requires --reference
               supertonic3   4-stage multilingual flow-matching (31 langs);
                             requires --voice-style <preset.json>
@@ -1346,9 +1248,9 @@ public enum TtsBenchmarkCommand {
                                         see Documentation/TTS/MinimaxCorpus.md)
               --corpus-path <path>      Custom corpus file (overrides --corpus)
               --voice <name>            Voice id (KokoroAne/PocketTTS)
-              --speaker <name>          Magpie speaker: john|sofia|aria|jason|leo
-              --language <code>         PocketTTS lang pack or Magpie language code
-              --compute-units <preset>  default | all-ane | cpu-and-gpu | cpu-only
+              --language <code>         PocketTTS lang pack code
+              --compute-units <preset>  default | all-ane | cpu-and-gpu | cpu-only | ane-tail-gpu
+                                        (kokoro-ane on M5/macOS 26.5 needs ane-tail-gpu; see #667)
               --output-json <path>      Write JSON report
               --audio-dir <path>        Keep generated WAVs under this dir
               --skip-asr                Skip ASR roundtrip (no WER/CER)
@@ -1396,7 +1298,6 @@ public enum TtsBenchmarkCommand {
               fluidaudio tts-benchmark --backend kokoro-ane --variant mandarin \\
                   --voice zf_001 --corpus minimax-chinese --skip-asr
               fluidaudio tts-benchmark --backend pocket-tts --corpus minimax-german --language german
-              fluidaudio tts-benchmark --backend magpie --speaker sofia --language en
               fluidaudio tts-benchmark --backend styletts2 --reference speaker.wav
               fluidaudio tts-benchmark --backend supertonic3 \\
                   --voice-style M1.json --corpus minimax-english
